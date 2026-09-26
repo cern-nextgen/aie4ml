@@ -82,10 +82,18 @@ def test_the_proxy_refuses_what_it_was_not_calibrated_for():
         _proxy([r for r in _calibration() if r['cycles'] is None])
 
 
+def test_a_feature_constant_over_a_group_needs_no_kernels_of_its_own():
+    """Every term with Z repeats one without, so only J and Kt must be determined; the range keeps queries at Z=1."""
+    proxy = _proxy([r for r in _calibration() if r['features']['Z'] == 1])
+    cost = proxy.cost('dense.b.r.v1', SOURCES, 'single', GROUP, {'Z': 1, 'J': 5, 'Kt': 9})
+    assert cost.cycles == pytest.approx(10 + 5 + 7 * 5 + 3 * 5 * 9)
+    assert 'Z=2 outside 1..1' in proxy.cost('dense.b.r.v1', SOURCES, 'single', GROUP, {'Z': 2, 'J': 4, 'Kt': 8}).refusal
+
+
 def test_kernels_whose_features_cannot_determine_every_term_get_no_model():
-    one_row = [r for r in _calibration() if r['features']['Z'] == 1]  # every term with Z repeats one without
-    with pytest.raises(ValueError, match='too few kernels'):
-        _proxy(one_row)
+    few = [r for r in _calibration() if r['features']['Z'] == 1 and r['features']['J'] < 4 and r['features']['Kt'] < 8]
+    with pytest.raises(ValueError, match='too few kernels'):  # 4 kernels for the 4 terms of J and Kt
+        _proxy(few)
 
 
 def test_a_kernel_costs_the_same_in_any_chain_and_calibration_fails_if_it_did_not():

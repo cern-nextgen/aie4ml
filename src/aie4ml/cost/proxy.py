@@ -222,7 +222,10 @@ def _fit(records: Sequence[Mapping]) -> Dict[str, Optional[Dict]]:
         if len(wrappers) != 1:
             raise ValueError(f'{key}: wrapper cycles vary within one group and role: {sorted(wrappers)}.')
         matrix = np.array([_terms(r['features']) for r in members], dtype=float)
-        if len(members) <= matrix.shape[1] or np.linalg.matrix_rank(matrix) < matrix.shape[1]:
+        # A feature constant over the group adds no term the others do not span, and the range keeps every query at
+        # that constant, where the least-squares fit is unique: only the varying features' terms must be determined.
+        varying = sum(len({r['features'][n] for r in members}) > 1 for n in members[0]['features'])
+        if len(members) <= 2**varying or np.linalg.matrix_rank(matrix) < 2**varying:
             models[key] = None
             continue
         coefficients = np.linalg.lstsq(matrix, np.array([r['static'] for r in members], float), rcond=None)[0]
