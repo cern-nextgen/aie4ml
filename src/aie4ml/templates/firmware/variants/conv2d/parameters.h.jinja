@@ -45,6 +45,7 @@ struct {{L.struct_name}} {
   static constexpr int WN = {{P.weight_count}}, BN = {{P.bias_count}};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
+  static constexpr bool POOL = {{ 'true' if P.pool else 'false' }};
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};
   // The Dense bank contract for a buffer port: activation copies in banks 0 and 3, stack and bias in

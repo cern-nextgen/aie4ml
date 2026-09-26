@@ -3,4 +3,4 @@
 
 
 from .. import quantize  # noqa: F401 - registers QuantizeLinear/DequantizeLinear
-from . import activation, conv, elementwise, matmul, norm, tensor  # noqa: F401
+from . import activation, conv, elementwise, matmul, norm, pool, tensor  # noqa: F401

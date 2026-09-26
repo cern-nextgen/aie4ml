@@ -5,7 +5,7 @@ from __future__ import annotations
 from ....ir.graph import VIEW_FLATTEN_2D, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import SpatialAccess2D
-from .common import spatial_access_of
+from .common import fused_pool_of, spatial_access_of
 
 
 @family_resolver('conv2d')
@@ -13,7 +13,7 @@ class Conv2dFamilyResolver(FamilyResolver):
     """NHWC activations, compact `[kh, kw, Cin/groups, Cout]` weights; kernel limits live in variants."""
 
     op_type = 'conv2d'
-    supported_fusions = frozenset({'bias', 'relu'})
+    supported_fusions = frozenset({'bias', 'relu', 'max_pool'})
     supported_output_views = frozenset({VIEW_FLATTEN_2D})
 
     def spatial_access(self, node) -> SpatialAccess2D:
@@ -38,6 +38,13 @@ class Conv2dFamilyResolver(FamilyResolver):
         out_h, out_w = spatial.output_extent(h, w)
         if min(out_h, out_w) < 1:
             raise ValueError(f'{node.name}: conv2d window {spatial} leaves no output for a {h}x{w} input.')
+        pool = fused_pool_of(node)
+        if pool is not None:
+            if f'{pool.kind}_pool' not in self.supported_fusions:
+                raise ValueError(f'{node.name}: conv2d cannot fuse a {pool.kind} pool.')
+            out_h, out_w = pool.window.output_extent(out_h, out_w)
+            if min(out_h, out_w) < 1:
+                raise ValueError(f'{node.name}: the fused pool {pool.window} leaves no output.')
         view = node.traits.get('output_view')
         flatten = view is not None and view.data['kind'] == VIEW_FLATTEN_2D
         expected = (batch, out_h * out_w * cout) if flatten else (batch, out_h, out_w, cout)

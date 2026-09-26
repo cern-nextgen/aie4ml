@@ -21,6 +21,14 @@ class Conv2dFlags:
 
 
 @dataclass(frozen=True)
+class Pool2DConfig:
+    """A pool fused into the conv's epilogue."""
+
+    kind: str
+    window: SpatialAccess2D  # kernel, pads (top, left, bottom, right), strides, dilations
+
+
+@dataclass(frozen=True)
 class Conv2dConfig:
     """Resolved Conv2D: the canonical attributes plus the padded frames its kernel reads/writes."""
 
@@ -38,6 +46,7 @@ class Conv2dConfig:
     alternating_horizontal: bool
     bank_mem_bytes: int  # one memory bank: what a bank-pinned buffer copy, and the weights, must fit
     flags: Conv2dFlags
+    pool: Optional[Pool2DConfig]
 
 
 @dataclass(frozen=True)
