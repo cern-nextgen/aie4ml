@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 from ....ir.graph import OpNode
 from ...utils import (
@@ -17,6 +18,7 @@ from ...utils import (
     ordered_view_shape,
     shared_consumer_spatial_access,
 )
+from .config import Pool2DConfig
 
 CHANNEL_BLOCK = 8
 """Channels per mmul K/N block: the frame's inner blocking factor, and the partition granularity."""
@@ -33,6 +35,22 @@ def spatial_access_of(node: OpNode) -> SpatialAccess2D:
         strides=tuple(int(s) for s in node.metadata['strides']),
         dilations=tuple(int(d) for d in node.metadata['dilations']),
     )
+
+
+def fused_pool_of(node: OpNode) -> Optional[Pool2DConfig]:
+    """The pool a conv2d node fuses into its epilogue, if any, from the trait FusePool left."""
+    fused = node.traits.get('fused_pool')
+    if fused is None:
+        return None
+    if set(fused.data) != {'kind', 'kernel_shape', 'strides', 'dilations', 'pads'}:
+        raise ValueError(f'{node.name}: a fused_pool trait holds its kind and window, got {sorted(fused.data)}.')
+    window = SpatialAccess2D(
+        kernel=tuple(int(x) for x in fused.data['kernel_shape']),
+        pads=tuple(int(p) for p in fused.data['pads']),
+        strides=tuple(int(s) for s in fused.data['strides']),
+        dilations=tuple(int(d) for d in fused.data['dilations']),
+    )
+    return Pool2DConfig(kind=str(fused.data['kind']), window=window)
 
 
 def frame_view(

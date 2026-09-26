@@ -33,7 +33,7 @@ def _qparams(prefix: str, *, frac: int, elem_type: int = TensorProto.INT8) -> li
     ]
 
 
-def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed, stride=1):
+def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed, stride=1, unsigned=False):
     """Conv(x, W, b) [-> Relu] -> Q -> DQ with int8 weights and an int32 bias in the accumulator scale."""
     rng = np.random.default_rng(seed)
     w = rng.integers(-6, 6, size=(cout, cin // groups, k, k), dtype=np.int8)
@@ -43,7 +43,7 @@ def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed
         numpy_helper.from_array(b, f'{name}_b_q'),
         *_qparams(f'{name}_w', frac=FRAC),
         *_qparams(f'{name}_b', frac=2 * FRAC, elem_type=TensorProto.INT32),
-        *_qparams(f'{name}o', frac=FRAC),
+        *_qparams(f'{name}o', frac=FRAC, elem_type=TensorProto.UINT8 if unsigned else TensorProto.INT8),
     ]
     for tag in ('w', 'b'):
         nodes.append(
