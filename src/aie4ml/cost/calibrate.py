@@ -370,6 +370,9 @@ def _fit_transport(plan: Plan, evidence: Evidence, threads: int, fitted: Path):
     failed = _build(plan, chains + singles + handoffs, evidence, threads, simulate=True, projects=True)
     chains, singles, handoffs = ([d for d in ds if d['name'] not in failed] for ds in (chains, singles, handoffs))
     measured = {d['name']: _measured(plan.out / d['name']) for d in chains + singles + handoffs}
+    unmeasured = sorted(name for name, found in measured.items() if found is None)
+    if unmeasured:
+        raise RuntimeError(f'simulated but no latency or interval to read, even rebuilt: {unmeasured}')
     for d in chains + singles:
         models[d['name']] = _lowered(*plan.model(d)[:2], plan.part, d['name'], plan.out, plan.model(d)[2])
 
@@ -416,13 +419,14 @@ def _build(
     plan: Plan, designs: List[Dict], evidence: Evidence, threads: int, simulate: bool, projects: bool = False
 ) -> set:
     """Build each design whose kernels the evidence lacks -- compile-only, or simulated -- and add what it showed;
-    with `projects`, also each simulated design whose project is gone. Returns the designs that failed, ever."""
+    with `projects`, also each simulated design whose measurement cannot be read. Returns the designs that failed,
+    ever."""
     todo = {}
     out = evidence.path.parent / 'designs'
     for design in designs:
         simulated = simulate or design.get('simulate', False)
         known = design['kernels'] and evidence.has([k['key'] for k in design['kernels']], simulated)
-        gone = projects and not evidence.refused(design) and not (out / design['name'] / 'aiesimulator_output').exists()
+        gone = projects and not evidence.refused(design) and _measured(out / design['name']) is None
         if known and not gone:
             continue
         todo[design['name']] = (design, simulated)
@@ -486,11 +490,16 @@ def _measure(job, out: Path) -> Dict[str, Dict]:
     return found
 
 
-def _measured(project: Path) -> Dict[str, float]:
+def _measured(project: Path) -> Optional[Dict[str, float]]:
+    """A simulated project's latency and interval, or None where it holds no simulation that yields both (a run
+    stopped or a log cut short)."""
     from ..report import report
 
+    if not (project / 'aiesimulator_output').exists():
+        return None
     latency = report(project)['latency']
-    return {'latency': float(latency['latency_cc']), 'interval': float(latency['global']['avg_cc'])}
+    cycles, interval = latency.get('latency_cc'), (latency.get('global') or {}).get('avg_cc')
+    return None if cycles is None or interval is None else {'latency': float(cycles), 'interval': float(interval)}
 
 
 def _lowered(model, directives, part: str, name: str, out: Path, feeds):
