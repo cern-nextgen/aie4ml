@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from ....ir.graph import OpNode
 from ...utils import (
     STORAGE_LAYOUT_INNER_BLOCKED,
@@ -45,7 +47,8 @@ def frame_view(
         inner_block=CHANNEL_BLOCK,
         inner_slices=channel_slices,
         row_slices=row_slices,
-        row_bytes_align=ROW_ALIGN_PIXELS,
+        # A producer stores whole register tiles of `column_align` pixels, so every row starts on one.
+        row_bytes_align=math.lcm(ROW_ALIGN_PIXELS, column_align),
     )
 
 

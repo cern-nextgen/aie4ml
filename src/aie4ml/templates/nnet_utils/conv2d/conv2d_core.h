@@ -33,6 +33,7 @@ inline void conv2d_check_contract() {
   static_assert(ConfigT::IN_ORIGIN_C >= ConfigT::PAD_L, "the image sits behind its column border");
   static_assert(ConfigT::IN_ORIGIN_C % ConfigT::M == 0 && ConfigT::OUT_ORIGIN_C % ConfigT::M == 0,
                 "origins keep tile stores aligned");
+  static_assert(ConfigT::FLATTEN || ConfigT::OUT_COLS % ConfigT::M == 0, "output rows keep tile stores aligned");
   static_assert(ConfigT::IN_ORIGIN_C + ConfigT::IN_W <= ConfigT::IN_COLS, "the image fits the frame columns");
   // A frame holds the whole image, one band of it, or -- under a vertical stride -- only the rows
   // its outputs actually read, which can stop short of the last image row. Either way it holds

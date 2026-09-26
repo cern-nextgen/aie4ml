@@ -19,6 +19,7 @@ from helpers import (
 )
 
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
+MLV2_PART = 'xc2ve3858-ssva2112-2mp-e-s'
 # 24 channels = 3 blocks, so one model covers a 3-chain split and the first/middle/last cascade;
 # 12 classes because a memtile shard needs whole 32-bit words.
 H, W, CIN, C1, C2, C3, CLASSES = 8, 8, 3, 24, 24, 8, 12
@@ -214,6 +215,23 @@ ROW_SPLIT = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
 STREAM_DIRECTIVES = {'b': {'ports': 'stream'}}
 
 
+def _padded_pair_model():
+    """conv(3x3, same) -> conv(3x3, same) -> NHWC output: the first conv stores into the second's bordered frame."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'b', CIN, C1, 3, pad=1, relu=True, seed=41)
+    _conv(nodes, inits, 'a', 'c', 'd', C1, 8, 3, pad=1, relu=True, seed=42)
+    nodes.append(helper.make_node('Transpose', ['c'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    return make_model(
+        'conv_padded_pair',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, H, W, 8])],
+        initializers=inits,
+    )
+
+
 def _feed() -> np.ndarray:
     rng = np.random.default_rng(11)
     return rng.integers(-40, 40, size=(1, H, W, CIN), dtype=np.int8)
@@ -352,6 +370,15 @@ def test_frame_refuses_consumers_that_read_different_windows(tmp_path):
     _head(nodes, inits, 'a3', H * W * C3, seed=13)
     with pytest.raises(NotImplementedError, match='read different windows'):
         lower(_model('conv_fanout', nodes, inits), tmp_path, part=AIE1_PART)
+
+
+def test_frame_rows_hold_whole_register_tiles(tmp_path):
+    """A producer stores whole register tiles, so every frame row starts on one: 64 bytes on AIE-MLv2, where
+    32-byte rows put every other row's stores out of alignment."""
+    ctx = lower(_padded_pair_model(), tmp_path, part=MLV2_PART)
+    for inst in ctx.ir.execution:
+        m = inst.config.microtiling.microtile_m
+        assert all(view.full[2] % m == 0 for view in inst.config.io_views.values() if len(view.full) == 4)
 
 
 def test_outer_splits_rows_into_overlapping_slices(tmp_path):
@@ -868,6 +895,13 @@ def test_stream_conv_matches_onnx_on_the_core(tmp_path):
         part=AIE1_PART,
         iterations=6,
         per_iteration=True,
+    )
+
+
+@pytest.mark.requires_vitis
+def test_padded_conv_pair_matches_onnx_on_aie_mlv2(tmp_path):
+    assert_x86_matches_onnx(
+        _padded_pair_model(), {'x_q': _feed()}, {}, tmp_path, batch=1, frac=FRAC, max_code_diff=0, part=MLV2_PART
     )
 
 
