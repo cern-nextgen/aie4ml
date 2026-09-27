@@ -504,11 +504,14 @@ class _MemoryPlanMaterializer:
         offset[shard_dim] -= int(unit_base_dim0)
         boundary = list(io_boundary)
         boundary[shard_dim] = min(int(buf_dims[shard_dim]), max(0, int(io_boundary[shard_dim]) - int(unit_base_dim0)))
+        inner = int(base['inner_dimension'])
+        tile = self._whole_beats(entry, io_tile, inner)
+        boundary[inner] = min(int(buf_dims[inner]), tile[inner])
         return {
             'access': 'read',
             'storage_layout': STORAGE_LAYOUT_LINEAR,
             'buffer_dimension': list(buf_dims),
-            'tiling_dimension': self._whole_beats(entry, io_tile, int(base['inner_dimension'])),
+            'tiling_dimension': tile,
             'io_tiling_dimension': list(io_tile),
             'io_boundary_dimension': list(io_boundary),
             'offset': offset,
@@ -593,10 +596,12 @@ class _MemoryPlanMaterializer:
         return staging
 
     def _whole_beats(self, entry: EdgeEntry, tile: List[int], inner: int) -> List[int]:
-        """A PLIO moves whole beats, so an inference whose tile would end mid-beat moves its rows padded to whole
-        beats: the memory tile's DMA zero-fills past the boundary and the host trims."""
-        beat = int(self.ctx.device.plio_width_bits) // int(self._graph_output_dtype(entry).width)
+        """A memory tile's DMA moves whole 32-bit words and a PLIO whole beats, so a row that would end mid-word, or an
+        inference mid-beat, moves padded: the DMA zero-fills past the boundary and the host trims."""
+        width = int(self._graph_output_dtype(entry).width)
+        word, beat = 32 // width, int(self.ctx.device.plio_width_bits) // width
         tile = [int(value) for value in tile]
+        tile[inner] = -(-tile[inner] // word) * word
         if prod(tile) % beat:
             tile[inner] = -(-tile[inner] // beat) * beat
         return tile

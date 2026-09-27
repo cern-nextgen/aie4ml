@@ -34,7 +34,7 @@ The full constraints are in [docs/support.md](docs/support.md).
 8-bit inputs against 16-bit weights (int8 × int16) are not supported.
 
 ## Prerequisites
-- AMD Vitis 2026.1.1 and a valid AIE tools license.  
+- AMD Vitis 2026.1.1 and a valid AIE tools license.
   *(aie4ml tracks the newest AIE compiler; older releases may fail to compile some kernels.)*
 - Python 3.10+.
 

@@ -244,6 +244,42 @@ def test_hls4ml_max_pool_fuses_into_the_conv(tmp_path, relu_after_pool):
     assert {'fused_pool', 'fused_activation', 'output_view'} <= set(conv.traits)
 
 
+def test_hls4ml_bit_exact_pool_keeps_the_conv_rounding(tmp_path):
+    """bit_exact types the pool and flatten outputs TRN/WRAP (they cannot round); fused into the conv, the conv still
+    rounds as its ReLU quantizer does."""
+    hls4ml = pytest.importorskip('hls4ml')
+    qkeras = pytest.importorskip('qkeras')
+    import aie4ml
+    from keras.models import Sequential
+
+    q_w = qkeras.quantized_bits(BITS, 2, alpha=1)
+    model = Sequential(
+        [
+            keras.Input(shape=(H, W, CIN)),
+            qkeras.QActivation(qkeras.quantized_bits(BITS, 2), name='input_quant'),
+            qkeras.QConv2D(16, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
+            qkeras.QActivation(qkeras.quantized_relu(BITS, 2), name='relu'),
+            keras.layers.MaxPooling2D((2, 2), name='pool'),
+            keras.layers.Flatten(name='flatten'),
+            qkeras.QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    hls_model = hls4ml.converters.convert_from_keras_model(
+        model,
+        backend='AIE',
+        output_dir=str(tmp_path / 'proj'),
+        part=PART,
+        hls_config=config,
+        batch_size=1,
+        bit_exact=True,
+    )
+    ctx = aie4ml.from_hls4ml(hls_model).context
+    (conv,) = [n for n in ctx.ir.logical if n.op_type == 'conv2d']
+    assert conv.outputs[0].precision.rounding.value == 'RND_CONV'
+    assert ctx.ir.execution.get(conv.name).config.rounding_mode == 'conv_even'
+
+
 @pytest.mark.requires_vitis
 @pytest.mark.parametrize('part', PARTS.values(), ids=PARTS.keys())
 def test_hls4ml_max_pool_matches_qkeras(tmp_path, part):

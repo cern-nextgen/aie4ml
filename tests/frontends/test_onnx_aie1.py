@@ -358,6 +358,18 @@ def test_aie_mlv2_int16_dense_takes_a_dense_acc64_shape(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    'part', ['xcve2802-vsvh1760-2mp-e-s', 'xc2ve3858-ssva2112-2mp-e-s'], ids=['aie-ml', 'aie-mlv2']
+)
+def test_a_graph_output_off_a_memory_tile_moves_whole_words(tmp_path, part):
+    """10 int8 features end mid-word: the memory tile reads each row as 12 and the host trims."""
+    plan = _run_pipeline(_dense_model(out_features=10), tmp_path, part=part).context.ir.physical.plan
+    (out,) = [p for p in plan['io_ports'] if p['direction'] == 'output']
+    assert out['descriptor']['io_boundary_dimension'][0] == 10
+    assert out['descriptor']['tiling_dimension'][0] == out['descriptor']['boundary_dimension'][0] == 12
+    assert out['staging']['tiling_dimension'][0] == 12
+
+
 def test_aie1_onnx_int8_int16_dense_is_rejected_before_shift_resolution(tmp_path):
     with pytest.raises(RuntimeError, match=r'unsupported int8 x int16.*output shift'):
         _resolve_dense(_dense_model(TensorProto.INT8, TensorProto.INT16), tmp_path)

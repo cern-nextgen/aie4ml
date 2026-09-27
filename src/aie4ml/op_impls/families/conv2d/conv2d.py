@@ -758,7 +758,7 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
     kernel lands it in the blocked layout the compute core reads (`ports: stream`).
 
     It buys legality rather than speed: a frame of several channel blocks crosses the graph
-    boundary in one port, which a DMA-fed frame cannot do. 
+    boundary in one port, which a DMA-fed frame cannot do.
     """
 
     variant_id = 'conv2d.s.r.v1'

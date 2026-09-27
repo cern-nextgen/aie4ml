@@ -5,6 +5,7 @@ import numpy as np
 from ..ir import TraitInstance, get_backend_context
 from ..op_impls import get_family_resolver_registry
 from .base import AIEPass
+from .utils import keeps_values
 
 
 def _row_permutation(shape, axis_order):
@@ -122,6 +123,13 @@ class FoldViewOps(AIEPass):
                 f'{node.name}: {source.name!r} has {len(source.consumers)} consumers, so its producer '
                 f'cannot write {kind} for all of them.'
             )
+
+        if not keeps_values(source.precision, out_tv.precision):
+            raise NotImplementedError(
+                f'{node.name}: {kind} only rearranges values, but {out_tv.name!r} is quantized {out_tv.precision}, '
+                f'not {source.precision}.'
+            )
+        out_tv.precision = source.precision  # the producer's rounding is what the view carries
 
         order = _row_permutation(source.shape, node.metadata['axis_order'])
         if order is not None:

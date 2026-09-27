@@ -59,3 +59,13 @@ def is_pointwise_dense(layer) -> bool:
         and (layer.get_attr('in_height'), layer.get_attr('in_width'))
         == (layer.get_attr('out_height'), layer.get_attr('out_width'))
     )
+
+
+def keeps_values(source, result) -> bool:
+    """Whether an op that only moves or selects values (a reshape, a max pool) can carry `source`'s quantization into
+    `result`: they must share a representation; how `result` would round or saturate never applies."""
+    from ..aie_types import QuantIntent
+
+    if isinstance(source, QuantIntent) and isinstance(result, QuantIntent):
+        return (source.width, source.frac, source.signed) == (result.width, result.frac, result.signed)
+    return source == result

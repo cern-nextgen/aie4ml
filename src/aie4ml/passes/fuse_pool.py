@@ -3,6 +3,7 @@
 from ..ir import TraitInstance, get_backend_context
 from ..op_impls import get_family_resolver_registry
 from .base import AIEPass
+from .utils import keeps_values
 
 
 class FusePool(AIEPass):
@@ -37,11 +38,12 @@ class FusePool(AIEPass):
                 raise ValueError(
                     f'{pool.name}: a fused pool runs inside {producer.name}; direct that layer instead, not the pool.'
                 )
-            if source.precision != pooled.precision:
+            if not keeps_values(source.precision, pooled.precision):
                 raise NotImplementedError(
                     f'{pool.name}: a fused pool keeps its input quantization, but its output is quantized '
                     f'{pooled.precision}, not {source.precision}.'
                 )
+            pooled.precision = source.precision  # the producer rounds and saturates what the pool then selects
             window = {k: pool.metadata[k] for k in ('kernel_shape', 'strides', 'dilations', 'pads')}
             producer.add_trait(TraitInstance('fused_pool', {'kind': kind, **window}))
             graph.remove_node(pool, mode='contract')
