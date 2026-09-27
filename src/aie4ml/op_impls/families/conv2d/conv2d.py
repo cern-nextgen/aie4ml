@@ -43,6 +43,7 @@ from .common import (
     describe_frame_staging,
     describe_logical_staging,
     frame_view,
+    fused_pool_of,
     spatial_access_of,
 )
 from .config import Conv2dConfig, Conv2dFlags, FrameRetileConfig
@@ -55,8 +56,9 @@ Four rows keep the halo copy between bands (window - 1 rows) small relative to t
 the frame it holds stays a fraction of the whole image.
 """
 
-_SPATIAL_BLOCKS = {'AIE': 2, 'AIE-ML': 4, 'AIE-MLV2': 4}
-"""Register blocking measured best per generation: mmul row tiles per accumulator set."""
+_SPATIAL_BLOCKS = {'AIE': (2,), 'AIE-ML': (4, 2), 'AIE-MLV2': (4, 2)}
+"""Register blockings per generation, mmul row tiles per accumulator set: the first that pads the output width
+least, which is the larger one where both fit it (measured faster), else the one computing fewer padded pixels."""
 
 
 def _padded_blocks(blocks: int) -> int:
@@ -121,14 +123,30 @@ class Conv2dOpImplVariant(OpImplVariant):
         generation = select_generation_key(device.generation)
         m, k, n = MICROTILE_OPTIONS[generation][('int8', 'int8')][0]
         microtiling = MatmulMicrotileConfig(microtile_m=m, microtile_k=k, microtile_n=n)
-        spatial_blocks = _SPATIAL_BLOCKS[generation]
+        out_w = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[1]
+        spatial_blocks = min(_SPATIAL_BLOCKS[generation], key=lambda blocks: align_up(out_w, blocks * m))
 
         view = node.traits.get('output_view')
         flatten = view is not None and view.data['kind'] == VIEW_FLATTEN_2D
         parallelism = self._resolve_parallelism(node, parallel_cfg, input_contracts, flatten=flatten)
-        block = spatial_blocks * m
+        # Frames keep the generation's widest block: every op on a tensor must derive the same frame from it.
+        block = max(_SPATIAL_BLOCKS[generation]) * m
         outer = parallelism.contract == 'outer'
         row_slices = parallelism.cas_num if outer else 1
+        pool = fused_pool_of(node)
+        if pool is not None:
+            window = pool.window
+            if window.kernel != (2, 2) or window.strides != (2, 2) or any(window.pads) or window.dilations != (1, 1):
+                raise NotImplementedError(
+                    f'{node.name}: {self.variant_id} fuses a 2x2 max pool of stride 2 without pads, not {window}.'
+                )
+            conv_rows = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+            if outer and (conv_rows // parallelism.cas_num) % 2:
+                raise NotImplementedError(
+                    f"{node.name}: each of its {parallelism.cas_num} row slices (contract 'outer') must hold whole "
+                    f'pool windows, but {conv_rows} output rows split into odd slices.'
+                )
+
         io_views = {
             lhs.name: frame_view(
                 lhs, column_block=block, column_align=m, channel_slices=parallelism.cas_length, row_slices=row_slices
@@ -184,6 +202,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             bank_mem_bytes=int(device.bank_mem_bytes),
             flags=Conv2dFlags(use_relu=use_relu, emit_flattened=flatten),
+            pool=pool,
         )
 
     def _resolve_parallelism(self, node, parallel_cfg, input_contracts, *, flatten: bool) -> ParallelismConfig:
@@ -554,12 +573,13 @@ class Conv2dOpImplVariant(OpImplVariant):
         if config.flags.emit_flattened:
             return describe_inner_output_staging(view, port, buf_dims)
         outer = config.parallelism.contract == 'outer'
+        # 'outer': each chain writes its share of the output rows -- the pooled ones, under a fused pool.
         return describe_frame_staging(
             view,
             'write',
             0 if outer else int(port),
             row_slice=int(port) if outer else 0,
-            row_step=self._rows_per_chain(node, config),
+            row_step=int(view.logical[1]) // int(config.parallelism.cas_num) if outer else 0,
         )
 
     def build_ports(self, node: OpNode, config: Conv2dConfig):
@@ -718,6 +738,8 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
             raise NotImplementedError(f'{node.name}: {self.variant_id} does not implement partitioning yet.')
         if config.flags.emit_flattened:
             raise NotImplementedError(f'{node.name}: {self.variant_id} writes a frame, not a flattened row.')
+        if config.pool is not None:
+            raise NotImplementedError(f'{node.name}: {self.variant_id} does not fuse a pool yet.')
         return config
 
     def validate_config(self, node: OpNode, config: Conv2dConfig, device) -> None:

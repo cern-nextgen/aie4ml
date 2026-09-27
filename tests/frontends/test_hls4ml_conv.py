@@ -115,3 +115,69 @@ def test_layers_without_bias_lower_with_only_their_operands(tmp_path):
     assert [n.op_type for n in weighted] == ['conv2d', 'conv2d', 'dense']
     for node in weighted:
         assert sorted(node.roles.values()) == ['lhs', 'rhs'] and len(node.inputs) == 2, node.name
+
+
+PARTS = {
+    'aie1': 'xcvp2802-vsva5601-2MHP-e-S',
+    'aie-ml': 'xcve2802-vsvh1760-2mp-e-s',
+    'aie-mlv2': 'xc2ve3858-ssva2112-2mp-e-s',
+}
+
+
+def _pooled_model(tmp_path, part, relu_after_pool=False):
+    """QConv2D -> quantized ReLU -> MaxPooling2D -> Flatten -> QDense, the ReLU on either side of the pool."""
+    hls4ml = pytest.importorskip('hls4ml')
+    pytest.importorskip('qkeras')
+    from keras.models import Sequential
+    from qkeras import QActivation, QConv2D, QDense, quantized_bits, quantized_relu
+
+    tf.keras.utils.set_random_seed(7)
+    q_w = quantized_bits(BITS, 2, alpha=1)
+    relu = QActivation(quantized_relu(BITS, 2), name='relu')
+    pool = tf.keras.layers.MaxPooling2D((2, 2), name='pool')
+    model = Sequential(
+        [
+            tf.keras.layers.InputLayer(input_shape=(H, W, CIN)),
+            QConv2D(16, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
+            *([pool, relu] if relu_after_pool else [relu, pool]),
+            tf.keras.layers.Flatten(name='flatten'),
+            QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
+    hls_model = hls4ml.converters.convert_from_keras_model(
+        model,
+        backend='AIE',
+        io_type='io_parallel',
+        output_dir=str(tmp_path / 'proj'),
+        part=part,
+        hls_config=config,
+        project_name='proj',
+        batch_size=1,
+        iterations=2,
+    )
+    return model, hls_model
+
+
+@pytest.mark.parametrize('relu_after_pool', [False, True], ids=['relu-pool', 'pool-relu'])
+def test_hls4ml_max_pool_fuses_into_the_conv(tmp_path, relu_after_pool):
+    """The same canonical pool2d the ONNX MaxPool lowers to, so the conv fuses it and the ReLU either side."""
+    import aie4ml
+
+    _, hls_model = _pooled_model(tmp_path, PART, relu_after_pool)
+    logical = aie4ml.from_hls4ml(hls_model).context.ir.logical
+    (conv,) = [n for n in logical if n.op_type == 'conv2d']
+    assert not [n for n in logical if n.op_type == 'pool2d']
+    assert {'fused_pool', 'fused_activation', 'output_view'} <= set(conv.traits)
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', PARTS.values(), ids=PARTS.keys())
+def test_hls4ml_max_pool_matches_qkeras(tmp_path, part):
+    model, hls_model = _pooled_model(tmp_path, part)
+    hls_model.compile()
+    x = np.random.default_rng(5).integers(-128, 128, size=(2, H, W, CIN)).astype(np.float32) / 32  # input grid
+    want = model.predict(x, verbose=0)  # two distinct inferences: the output is refilled every call
+    got = hls_model.predict(x.reshape(2, 1, H, W, CIN), simulator='x86')  # (iterations, batch, ...)
+    np.testing.assert_equal(np.asarray(got).reshape(want.shape), want)

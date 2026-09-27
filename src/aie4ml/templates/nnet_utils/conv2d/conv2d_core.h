@@ -8,6 +8,7 @@
 #pragma once
 #include <adf.h>
 #include <aie_api/aie.hpp>
+#include <limits>
 #include "parameters.h"
 
 using namespace adf;
@@ -33,6 +34,7 @@ inline void conv2d_check_contract() {
   static_assert(ConfigT::IN_ORIGIN_C >= ConfigT::PAD_L, "the image sits behind its column border");
   static_assert(ConfigT::IN_ORIGIN_C % ConfigT::M == 0 && ConfigT::OUT_ORIGIN_C % ConfigT::M == 0,
                 "origins keep tile stores aligned");
+  static_assert(ConfigT::FLATTEN || ConfigT::OUT_COLS % ConfigT::M == 0, "output rows keep tile stores aligned");
   static_assert(ConfigT::IN_ORIGIN_C + ConfigT::IN_W <= ConfigT::IN_COLS, "the image fits the frame columns");
   // A frame holds the whole image, one band of it, or -- under a vertical stride -- only the rows
   // its outputs actually read, which can stop short of the last image row. Either way it holds
@@ -50,8 +52,77 @@ inline void conv2d_check_contract() {
   static_assert(ConfigT::STRIDE_W == 1 || !ConfigT::FILLS_BORDER,
                 "a strided frame is delivered with its border, because a kernel store writes whole "
                 "register tiles and those land in different polyphase classes");
-  static_assert(ConfigT::FLATTEN || ConfigT::OUT_ORIGIN_C + ConfigT::OUT_W_COMPUTED <= ConfigT::OUT_COLS,
+  static_assert(ConfigT::FLATTEN || ConfigT::OUT_ORIGIN_C + ConfigT::OUT_W_COMPUTED / (ConfigT::POOL ? 2 : 1) <=
+                                        ConfigT::OUT_COLS,
                 "output frame holds every column the computed tiles write");
+}
+
+// A fused pool drops an odd last row, in every kernel of a chain alike.
+template<typename ConfigT>
+inline constexpr int conv2d_rows = ConfigT::POOL ? ConfigT::OUT_H / 2 * 2 : ConfigT::OUT_H;
+
+// The max's identity; zero also applies the ReLU, which commutes with the max.
+template<typename ConfigT>
+static inline void conv2d_pool_fill(typename ConfigT::result_t* out)
+{
+  using result_t = typename ConfigT::result_t;
+  constexpr int M = ConfigT::M, SA = M * 8, ROWS = conv2d_rows<ConfigT> / 2;
+  const auto identity =
+      aie::broadcast<result_t, SA>(ConfigT::USE_RELU ? result_t(0) : std::numeric_limits<result_t>::lowest());
+  if constexpr (ConfigT::FLATTEN) {
+    for (int slot = 0; slot < ROWS * (ConfigT::OUT_W / 2) * ConfigT::NB; ++slot)
+      aie::store_v(out + slot * SA, identity);
+  } else {
+    for (int nb = 0; nb < ConfigT::NB; ++nb)
+      for (int py = 0; py < ROWS; ++py) {
+        result_t* row = out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + py) * ConfigT::OUT_COLS +
+                               ConfigT::OUT_ORIGIN_C) * 8;
+        for (int px = 0; px < ConfigT::OUT_W_COMPUTED / 2; px += M) aie::store_v(row + px * 8, identity);
+      }
+  }
+}
+
+// Pools two register tiles at a time: M is even, so no pixel pair straddles them, and vectors stay
+// within 1024 bits.
+template<typename ConfigT, typename MMUL>
+static inline void conv2d_store_pooled(typename ConfigT::result_t* out, int oy, int x, int nb, MMUL& lo, MMUL& hi)
+{
+  using result_t = typename ConfigT::result_t;
+  // AIE1 has no 8-bit vector ALU: pool in int16, pack once on the store.
+  using pool_t = std::conditional_t<__AIE_ARCH__ == 10 && sizeof(result_t) == 1, int16, result_t>;
+  constexpr int M = ConfigT::M, SA = M * 8, PIXEL_WORDS = 8 * sizeof(pool_t) / 4;
+  static_assert(M % 2 == 0, "a register tile holds whole pixel pairs");
+  auto widen = [](aie::vector<result_t, SA> v) {
+    if constexpr (std::is_same_v<pool_t, result_t>) return v; else return v.template unpack<pool_t>();
+  };
+  auto narrow = [](aie::vector<pool_t, SA> v) {
+    if constexpr (std::is_same_v<pool_t, result_t>) return v; else return v.template pack<result_t>();
+  };
+  auto merge = [&](result_t* o, aie::vector<pool_t, SA> v) {
+    aie::store_v(o, narrow(aie::max(v, widen(aie::load_v<SA>(o)))));
+  };
+  const auto row = aie::concat(widen(lo.template to_vector<result_t>(ConfigT::SHIFT)),
+                               widen(hi.template to_vector<result_t>(ConfigT::SHIFT)));
+  // Word permutes are native; AIE1 runs byte permutes through the multiplier.
+  const auto words = row.template cast_to<int32>();
+  const aie::vector<pool_t, SA> pooled = aie::max(aie::filter_even(words, PIXEL_WORDS).template cast_to<pool_t>(),
+                                                   aie::filter_odd(words, PIXEL_WORDS).template cast_to<pool_t>());
+  const int py = oy / 2, px = x / 2;
+  if constexpr (ConfigT::FLATTEN) {
+    // As the unpooled store: each pixel at row 0 of its M-row slot.
+    auto pair = aie::concat(pooled, pooled).template cast_to<int32>();
+    for (int i = 0; i < M; ++i) {
+      if (px + i < ConfigT::OUT_W / 2)
+        merge(out + ((py * (ConfigT::OUT_W / 2) + px + i) * ConfigT::NB + nb) * SA,
+              aie::shuffle_down(pair, PIXEL_WORDS * i)
+                  .template extract<SA * sizeof(pool_t) / 4>(0)
+                  .template cast_to<pool_t>());
+    }
+  } else {
+    merge(out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + py) * ConfigT::OUT_COLS +
+                 ConfigT::OUT_ORIGIN_C + px) * 8,
+          pooled);
+  }
 }
 
 template<typename ConfigT>
@@ -137,8 +208,9 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
   using MMUL = aie::mmul<M, 8, 8, data_t, weight_t, acc_scalar_t>;
 
   if constexpr (ConfigT::FILLS_BORDER) conv2d_zero_border<ConfigT>(frame);
+  if constexpr (ConfigT::POOL && !CASC_OUT) conv2d_pool_fill<ConfigT>(out);
 
-  for (int oy = 0; oy < ConfigT::OUT_H; ++oy) {
+  for (int oy = 0; oy < conv2d_rows<ConfigT>; ++oy) {
     for (int z = 0; z < ConfigT::OUT_W_COMPUTED; z += MB * M) {
       const data_t* pA = frame + oy * ConfigT::STRIDE_H * G::RB + z * 8;
       for (int j = 0; j < NB; j += 2) {
@@ -207,6 +279,13 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
             writeincr(outCascade, C21.to_accum());
             writeincr(outCascade, C30.to_accum());
             writeincr(outCascade, C31.to_accum());
+          }
+        } else if constexpr (ConfigT::POOL) {
+          conv2d_store_pooled<ConfigT>(out, oy, z, j, C00, C10);
+          if (j + 1 < NB) conv2d_store_pooled<ConfigT>(out, oy, z, j + 1, C01, C11);
+          if constexpr (MB == 4) {
+            conv2d_store_pooled<ConfigT>(out, oy, z + 2 * M, j, C20, C30);
+            if (j + 1 < NB) conv2d_store_pooled<ConfigT>(out, oy, z + 2 * M, j + 1, C21, C31);
           }
         } else {
           auto store_tile = [&](int nb, int mm, MMUL& acc) {

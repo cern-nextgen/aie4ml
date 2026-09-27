@@ -169,7 +169,7 @@ class AIEBackend(Backend):
 
     def create_initial_config(
         self,
-        part='xilinx_vek280_base_202520_1',
+        part='xilinx_vek280_base_202610_1',
         plio_width_bits=None,
         pl_clock_freq_mhz=None,
         batch_size=8,

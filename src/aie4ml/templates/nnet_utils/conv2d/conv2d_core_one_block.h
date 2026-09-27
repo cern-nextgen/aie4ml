@@ -27,6 +27,7 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
   static_assert(ConfigT::NB == 1 && ConfigT::NBP == 1, "one output block, unpadded");
 
   if constexpr (ConfigT::FILLS_BORDER) conv2d_zero_border<ConfigT>(frame);
+  if constexpr (ConfigT::POOL && !CASC_OUT) conv2d_pool_fill<ConfigT>(out);
 
   aie::vector<bias_t, M * 8> bb;
   if constexpr (!CASC_IN) {
@@ -34,7 +35,7 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
     for (int m = 0; m < M; ++m) bb.template insert<8>(m, b);
   }
 
-  for (int oy = 0; oy < ConfigT::OUT_H; ++oy) {
+  for (int oy = 0; oy < conv2d_rows<ConfigT>; ++oy) {
     for (int z = 0; z < ConfigT::OUT_W_COMPUTED; z += MB * M) {
       const data_t* pA = frame + oy * ConfigT::STRIDE_H * G::RB + z * 8;
       MMUL C0, C1, C2, C3;
@@ -82,6 +83,9 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
           writeincr(outCascade, C2.to_accum());
           writeincr(outCascade, C3.to_accum());
         }
+      } else if constexpr (ConfigT::POOL) {
+        conv2d_store_pooled<ConfigT>(out, oy, z, 0, C0, C1);
+        if constexpr (MB == 4) conv2d_store_pooled<ConfigT>(out, oy, z + 2 * M, 0, C2, C3);
       } else {
         auto store_tile = [&](int mm, MMUL& acc) {
           aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);

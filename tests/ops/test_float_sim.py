@@ -594,7 +594,7 @@ def test_bf16_combined_mlp_pipeline(tmp_path):
     aie_model = from_onnx(
         model,
         {
-            'Part': 'xilinx_vek280_base_202520_1',
+            'Part': 'xilinx_vek280_base_202610_1',
             'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
         },
         output_dir=tmp_path / 'proj_bf16_mlp',
@@ -663,7 +663,7 @@ def test_bf16_combined_mlp_x86_bit_exact(tmp_path):
     aie_model = from_onnx(
         model,
         {
-            'Part': 'xilinx_vek280_base_202520_1',
+            'Part': 'xilinx_vek280_base_202610_1',
             'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
         },
         output_dir=tmp_path / 'proj_bf16_mlp_x86',
@@ -930,7 +930,7 @@ def test_float_like_single_dense_x86_code_diff(tmp_path, mode):
         model_dim=model_dim,
         out_dim=out_dim,
     )
-    part = 'vek385_base' if mode == 'fp8' else 'xilinx_vek280_base_202520_1'
+    part = 'vek385_base' if mode == 'fp8' else 'xilinx_vek280_base_202610_1'
     aie_model = from_onnx(
         model,
         {

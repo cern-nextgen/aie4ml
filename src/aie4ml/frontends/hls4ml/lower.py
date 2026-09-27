@@ -190,6 +190,17 @@ class LowerToAieIr(ModelOptimizerPass):
             )
             meta['input_roles'] = ['lhs', 'rhs'] + (['bias'] if layer.get_attr('bias_data') is not None else [])
 
+        if node.op_type == 'pool2d':
+            # The canonical pool2d the ONNX MaxPool lowers to; hls4ml gives Keras 'same' pads explicitly.
+            meta.update(
+                kind=str(layer.get_attr('pool_op')).lower(),
+                kernel_shape=(int(layer.get_attr('pool_height')), int(layer.get_attr('pool_width'))),
+                strides=(int(layer.get_attr('stride_height')), int(layer.get_attr('stride_width'))),
+                dilations=(1, 1),
+                pads=tuple(int(layer.get_attr(f'pad_{side}', 0)) for side in ('top', 'left', 'bottom', 'right')),
+            )
+            meta['input_roles'] = ['lhs']
+
         if node.op_type == 'reshape':
             # hls4ml tensors are already in canonical order, so the flattened row ravels the axes
             # exactly as they are stored.
@@ -264,6 +275,8 @@ class LowerToAieIr(ModelOptimizerPass):
             )
         if layer.class_name in ('Conv2D', 'DepthwiseConv2D'):
             return 'conv2d'
+        if layer.class_name == 'Pooling2D':
+            return 'pool2d'
         if layer.class_name in ('Reshape', 'Flatten'):
             return 'reshape'
         if layer.class_name == 'Transpose':

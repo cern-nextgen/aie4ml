@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional
 # Itanium mangling prefixes each identifier with its length (_ZN12dense_singleI... ->
 # 12 chars of 'dense_single'), which is how the class name is recovered from the symbol.
 _KERNEL_RE = re.compile(r'run _ZN(\d+)([A-Za-z_][A-Za-z0-9_]*)')
+_TILE_RE = re.compile(r'array\.tile_(\d+)_(\d+)')  # a profile's tile, by absolute array row
 _PLIO_RE = re.compile(r'\|\s*(?:plio)?\s*\|?\s*(PLIO_\w+)\s*\|\s*(IN|OUT)\s*\|\s*([\d.]+)')
 _CORE_RE = re.compile(r'^Core (\S+)', re.M)
 
@@ -325,7 +326,8 @@ def _vitis(project: Path) -> Dict[str, Any]:
         for n in doc.get('nets', {}).values()
         if 'srcInstance' in n and 'dstInstance' in n
     ]
-    return {'tiles': tiles, 'memtiles': memtiles, 'nets': nets, 'inst_op': inst_op}
+    row_start = (doc.get('aie_driver_config') or {}).get('aie_tile_row_start')
+    return {'tiles': tiles, 'memtiles': memtiles, 'nets': nets, 'inst_op': inst_op, 'aie_tile_row_start': row_start}
 
 
 def _op_edges(vitis: Dict[str, Any]) -> List[tuple]:
@@ -363,11 +365,17 @@ def _project_dir(model_or_path) -> Path:
 def _kernel_cycles(project: Path, vitis: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Per-tile compute cycles and stall share, from the --profile function reports."""
     owned = _op_tiles(project, vitis)
+    # Profile file names offset the row differently per device (AIE-MLv2 keeps its memory-tile rows), so a
+    # profile's core comes from the tile it names, less the design's first core row.
+    row_start = vitis.get('aie_tile_row_start')
+    if row_start is None:
+        return []
     rows = []
     for path in sorted(project.glob('aiesimulator_output/profile_funct_*.txt')):
         text = path.read_text(errors='ignore')
         run = next((ln for ln in text.splitlines() if 'run _ZN' in ln), None)
-        if run is None:
+        named = _TILE_RE.search(text)
+        if run is None or named is None:
             continue
         fields = run.split()
         try:
@@ -381,7 +389,7 @@ def _kernel_cycles(project: Path, vitis: Dict[str, Any]) -> List[Dict[str, Any]]
         # the second group is the kernel's cost -- reading the first would charge its callees to
         # nobody and leave the difference looking like time blocked on a port.
         busy = fields[7].rstrip('%') if len(fields) > 7 else ''
-        tile = path.stem.replace('profile_funct_', '')
+        tile = f'{named.group(1)}_{int(named.group(2)) - int(row_start)}'
         rows.append(
             {
                 'tile': tile,
