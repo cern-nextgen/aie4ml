@@ -716,3 +716,61 @@ def test_direct_padded_output_uses_dma_projection(tmp_path):
         {'dimension': 0, 'stride': 8, 'wrap': 2},
         {'dimension': 2, 'stride': 1, 'wrap': 4},
     ]
+
+
+def _small_batch_dense_model(rows):
+    """int16 rows against distinct int8 weights, so a row from the wrong inference changes every output."""
+    nodes = [
+        helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'),
+        helper.make_node('DequantizeLinear', ['w_q', 'w_scale', 'w_zp'], ['w'], name='w_dq'),
+        helper.make_node('MatMul', ['x', 'w'], ['mm'], name='dense'),
+        helper.make_node('QuantizeLinear', ['mm', 'y_scale', 'y_zp'], ['y_q'], name='y_q'),
+        helper.make_node('DequantizeLinear', ['y_q', 'y_scale', 'y_zp'], ['y'], name='y_dq'),
+    ]
+    weights = np.random.default_rng(1).integers(-4, 5, size=(32, 16)).astype(np.int8)
+    return make_model(
+        'aie1_small_batch',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT16, [rows, 32])],
+        outputs=[('y', TensorProto.FLOAT, [rows, 16])],
+        initializers=[
+            *_qparams('x', TensorProto.INT16),
+            *_qparams('w', TensorProto.INT8),
+            *_qparams('y', TensorProto.INT8),
+            numpy_helper.from_array(weights, 'w_q'),
+        ],
+        opset=21,  # int16 QDQ
+    )
+
+
+def test_a_batch_below_the_padded_tile_moves_only_its_rows(tmp_path):
+    """AIE1 pads 4 int16 rows to a tile of 8 and has no memory tile to fill the rest, so each boundary DMA
+    walks only the rows the host moves; walking the whole tile, the input would wait for rows never sent."""
+    aie_model = from_onnx(
+        _small_batch_dense_model(4),
+        {'Part': AIE1_PART, 'AIEConfig': {'BatchSize': 4, 'Iterations': 2}},
+        output_dir=tmp_path,
+        project_name='small_batch',
+    )
+    aie_model.run_pipeline()
+    for io in aie_model.context.ir.physical.plan['io_ports']:
+        walks = {step['dimension']: step['wrap'] for step in io['descriptor']['tile_traversal']}
+        assert io['staging']['tiling_dimension'][1] == 4 and walks[2] == 1, io['direction']
+
+
+@pytest.mark.requires_vitis
+def test_a_batch_below_the_padded_tile_matches_onnx(tmp_path):
+    from helpers import assert_x86_matches_onnx
+
+    feeds = {'x_q': np.random.default_rng(3).integers(-200, 200, size=(2, 4, 32)).astype(np.int16)}
+    assert_x86_matches_onnx(
+        _small_batch_dense_model(4),
+        feeds,
+        {},
+        tmp_path,
+        batch=4,
+        max_code_diff=0,
+        part=AIE1_PART,
+        iterations=2,
+        per_iteration=True,
+    )

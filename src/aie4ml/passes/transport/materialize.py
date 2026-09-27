@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 from ...aie_types import AIEDataType
 from ...ir import get_backend_context
 from ...op_impls.common_types import PORT_KIND_STREAM
-from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, staging_tile_shape
+from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, STORAGE_LAYOUT_MICROTILED, staging_tile_shape
 from ..base import AIEPass
 from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, location_problem, pinned_locations, static_problem
 from ..utils import sanitize_identifier
@@ -224,7 +224,17 @@ class _MemoryPlanMaterializer:
                 # Vitis accepts access constraints on hierarchical ports but does not apply their buffer
                 # reorder; bind them to the kernel ports. A stream port has no DMA to constrain, and
                 # neither does a transfer that already moves the buffer in its own order.
-                descriptor = boundary_access_descriptor(descriptor, element_bits=int(element.width))
+                # A padded microtiled buffer takes only the logical rows the PLIO carries, as its output does;
+                # left to walk the whole buffer, the DMA would wait for rows the host never sends.
+                padded = int(prod(staging_tile_shape(descriptor))) != int(prod(staging['io_tiling_dimension']))
+                descriptor = boundary_access_descriptor(
+                    descriptor,
+                    element_bits=int(element.width),
+                    project_to_io_boundary=padded and descriptor.get('storage_layout') == STORAGE_LAYOUT_MICROTILED,
+                )
+                transfer = descriptor.pop('transfer_shape', None)
+                if transfer is not None:
+                    staging['tiling_dimension'] = [int(value) for value in transfer]  # the host pads to it
                 if not describes_natural_order(descriptor):
                     self.kernel_write_accesses.extend(
                         {'endpoint': f'{consumer_id}.{endpoint}', 'descriptor': descriptor}
