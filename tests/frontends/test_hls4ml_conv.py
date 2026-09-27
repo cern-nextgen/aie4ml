@@ -117,6 +117,56 @@ def test_layers_without_bias_lower_with_only_their_operands(tmp_path):
         assert sorted(node.roles.values()) == ['lhs', 'rhs'] and len(node.inputs) == 2, node.name
 
 
+def _batchnorm_model(tmp_path, part):
+    """QConv2DBatchnorm with trained-looking statistics: hls4ml folds them into its quantized weights and bias."""
+    hls4ml = pytest.importorskip('hls4ml')
+    qkeras = pytest.importorskip('qkeras')
+    from keras.models import Sequential
+
+    keras.utils.set_random_seed(7)
+    q_w = qkeras.quantized_bits(BITS, 2, alpha=1)
+    conv = qkeras.QConv2DBatchnorm(COUT, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv')
+    model = Sequential([keras.Input(shape=(H, W, CIN)), conv, qkeras.QActivation(qkeras.quantized_relu(BITS, 2))])
+    rng = np.random.default_rng(3)
+    stats = {'gamma': (0.5, 1.5), 'beta': (-0.5, 0.5), 'moving_mean': (-0.5, 0.5), 'moving_variance': (0.5, 2)}
+    for weight in conv.weights:
+        if (name := weight.path.rsplit('/', 1)[1]) in stats:
+            weight.assign(rng.uniform(*stats[name], COUT).astype(np.float32))
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
+    hls_model = hls4ml.converters.convert_from_keras_model(
+        model,
+        backend='AIE',
+        io_type='io_parallel',
+        output_dir=str(tmp_path / 'proj'),
+        part=part,
+        hls_config=config,
+        project_name='proj',
+        batch_size=1,
+        iterations=2,
+    )
+    return model, hls_model
+
+
+def test_hls4ml_folded_batchnorm_lowers_to_a_conv(tmp_path):
+    import aie4ml
+
+    _, hls_model = _batchnorm_model(tmp_path, PART)
+    (conv,) = [n for n in aie4ml.from_hls4ml(hls_model).context.ir.logical if n.op_type == 'conv2d']
+    folded = next(layer for layer in hls_model.get_layers() if layer.class_name == 'Conv2DBatchnorm')
+    np.testing.assert_array_equal(conv.inputs[1].data, folded.weights['weight'].data)
+
+
+@pytest.mark.requires_vitis
+def test_hls4ml_folded_batchnorm_matches_qkeras(tmp_path):
+    model, hls_model = _batchnorm_model(tmp_path, 'xcve2802-vsvh1760-2mp-e-s')
+    hls_model.compile()
+    x = np.random.default_rng(5).integers(-128, 128, size=(2, H, W, CIN)).astype(np.float32) / 32
+    want = model.predict(x, verbose=0)
+    got = hls_model.predict(x.reshape(2, 1, H, W, CIN), simulator='x86')
+    np.testing.assert_equal(np.asarray(got).reshape(want.shape), want)
+
+
 PARTS = {
     'aie1': 'xcvp2802-vsva5601-2MHP-e-S',
     'aie-ml': 'xcve2802-vsvh1760-2mp-e-s',
