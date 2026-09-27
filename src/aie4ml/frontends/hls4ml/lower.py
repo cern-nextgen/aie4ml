@@ -273,8 +273,13 @@ class LowerToAieIr(ModelOptimizerPass):
                 f'{layer.name}: a separable convolution is a depthwise and a pointwise convolution; '
                 'split it in the model so each lowers to its own conv2d.'
             )
-        if layer.class_name in ('Conv2D', 'DepthwiseConv2D'):
+        if layer.class_name in ('Conv2D', 'DepthwiseConv2D', 'Conv2DBatchnorm'):  # hls4ml folds the batchnorm
             return 'conv2d'
+        if layer.class_name == 'BatchNormalization':
+            raise NotImplementedError(
+                f'{layer.name}: a batch normalization hls4ml did not fold into the layer before it; '
+                'fold it in the model, e.g. with QKeras QConv2DBatchnorm.'
+            )
         if layer.class_name == 'Pooling2D':
             return 'pool2d'
         if layer.class_name in ('Reshape', 'Flatten'):

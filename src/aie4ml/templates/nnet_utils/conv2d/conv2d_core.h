@@ -288,7 +288,8 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
             if (j + 1 < NB) conv2d_store_pooled<ConfigT>(out, oy, z + 2 * M, j + 1, C21, C31);
           }
         } else {
-          auto store_tile = [&](int nb, int mm, MMUL& acc) {
+          // Inlined: an outlined call would spill every accumulator it takes by reference (MLv2 outlines it).
+          auto store_tile = [&](int nb, int mm, MMUL& acc) __attribute__((always_inline)) {
             if (nb >= NB) return;
             aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
             if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));

@@ -51,6 +51,8 @@
       "CoreStreamOutputs": 1,
       "StreamSwitchWidthBits": 64,
       "CascadeWidthBits": 512,
+      "CascadeOutputFifoDepth": 2,
+      "CascadeInputFifoDepth": 2,
       "HasMemTile": true,
       "MaxMemTileInPorts": 8,
       "MaxMemTileOutPorts": 8,

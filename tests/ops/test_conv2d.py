@@ -454,6 +454,22 @@ def test_conv_refuses_dilation(tmp_path):
         lower(_model('conv_dilation', nodes, inits), tmp_path, part=AIE1_PART)
 
 
+def test_conv_refuses_an_unfolded_batchnorm(tmp_path):
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    inits += [numpy_helper.from_array(np.zeros((C3, CIN, 3, 3), np.int8), 'w_q'), *_qparams('w', frac=FRAC)]
+    inits += [numpy_helper.from_array(np.ones(C3, np.float32), f'bn_{name}') for name in 'gbmv']
+    inits += _qparams('co', frac=FRAC)
+    nodes.append(helper.make_node('DequantizeLinear', ['w_q', 'w_scale', 'w_zp'], ['w']))
+    nodes.append(helper.make_node('Conv', ['x_nchw', 'w'], ['cv'], pads=[1, 1, 1, 1], name='conv'))
+    nodes.append(helper.make_node('BatchNormalization', ['cv', 'bn_g', 'bn_b', 'bn_m', 'bn_v'], ['bn'], name='bn'))
+    qdq(nodes, 'bn', 'a', 'co')
+    _head(nodes, inits, 'a', H * W * C3, seed=9)
+    with pytest.raises(NotImplementedError, match='fold BatchNormalization'):
+        lower(_model('conv_bn', nodes, inits), tmp_path)
+
+
 # --------------------------------------------------------------------------- #
 # numerics
 # --------------------------------------------------------------------------- #
@@ -485,6 +501,21 @@ def test_graph_output_keeps_the_order_onnx_declares(tmp_path):
     which would expose a differently shaped tensor than the ONNX graph promises."""
     with pytest.raises(NotImplementedError, match=r"transpose feeds graph output 'y'"):
         lower(_nchw_output_model(), tmp_path, part=AIE1_PART)
+
+
+@pytest.mark.parametrize('part', [PART, MLV2_PART])
+def test_a_graph_output_off_a_memory_tile_moves_whole_plio_beats(tmp_path, part):
+    """12 int8 classes end mid-beat on a 128-bit PLIO: the memory tile and the host move 16 and the host trims."""
+    nodes, inits = [], []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a1', 'c1', CIN, 8, 3, pad=1, relu=True, seed=1)
+    _head(nodes, inits, 'a1', H * W * 8, seed=3)
+    ctx = lower(_model('conv_beats', nodes, inits), tmp_path, {'c1': {'parallelism': {'cas_num': 1}}}, part=part)
+    plan = ctx.ir.physical.plan
+    assert [b['tensor'] for b in plan['buffers']] == ['y']
+    out = next(p for p in plan['io_ports'] if p['direction'] == 'output')
+    assert out['descriptor']['io_boundary_dimension'] == [CLASSES, 1]
+    assert out['descriptor']['tiling_dimension'] == out['staging']['tiling_dimension'] == [16, 1]
 
 
 def test_conv2d_refuses_directives_it_does_not_implement(tmp_path):

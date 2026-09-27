@@ -11,7 +11,7 @@ pytest.importorskip('onnx')
 from aie4ml.frontends.onnx import from_onnx  # noqa: E402
 from onnx import TensorProto, helper, numpy_helper  # noqa: E402,F401  (re-exported for tests)
 
-#: Ships with Vitis 2025.2
+#: Ships with Vitis 2026.1
 PART = 'xilinx_vek280_base_202610_1'
 
 
