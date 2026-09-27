@@ -1,7 +1,7 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Normalization ops: LayerNormalization and (HCCS) Softmax."""
+"""Normalization ops: LayerNormalization and (HCCS) Softmax; BatchNormalization is refused."""
 
 from __future__ import annotations
 
@@ -12,6 +12,15 @@ from ..context import OnnxImportContext
 from ..registry import onnx_handler
 from ..shapes import normalize_axis
 from ..utils import attr
+
+
+@onnx_handler('BatchNormalization')
+def _batch_norm(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
+    # Its per-channel scale folds exactly only into float weights, before quantization.
+    raise NotImplementedError(
+        f'{node_name}: fold BatchNormalization into the layer before it ahead of quantizing (a PyTorch eval-mode '
+        'export and onnxruntime quant_pre_process fold Conv + BatchNormalization).'
+    )
 
 
 @onnx_handler('LayerNormalization')

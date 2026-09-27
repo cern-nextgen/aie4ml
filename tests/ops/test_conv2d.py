@@ -454,6 +454,22 @@ def test_conv_refuses_dilation(tmp_path):
         lower(_model('conv_dilation', nodes, inits), tmp_path, part=AIE1_PART)
 
 
+def test_conv_refuses_an_unfolded_batchnorm(tmp_path):
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    inits += [numpy_helper.from_array(np.zeros((C3, CIN, 3, 3), np.int8), 'w_q'), *_qparams('w', frac=FRAC)]
+    inits += [numpy_helper.from_array(np.ones(C3, np.float32), f'bn_{name}') for name in 'gbmv']
+    inits += _qparams('co', frac=FRAC)
+    nodes.append(helper.make_node('DequantizeLinear', ['w_q', 'w_scale', 'w_zp'], ['w']))
+    nodes.append(helper.make_node('Conv', ['x_nchw', 'w'], ['cv'], pads=[1, 1, 1, 1], name='conv'))
+    nodes.append(helper.make_node('BatchNormalization', ['cv', 'bn_g', 'bn_b', 'bn_m', 'bn_v'], ['bn'], name='bn'))
+    qdq(nodes, 'bn', 'a', 'co')
+    _head(nodes, inits, 'a', H * W * C3, seed=9)
+    with pytest.raises(NotImplementedError, match='fold BatchNormalization'):
+        lower(_model('conv_bn', nodes, inits), tmp_path)
+
+
 # --------------------------------------------------------------------------- #
 # numerics
 # --------------------------------------------------------------------------- #

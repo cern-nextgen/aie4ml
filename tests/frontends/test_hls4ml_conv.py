@@ -157,6 +157,28 @@ def test_hls4ml_folded_batchnorm_lowers_to_a_conv(tmp_path):
     np.testing.assert_array_equal(conv.inputs[1].data, folded.weights['weight'].data)
 
 
+def test_hls4ml_refuses_a_batchnorm_it_did_not_fold(tmp_path):
+    """After a quantized conv hls4ml keeps the batchnorm: folding it would change the quantized weights."""
+    hls4ml = pytest.importorskip('hls4ml')
+    qkeras = pytest.importorskip('qkeras')
+    from keras.models import Sequential
+
+    q_w = qkeras.quantized_bits(BITS, 2, alpha=1)
+    model = Sequential(
+        [
+            keras.Input(shape=(H, W, CIN)),
+            qkeras.QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
+            keras.layers.BatchNormalization(name='bn'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
+    with pytest.raises(NotImplementedError, match='did not fold'):
+        hls4ml.converters.convert_from_keras_model(
+            model, backend='AIE', output_dir=str(tmp_path / 'proj'), part=PART, hls_config=config, project_name='proj'
+        )
+
+
 @pytest.mark.requires_vitis
 def test_hls4ml_folded_batchnorm_matches_qkeras(tmp_path):
     model, hls_model = _batchnorm_model(tmp_path, 'xcve2802-vsvh1760-2mp-e-s')
