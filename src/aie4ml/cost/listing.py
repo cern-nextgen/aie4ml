@@ -22,6 +22,8 @@ CHECKED = frozenset(
     {
         ('AIE', 'V-2024.06#8be6237c82#250729'),  # Vitis 2025.2
         ('AIE', 'X-2025.06#865883355f#260312'),  # Vitis 2026.1 and 2026.1.1
+        ('AIE-ML', 'X-2025.06#764cd94af1#260213'),  # Vitis 2026.1.1
+        ('AIE-MLV2', 'X-2025.06#764cd94af1#260213'),  # Vitis 2026.1.1
     }
 )
 
@@ -47,15 +49,15 @@ _NO_DESTINATION = re.compile(r'^(?:NOP|RET|J)\b')
 class Decoder:
     """What a generation's instructions mean, where they differ: setting a location to an immediate, the
     decrement-and-branch that closes a software loop (dst, src), the store forms that write fewer bytes than the
-    generation's store unit (its `StoreBytes` in aie_devices.json), which instructions read or write the cascade,
-    and a vector load with its base register (None where not yet known for the generation)."""
+    generation's store unit (its `StoreBytes` in aie_devices.json). Cascade moves and vector loads read alike on
+    every generation."""
 
     immediate: re.Pattern
     decrement_branch: re.Pattern
     narrow: Tuple[Tuple[re.Pattern, int], ...] = ()
-    cascade_read: Optional[re.Pattern] = None
-    cascade_write: Optional[re.Pattern] = None
-    vector_load: Optional[re.Pattern] = None
+    cascade_read: re.Pattern = re.compile(r',\s*SCD\b')  # VMOV acc, SCD: one word from the chain's previous kernel
+    cascade_write: re.Pattern = re.compile(r'\bMCD\s*,')  # VMOV MCD, acc: one word to the next
+    vector_load: re.Pattern = re.compile(r'^VLD[AB](?:\.[\w.]+)?\s+\w+,\s*\[(\w+)')  # VLDA wr0, [p3, cs4]: base p3
 
 
 _ML_DECODER = dict(
@@ -67,9 +69,6 @@ DECODERS = {
         immediate=re.compile(r'^MOV(?:\.[su]\d+)?\s+(\w+),\s*#(-?\d+)$'),
         decrement_branch=re.compile(r'^BDEC\s+(\w+),\s*(\w+),'),
         narrow=((re.compile(r'^VST(?:\.SPIL)?\.48\.SRSB\s+bm\d'), 16),),  # 16 accumulator lanes, a byte each
-        cascade_read=re.compile(r',\s*SCD\b'),  # VMOV acc, SCD: one word from the chain's previous kernel
-        cascade_write=re.compile(r'\bMCD\s*,'),  # VMOV MCD, acc: one word to the next
-        vector_load=re.compile(r'^VLD[AB](?:\.[\w.]+)?\s+\w+,\s*\[(\w+)'),  # VLDA wr0, [p3, cs4]: base p3
     ),
     'AIE-ML': Decoder(**_ML_DECODER),
     'AIE-MLV2': Decoder(**_ML_DECODER),
@@ -254,8 +253,6 @@ def loop_plan(listing: Path, generation: str) -> LoopPlan:
         raise ScheduleUnavailable(f'the {generation} listing form of compiler {compiler} has not been checked.')
     decoder = DECODERS[generation]
     store_bytes = int(load_device_catalog()['generations'][generation]['StoreBytes'])
-    if decoder.cascade_read is None or decoder.cascade_write is None or decoder.vector_load is None:
-        raise ScheduleUnavailable(f'the {generation} decoder does not know cascade accesses or vector loads.')
     root = Loop(depth=0, trips=1)
     frames = [_Frame(root, None)]
     closed = []

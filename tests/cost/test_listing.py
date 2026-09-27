@@ -49,6 +49,27 @@ def test_the_descriptor_keeps_what_timing_needs_and_rebuilds_the_same_plan(tmp_p
     assert plan.root.pairs() == 3 * 4 and plan.root.moves_cascade()
 
 
+@pytest.mark.parametrize('generation', ['AIE-ML', 'AIE-MLV2'])
+def test_aie_ml_listings_count_their_own_loop_forms(tmp_path, generation):
+    lines = (
+        'MOVXM r7, #2',
+        '.loop_nesting 1',
+        'MOVA lc, #4',
+        '.loop_nesting 2',
+        '.begin_of_loop',
+        'VLDA wh0, [p0, #32]; VLDB wl1, [p0], #32; VMOV MCD, bml0',
+        'NOP',
+        '.end_of_loop',
+        '.loop_nesting 1',
+        'JNZD r7, r7, #1024',
+        '.loop_nesting 0',
+        'RET lr',
+    )
+    plan = loop_plan(_listing(tmp_path, *lines, compiler='X-2025.06#764cd94af1#260213'), generation)
+    assert plan.cycles() == 2 + 3 * (2 + 4 * 2)
+    assert plan.root.pairs() == 3 * 4 and plan.root.moves_cascade()
+
+
 def test_a_schedule_that_cannot_be_accounted_for_gives_no_cycles(tmp_path):
     with pytest.raises(ScheduleUnavailable, match='not one immediate'):
         loop_plan(_listing(tmp_path, *_nest('MOV r7, r3')), 'AIE')
