@@ -215,7 +215,7 @@ ROW_SPLIT = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
 STREAM_DIRECTIVES = {'b': {'ports': 'stream'}}
 
 
-def _padded_pair_model():
+def _padded_pair_model(size=H):
     """conv(3x3, same) -> conv(3x3, same) -> NHWC output: the first conv stores into the second's bordered frame."""
     nodes: list = []
     inits: list = []
@@ -226,8 +226,8 @@ def _padded_pair_model():
     return make_model(
         'conv_padded_pair',
         nodes=nodes,
-        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
-        outputs=[('y', TensorProto.FLOAT, [1, H, W, 8])],
+        inputs=[('x_q', TensorProto.INT8, [1, size, size, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, size, size, 8])],
         initializers=inits,
     )
 
@@ -777,6 +777,26 @@ def test_generated_graph_pins_the_frame(tmp_path):
     assert '{ -1, 0, 2, 0, 3 }' in params  # the conv's input: its west neighbour, the retiler
     assert 'location<buffer>' not in (tmp_path / 'src' / 'graph_plan.h').read_text()
     assert 'python3' not in (tmp_path / 'Makefile').read_text()
+
+
+@pytest.mark.parametrize(
+    'part, size, blocks',
+    [
+        ('xcve2802-vsvh1760-2mp-e-s', 16, 4),  # both fill 16 columns: the larger measured faster
+        ('xcve2802-vsvh1760-2mp-e-s', 8, 2),
+        (MLV2_PART, 8, 2),  # 4 blocks of 8 would compute 32 columns for 8
+        (AIE1_PART, 8, 2),
+    ],
+)
+def test_register_blocking_pads_the_output_width_least(tmp_path, part, size, blocks):
+    ctx = lower(_padded_pair_model(size), tmp_path, part=part)
+    assert ctx.ir.execution.get('b_aie').config.spatial_blocks == blocks
+
+
+def test_convs_of_different_blockings_share_one_frame(tmp_path):
+    """16 wide takes 4 blocks, the stride-2 consumer's 8 wide takes 2: the frame between them is one layout."""
+    ctx = lower(_strided_chain_model(size=16), tmp_path, part='xcve2802-vsvh1760-2mp-e-s')
+    assert [ctx.ir.execution.get(n).config.spatial_blocks for n in ('first_aie', 'second_aie')] == [4, 2]
 
 
 def test_frame_larger_than_a_bank_is_refused(tmp_path):
