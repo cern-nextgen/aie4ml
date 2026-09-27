@@ -46,7 +46,7 @@ def lowered(tmp_path):
         project_name='proj',
         batch_size=1,  # conv2d.b.r.v1 runs one sample per call
     )
-    hls_model.compile()
+    hls_model.write()
     from aie4ml.ir import get_backend_context
 
     return get_backend_context(hls_model)
