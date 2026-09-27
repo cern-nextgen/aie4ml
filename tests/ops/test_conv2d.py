@@ -487,6 +487,21 @@ def test_graph_output_keeps_the_order_onnx_declares(tmp_path):
         lower(_nchw_output_model(), tmp_path, part=AIE1_PART)
 
 
+@pytest.mark.parametrize('part', [PART, MLV2_PART])
+def test_a_graph_output_off_a_memory_tile_moves_whole_plio_beats(tmp_path, part):
+    """12 int8 classes end mid-beat on a 128-bit PLIO: the memory tile and the host move 16 and the host trims."""
+    nodes, inits = [], []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a1', 'c1', CIN, 8, 3, pad=1, relu=True, seed=1)
+    _head(nodes, inits, 'a1', H * W * 8, seed=3)
+    ctx = lower(_model('conv_beats', nodes, inits), tmp_path, {'c1': {'parallelism': {'cas_num': 1}}}, part=part)
+    plan = ctx.ir.physical.plan
+    assert [b['tensor'] for b in plan['buffers']] == ['y']
+    out = next(p for p in plan['io_ports'] if p['direction'] == 'output')
+    assert out['descriptor']['io_boundary_dimension'] == [CLASSES, 1]
+    assert out['descriptor']['tiling_dimension'] == out['staging']['tiling_dimension'] == [16, 1]
+
+
 def test_conv2d_refuses_directives_it_does_not_implement(tmp_path):
     """The kernel fixes its own register tiling, so a microtiling request is refused, not ignored."""
     with pytest.raises(NotImplementedError, match='microtiling'):

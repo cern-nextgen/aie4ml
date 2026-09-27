@@ -508,7 +508,7 @@ class _MemoryPlanMaterializer:
             'access': 'read',
             'storage_layout': STORAGE_LAYOUT_LINEAR,
             'buffer_dimension': list(buf_dims),
-            'tiling_dimension': io_tile,
+            'tiling_dimension': self._whole_beats(entry, io_tile, int(base['inner_dimension'])),
             'io_tiling_dimension': list(io_tile),
             'io_boundary_dimension': list(io_boundary),
             'offset': offset,
@@ -586,7 +586,20 @@ class _MemoryPlanMaterializer:
         producer = entry.producer
         inst = self._kernel_inst(producer.node)
         base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port, None)
-        return _host_visible_output_staging(base)
+        staging = _host_visible_output_staging(base)
+        staging['tiling_dimension'] = self._whole_beats(
+            entry, staging['tiling_dimension'], int(base['inner_dimension'])
+        )
+        return staging
+
+    def _whole_beats(self, entry: EdgeEntry, tile: List[int], inner: int) -> List[int]:
+        """A PLIO moves whole beats, so an inference whose tile would end mid-beat moves its rows padded to whole
+        beats: the memory tile's DMA zero-fills past the boundary and the host trims."""
+        beat = int(self.ctx.device.plio_width_bits) // int(self._graph_output_dtype(entry).width)
+        tile = [int(value) for value in tile]
+        if prod(tile) % beat:
+            tile[inner] = -(-tile[inner] // beat) * beat
+        return tile
 
     def _next_buffer_name(self, entry: EdgeEntry):
         base = sanitize_identifier(entry.producer.tensor)
