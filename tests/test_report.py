@@ -68,3 +68,28 @@ def test_report_latency_runs_from_the_first_input(tmp_path):
     assert measured_latency_cc(tmp_path) is None  # no host measurement yet
     (tmp_path / 'log').write_text('AIE4ML_LATENCY_START_CC 900\n...\nAIE4ML_LATENCY_START_CC 1000\n')
     assert measured_latency_cc(tmp_path) == 1000 + 100  # the last run's count, plus 80 ns at 1.25 GHz
+
+
+def test_a_profile_is_charged_to_the_core_its_tile_names(tmp_path):
+    """AIE-MLv2 names the file of core (7, 0) profile_funct_7_2: the tile inside, less the design's first
+    core row, is the core its op was placed on."""
+    from aie4ml.report import _kernel_cycles
+
+    (tmp_path / 'aie_pipeline.json').write_text(
+        json.dumps(
+            {
+                'physical': {'placements': {'c1_aie': {'col': 7, 'row': 0}}},
+                'execution': [{'node': 'c1_aie', 'config': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}],
+            }
+        )
+    )
+    profiles = tmp_path / 'aiesimulator_output'
+    profiles.mkdir()
+    (profiles / 'profile_funct_7_2.txt').write_text(
+        'Function profiling report information for ::tl.aie_logical.aie_xtlm.math_engine'
+        '.array.tile_7_3.cm.proc.iss\n'
+        '  6  7374  76.88%  1229  1229  1229  7374  76.88%  1229  1229  1229  704  1245  0'
+        ' run _ZN13conv2d_singleI5L1Cfg\n'
+    )
+    (kernel,) = _kernel_cycles(tmp_path, {'aie_tile_row_start': 3})
+    assert (kernel['tile'], kernel['op'], kernel['cycles_per_call']) == ('7_0', 'c1_aie', 1229)
