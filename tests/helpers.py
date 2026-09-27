@@ -232,7 +232,10 @@ def _assert_matches_onnx(
     else:
         aie_model.compile()
 
-    sess = ort.InferenceSession(model.SerializeToString(), providers=['CPUExecutionProvider'])
+    # Basic level: the graph's own QDQ arithmetic. ORT 1.30's extended QDQ propagation mistypes an inserted Q.
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    sess = ort.InferenceSession(model.SerializeToString(), options, providers=['CPUExecutionProvider'])
     names = [o.name for o in sess.get_outputs()]
     if per_iteration:
         runs = [sess.run(None, {k: v[i] for k, v in feeds.items()}) for i in range(iterations)]
