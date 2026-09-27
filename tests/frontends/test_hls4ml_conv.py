@@ -8,7 +8,7 @@ layer, the weight arrangement differ.
 import numpy as np
 import pytest
 
-tf = pytest.importorskip('tensorflow')
+keras = pytest.importorskip('keras')
 
 PART = 'xcvp2802-vsva5601-2MHP-e-S'
 H, W, CIN, COUT, CLASSES, BITS = 8, 8, 8, 8, 8, 8
@@ -21,16 +21,16 @@ def lowered(tmp_path):
     from keras.models import Sequential
     from qkeras import QActivation, QConv2D, QDense, QDepthwiseConv2D, quantized_bits, quantized_relu
 
-    tf.keras.utils.set_random_seed(7)
+    keras.utils.set_random_seed(7)
     q_w = quantized_bits(BITS, 2, alpha=1)
     model = Sequential(
         [
-            tf.keras.layers.InputLayer(input_shape=(H, W, CIN)),
+            keras.Input(shape=(H, W, CIN)),
             QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
             QActivation(quantized_relu(BITS, 2), name='relu'),
             QDepthwiseConv2D((3, 3), padding='same', depthwise_quantizer=q_w, bias_quantizer=q_w, name='dw'),
             QActivation(quantized_relu(BITS, 2), name='dwrelu'),
-            tf.keras.layers.Flatten(name='flatten'),
+            keras.layers.Flatten(name='flatten'),
             QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
         ]
     )
@@ -90,12 +90,12 @@ def test_layers_without_bias_lower_with_only_their_operands(tmp_path):
     q_w = quantized_bits(BITS, 2, alpha=1)
     model = Sequential(
         [
-            tf.keras.layers.InputLayer(input_shape=(H, W, CIN)),
+            keras.Input(shape=(H, W, CIN)),
             QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, use_bias=False, name='conv'),
             QActivation(quantized_relu(BITS, 2), name='relu'),
             QDepthwiseConv2D((3, 3), padding='same', depthwise_quantizer=q_w, use_bias=False, name='dw'),
             QActivation(quantized_relu(BITS, 2), name='dwrelu'),
-            tf.keras.layers.Flatten(name='flatten'),
+            keras.layers.Flatten(name='flatten'),
             QDense(CLASSES, kernel_quantizer=q_w, use_bias=False, name='fc'),
         ]
     )
@@ -131,16 +131,16 @@ def _pooled_model(tmp_path, part, relu_after_pool=False):
     from keras.models import Sequential
     from qkeras import QActivation, QConv2D, QDense, quantized_bits, quantized_relu
 
-    tf.keras.utils.set_random_seed(7)
+    keras.utils.set_random_seed(7)
     q_w = quantized_bits(BITS, 2, alpha=1)
     relu = QActivation(quantized_relu(BITS, 2), name='relu')
-    pool = tf.keras.layers.MaxPooling2D((2, 2), name='pool')
+    pool = keras.layers.MaxPooling2D((2, 2), name='pool')
     model = Sequential(
         [
-            tf.keras.layers.InputLayer(input_shape=(H, W, CIN)),
+            keras.Input(shape=(H, W, CIN)),
             QConv2D(16, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
             *([pool, relu] if relu_after_pool else [relu, pool]),
-            tf.keras.layers.Flatten(name='flatten'),
+            keras.layers.Flatten(name='flatten'),
             QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
         ]
     )

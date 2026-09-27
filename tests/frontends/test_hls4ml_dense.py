@@ -7,12 +7,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-tf = pytest.importorskip('tensorflow')
+keras = pytest.importorskip('keras')
 
 SEED = 123
 random.seed(SEED)
 np.random.seed(SEED)
-tf.keras.utils.set_random_seed(SEED)
+keras.utils.set_random_seed(SEED)
 
 
 def _require_vitis():
@@ -46,7 +46,8 @@ def _build_qkeras_mlp(qkeras, input_shape, in_features, hidden1, hidden2, out_fe
 
     model = Sequential(
         [
-            QActivation(q_in, name='input_quant', input_shape=input_shape),
+            keras.Input(shape=input_shape),
+            QActivation(q_in, name='input_quant'),
             QDense(hidden1, name='dense0', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'),
             QActivation(quantized_relu(bits, 0), name='act0'),
             QDense(hidden2, name='dense1', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'),
@@ -181,7 +182,8 @@ def test_aie_compile_x86_sim_nd_input(tmp_path: Path, input_shape):
 
     qmodel = Sequential(
         [
-            QActivation(quantized_bits(bits, 3), name='input_quant', input_shape=input_shape),
+            keras.Input(shape=input_shape),
+            QActivation(quantized_bits(bits, 3), name='input_quant'),
             QDense(
                 N,
                 name='dense0',
