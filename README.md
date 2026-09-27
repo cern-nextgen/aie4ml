@@ -12,73 +12,44 @@
 - Current hardware targets: AIE1, AIE-ML and AIE-MLv2 devices.
 - Current frontend paths: ONNX for explicit operator graphs, and an optional [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) frontend path.
 
-## Current Support
+## Supported Operators
 
-The tables describe implemented compiler paths, not every combination of shape, precision and routing. A check mark means the feature is available subject to the limits in its row; unsupported combinations fail during lowering. See [detailed support and transport contracts](docs/support.md) for the full constraints.
+The full constraints are in [docs/support.md](docs/support.md).
 
-### Compute layers
+| Operator | AIE1 | AIE-ML | AIE-MLv2 | Precision (inputs × weights) | Notes |
+| --- | :---: | :---: | :---: | --- | --- |
+| Dense (Gemm, MatMul with constant weights) | ✅ | ✅ | ✅ | int8 × int8, int16 × int8, float32 on all; int16 × int16 and bfloat16 on AIE-ML and AIE-MLv2; FP8 (E4M3) on AIE-MLv2 | Optional bias, fused ReLU. |
+| MatMul (two activations) | ✅ | ✅ | ✅ | As Dense | The right operand is 2-D; it may be broadcast over the left operand's batch axes. |
+| Conv2D, grouped and depthwise | ✅ | ✅ | ✅ | int8 × int8 on all; int16 × int8 on AIE-ML and AIE-MLv2 (int8 or int16 output) | Batch 1, kernels up to 7×7, padding smaller than the kernel, any stride (int16 inputs: horizontal stride 1), no dilation. Fuses bias, ReLU and a following MaxPool. |
+| MaxPool | ✅ | ✅ | ✅ | As its Conv2D | 2×2, stride 2, directly after a Conv2D (ReLU on either side). |
+| BatchNormalization | ✅ | ✅ | ✅ | — | Folded into the preceding Conv2D or Dense before quantization: QKeras `QConv2DBatchnorm`, a float Dense followed by BatchNormalization, or an ONNX export that folds Conv + BatchNormalization. |
+| ReLU | ✅ | ✅ | ✅ | — | Fused into the Dense or Conv2D. |
+| Add | ✅ | ✅ | ✅ | Both inputs and the output of one type | Same shapes; no broadcasting. |
+| LayerNorm | ✅ | ✅ | ✅ | int8 | Last axis. |
+| Softmax | ✅ | ✅ | ✅ | int8 in, uint8 or int16 out | Last axis. Exact integer exponential (beta), or a faster surrogate for models trained with it. |
+| Flatten / Reshape | ✅ | ✅ | ✅ | — | One sample to `[1, K]`, from a Conv2D into a Dense; no data is copied. |
+| Transpose | ✖️ | ✅ | ✅ | — | Of the last two axes. |
+| Slice, Split, Concat | ✅* | ✅ | ✅ | — | Along the boundaries of the producing layer's tiles; no data is copied. |
 
-| Layer | AIE1 | AIE-ML | AIE-MLv2 | Precision and supported configuration | Parallelism | Data ports |
-| --- | :---: | :---: | :---: | --- | --- | --- |
-| Dense / static-weight GEMM | ✓ | ✓ | ✓ | Integer or floating-point formats below; constant weights, optional bias and fused ReLU. | `cas_num` splits output channels (`inner`) or rows (`outer`); `cas_length` splits the reduction. | Buffer or stream. |
-| Dynamic MatMul | ✓ | ✓ | ✓ | Same format families as Dense; rank-2 RHS, optionally broadcast across LHS leading axes. Non-broadcast batched RHS is unsupported. | `inner` or `outer` `cas_num`, plus reduction `cas_length`. | Buffer. |
-| Conv2D / grouped / depthwise | ✓ | ✓ | ✓ | Signed int8 input, weights and output; static weights, optional bias/ReLU, zero `pads`, `groups` and `kernel_shape` validated through 7×7. Batch > 1 and dilation are unsupported. Stride > 1 runs on one buffer-port tile, fed by the graph boundary or another kernel, through a retiler on the neighbouring tile. | Buffer: `inner` output-channel or `outer` row-band `cas_num`, and input-channel-block `cas_length`; splits must fit whole blocks/bands. Stream: one tile only. | Buffer or stream for stride 1; buffer only for stride > 1. |
-| Elementwise Add | ✓ | ✓ | ✓ | Inputs and output must have the same shape and storage type; no broadcasting. | `inner` or `outer` `cas_num`; no cascade reduction. | Buffer. |
-| LayerNorm | ✓ | ✓ | ✓ | Signed int8 input/output; `axis=-1`, constant gamma/beta, supported static quantization and representable positive `epsilon`. Linear and microtiled kernels. | `outer` `cas_num`; `cas_length=1`. | Buffer. |
-| Softmax | ✓ | ✓ | ✓ | Int8 input to uint8 Q8 or int16 Q15; `axis=-1`. Accurate integer exponential or opt-in QAT surrogate (`approximation`); linear or microtiled `layout`. | `outer` `cas_num`; `cas_length=1`. | Buffer. |
-
-Dense and MatMul input × weight formats registered by generation (output precision and scale must also pass the accumulator/shift checks):
-
-| Format | AIE1 | AIE-ML | AIE-MLv2 |
-| --- | :---: | :---: | :---: |
-| int8 × int8, int16 × int8, float32 × float32 | ✓ | ✓ | ✓ |
-| int16 × int16, bfloat16 × bfloat16 | — | ✓ | ✓ |
-| FP8 E4M3 × FP8 E4M3 | — | — | ✓ |
-
-Int8 × int16 is deliberately rejected on all generations because the current accumulator output shift may be negative. Exact microtile choices are generation-specific and validated when selected.
-
-### Graph and transport features
-
-| Feature | AIE1 | AIE-ML | AIE-MLv2 | Supported contract |
-| --- | :---: | :---: | :---: | --- |
-| Fused ReLU and constant scale | ✓ | ✓ | ✓ | ReLU folds into Dense or Conv2D; power-of-two scale folds into integer output shifts. No standalone activation or arbitrary-scale kernel. |
-| Flatten / Reshape | ✓ | ✓ | ✓ | One sample to `[1, K]`, folded into a compatible producer (currently Conv2D) and consuming Dense; no copy kernel. |
-| Transpose / Permute | ✓ | ✓ | ✓ | Final-two-axis view only. AIE1 accepts foldable views but rejects a relayout requiring a memory tile. |
-| Split / Slice | ✓ | ✓ | ✓ | Folded, unit-step, port-aligned slices; no cross-port repacking or graph-boundary/chained views. |
-| Concat | ✓ | ✓ | ✓ | Folded when each consumer port belongs to one input; no port-spanning gather or graph-boundary/chained views. |
-| Fanout / branching | ✓ | ✓ | ✓ | Each consumer is planned separately; AIE1 direct multicast requires compatible staging. Routing and DMA resources still bound fanout. |
-| Direct buffer connections | ✓ | ✓ | ✓ | Compatible staging is required; shared-neighbour-memory aliasing is a placement optimization, not a guarantee. |
-| Memory-tile staging | — | ✓ | ✓ | One stage when supported by the device and layout; multi-stage relay and arbitrary relayout are not implemented. |
-
-ONNX is the recommended frontend for supported quantized operator graphs with explicit Q/DQ boundaries. The optional hls4ml path supports MLP-style Dense stacks, Conv2D and DepthwiseConv2D; SeparableConv2D must be expressed as separate depthwise and pointwise layers. Hardware-specific placement, memory and DMA limits are detailed in [support.md](docs/support.md) rather than implied by a check mark.
+8-bit inputs against 16-bit weights (int8 × int16) are not supported.
 
 ## Prerequisites
-
-- The latest AMD Vitis (currently 2026.1) and a valid AIE tools license. aie4ml tracks the newest AIE
-  compiler; older releases can fail to compile some kernels.
+- AMD Vitis 2026.1.1 and a valid AIE tools license.  
+  *(aie4ml tracks the newest AIE compiler; older releases may fail to compile some kernels.)*
 - Python 3.10+.
-- Optional: [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) if using the hls4ml frontend integration.
-
-## Frontend Compatibility
-
-The ONNX path is the recommended route for operator-level compiler development and for models that already express quantized tensors and Q/DQ boundaries explicitly. The hls4ml path supports Dense stacks and the documented Conv2D and DepthwiseConv2D configurations.
 
 ## Installation
 
 ```bash
-pip install aie4ml
+pip install "aie4ml[onnx]"     # ONNX frontend
+pip install "aie4ml[hls4ml]"   # hls4ml frontend
 ```
 
-For the ONNX frontend (recommended path), also install ONNX and onnxruntime:
+Keras 3 and QKeras v3 models need hls4ml 1.4. Until it is released, install hls4ml from upstream commit:
 
 ```bash
-pip install onnx onnxruntime
-```
-
-Install hls4ml only if you need the hls4ml frontend/backend integration:
-
-```bash
-pip install hls4ml
+pip install qkeras-v3 "tensorflow~=2.16.0" \
+    "hls4ml @ git+https://github.com/fastmachinelearning/hls4ml.git@a2abb4d22e7762a870cd46ccf3e07ff6a5622ed5"
 ```
 
 ## Documentation & Tutorials
@@ -90,6 +61,28 @@ Tutorial 2: [`tutorials/tutorial_2.ipynb`](tutorials/tutorial_2.ipynb)
 
 General `hls4ml` concepts: [https://fastmachinelearning.org/hls4ml](https://fastmachinelearning.org/hls4ml)
 
+### Parallelism
+
+Each Dense, MatMul and Conv2D layer can span several AI Engine tiles, set per layer (`LayerDirectives` in the ONNX
+config, or the hls4ml layer config):
+
+- `parallelism: {cas_length: L}` splits the reduction (input features or channels) over a chain of `L` tiles.
+- `parallelism: {cas_num: C}` runs `C` chains side by side, each computing a share of the output features or
+  channels (`contract: 'inner'`, the default) or of the rows (`contract: 'outer'`).
+- `ports: 'stream'`(beta) moves a Dense or a single-tile int8 Conv2D over streams instead of memory buffers.
+
+### Model structure
+
+- Branches (one output feeding several layers) and residual connections through Add.
+- On AIE-ML and AIE-MLv2, a memory tile reorders data between layers that lay it out differently. AIE1 has no memory
+  tile, so connected layers must agree on the layout; conversion says when they do not.
+
+### Frontends
+
+| Frontend | Models |
+| --- | --- |
+| ONNX (preferred) | Quantized operator graphs with QuantizeLinear/DequantizeLinear boundaries (QDQ). |
+| hls4ml | Keras 3 and QKeras v3: Dense, Conv2D, DepthwiseConv2D, QConv2DBatchnorm, MaxPooling2D, Flatten, ReLU activations and LayerNormalization. Split a SeparableConv2D into its depthwise and pointwise layers. |
 
 ## Maintainer
 

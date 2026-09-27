@@ -253,3 +253,44 @@ def test_hls4ml_max_pool_matches_qkeras(tmp_path, part):
     want = model.predict(x, verbose=0)  # two distinct inferences: the output is refilled every call
     got = hls_model.predict(x.reshape(2, 1, H, W, CIN), simulator='x86')  # (iterations, batch, ...)
     np.testing.assert_equal(np.asarray(got).reshape(want.shape), want)
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [PARTS['aie-ml'], PARTS['aie-mlv2']], ids=['aie-ml', 'aie-mlv2'])
+def test_hls4ml_int16_conv_matches_qkeras(tmp_path, part):
+    """16-bit activations against 8-bit weights: QConv2D -> 16-bit ReLU -> MaxPooling2D -> Flatten -> QDense."""
+    hls4ml = pytest.importorskip('hls4ml')
+    qkeras = pytest.importorskip('qkeras')
+    from keras.models import Sequential
+
+    keras.utils.set_random_seed(7)
+    q_w = qkeras.quantized_bits(BITS, 2, alpha=1)
+    model = Sequential(
+        [
+            keras.Input(shape=(H, W, CIN)),
+            qkeras.QConv2D(16, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
+            qkeras.QActivation(qkeras.quantized_relu(16, 6), name='relu'),
+            keras.layers.MaxPooling2D((2, 2), name='pool'),
+            keras.layers.Flatten(name='flatten'),
+            qkeras.QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
+            qkeras.QActivation(qkeras.quantized_relu(BITS, 3), name='out'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = 'ap_fixed<16,6>'
+    hls_model = hls4ml.converters.convert_from_keras_model(
+        model,
+        backend='AIE',
+        io_type='io_parallel',
+        output_dir=str(tmp_path / 'proj'),
+        part=part,
+        hls_config=config,
+        project_name='proj',
+        batch_size=1,
+        iterations=2,
+    )
+    hls_model.compile()
+    x = np.random.default_rng(5).integers(-2048, 2048, size=(2, H, W, CIN)).astype(np.float32) / 1024
+    want = model.predict(x, verbose=0)
+    got = hls_model.predict(x.reshape(2, 1, H, W, CIN), simulator='x86')
+    np.testing.assert_equal(np.asarray(got).reshape(want.shape), want)

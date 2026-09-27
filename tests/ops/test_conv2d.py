@@ -33,8 +33,9 @@ def _qparams(prefix: str, *, frac: int, elem_type: int = TensorProto.INT8) -> li
     ]
 
 
-def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed, stride=1, unsigned=False):
-    """Conv(x, W, b) [-> Relu] -> Q -> DQ with int8 weights and an int32 bias in the accumulator scale."""
+def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed, stride=1, unsigned=False, bits=8):
+    """Conv(x, W, b) [-> Relu] -> Q -> DQ with int8 weights, an int32 bias in the accumulator scale and a `bits`-bit
+    output."""
     rng = np.random.default_rng(seed)
     w = rng.integers(-6, 6, size=(cout, cin // groups, k, k), dtype=np.int8)
     b = rng.integers(-64, 64, size=(cout,), dtype=np.int32)
@@ -43,7 +44,11 @@ def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed
         numpy_helper.from_array(b, f'{name}_b_q'),
         *_qparams(f'{name}_w', frac=FRAC),
         *_qparams(f'{name}_b', frac=2 * FRAC, elem_type=TensorProto.INT32),
-        *_qparams(f'{name}o', frac=FRAC, elem_type=TensorProto.UINT8 if unsigned else TensorProto.INT8),
+        *_qparams(
+            f'{name}o',
+            frac=FRAC,
+            elem_type=TensorProto.INT16 if bits == 16 else TensorProto.UINT8 if unsigned else TensorProto.INT8,
+        ),
     ]
     for tag in ('w', 'b'):
         nodes.append(
@@ -985,5 +990,71 @@ def test_conv_chain_matches_onnx(conv_model, tmp_path, part):
         max_code_diff=0,
         part=part,
         iterations=6,
+        per_iteration=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# int16 activations against int8 weights (AIE-ML and AIE-MLv2)
+# --------------------------------------------------------------------------- #
+
+INT16_PARTS = {'aie-ml': PART, 'aie-mlv2': MLV2_PART}
+INT16_DIRECTIVES = {
+    'c0': {'parallelism': {'cas_num': 1}},
+    'c1': {'parallelism': {'cas_num': 2}},
+    'c2': {'parallelism': {'cas_length': 2}},
+}
+
+
+def _int16_model():
+    """Every path an int16 frame takes: an int8 conv writes it (c0), two chains split it (c1), a two-kernel cascade
+    reads it and fuses ReLU and a 2x2 max pool (c2), and a Dense reads it flattened."""
+    nodes, inits = [], []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a0', 'c0', CIN, 16, 3, pad=1, relu=True, seed=1, bits=16)
+    _conv(nodes, inits, 'a0', 'a1', 'c1', 16, 16, 3, pad=1, relu=True, seed=2, bits=16)
+    _conv(nodes, inits, 'a1', 'a2', 'c2', 16, 16, 3, pad=1, relu=True, seed=3, bits=16)
+    inits += _qparams('p2o', frac=FRAC, elem_type=TensorProto.INT16)
+    nodes.append(helper.make_node('MaxPool', ['a2'], ['p2_pool'], name='p2', kernel_shape=[2, 2], strides=[2, 2]))
+    qdq(nodes, 'p2_pool', 'p2', 'p2o')
+    _head(nodes, inits, 'p2', H // 2 * W // 2 * 16, seed=4)
+    return make_model(
+        'conv_int16',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, CLASSES])],
+        initializers=inits,
+        opset=21,  # int16 QuantizeLinear
+    )
+
+
+@pytest.mark.parametrize('part', INT16_PARTS.values(), ids=INT16_PARTS.keys())
+def test_int16_frames_take_the_int16_core(tmp_path, part):
+    ctx = lower(_int16_model(), tmp_path, INT16_DIRECTIVES, part=part)
+    m16 = {PART: 2, MLV2_PART: 4}[part]
+    for name, m in (('c0_aie', 2 * m16), ('c1_aie', m16), ('c2_aie', m16)):
+        assert ctx.ir.execution.get(name).config.microtiling.microtile_m == m, name
+    assert {'fused_pool', 'fused_activation', 'output_view'} <= set(ctx.ir.execution.get('c2_aie').node.traits)
+
+
+def test_int16_conv_is_refused_where_no_core_takes_it(tmp_path):
+    with pytest.raises(ValueError, match='no conv2d variant matches'):
+        lower(_int16_model(), tmp_path, INT16_DIRECTIVES, part=AIE1_PART)
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', INT16_PARTS.values(), ids=INT16_PARTS.keys())
+def test_int16_conv_matches_onnx(tmp_path, part):
+    feeds = np.random.default_rng(3).integers(-60, 60, size=(2, 1, H, W, CIN), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _int16_model(),
+        {'x_q': feeds},
+        INT16_DIRECTIVES,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=2,
         per_iteration=True,
     )

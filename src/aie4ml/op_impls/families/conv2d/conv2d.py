@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -61,6 +61,21 @@ _SPATIAL_BLOCKS = {'AIE': (2,), 'AIE-ML': (4, 2), 'AIE-MLV2': (4, 2)}
 least, which is the larger one where both fit it (measured faster), else the one computing fewer padded pixels."""
 
 
+def _core_microtile(generation: str, lhs_width: int) -> Optional[Tuple[int, int, int]]:
+    """The mmul the core runs on activations of `lhs_width` bits against int8 weights: the generation's first shape
+    of 8-channel K and N blocks, or None where it has none."""
+    options = MICROTILE_OPTIONS[generation].get((f'int{lhs_width}', 'int8'), [])
+    return next((shape for shape in options if shape[1:] == (CHANNEL_BLOCK, CHANNEL_BLOCK)), None)
+
+
+def _frame_columns(generation: str) -> Tuple[int, int]:
+    """(column block, column alignment) of every frame on the generation, whatever its element width: the int8
+    core's widest register block and row tile, which every core's row tile divides. Every op on a tensor derives
+    the same frame from it."""
+    m = _core_microtile(generation, 8)[0]
+    return max(_SPATIAL_BLOCKS[generation]) * m, m
+
+
 def _padded_blocks(blocks: int) -> int:
     """Output blocks a tile's weights and bias hold: the paired core steps blocks two at a time, so it
     pads an odd count; a tile of one block runs the one-block core, which needs no padding."""
@@ -69,7 +84,7 @@ def _padded_blocks(blocks: int) -> int:
 
 @register_variant
 class Conv2dOpImplVariant(OpImplVariant):
-    """int8 Conv2D as an implicit GEMM over the Dense mmul core, on channel-blocked NHWC frames.
+    """Conv2D with int8 weights as an implicit GEMM over the Dense mmul core, on channel-blocked NHWC frames.
 
     Partitioning uses the Dense vocabulary on the frame: `cas_length` splits the reduction (input
     channel blocks) across a cascade chain, and `cas_num` splits either the output channel blocks
@@ -95,7 +110,11 @@ class Conv2dOpImplVariant(OpImplVariant):
             resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name).width,
             resolve_exact_storage_dtype(out.precision, namespace='output', layer_name=node.name).width,
         )
-        return widths == (8, 8, 8)
+        lhs_width, rhs_width, out_width = widths
+        if rhs_width != 8 or lhs_width not in (8, 16) or out_width not in (8, 16):
+            return False
+        # int16 activations, in or out, need a core for them on the generation
+        return _core_microtile(select_generation_key(device.generation), max(lhs_width, out_width)) is not None
 
     def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
@@ -120,8 +139,13 @@ class Conv2dOpImplVariant(OpImplVariant):
 
         precision, accumulator_tag = resolve_operand_precision(node, device)
         precision['bias'] = resolve_bias_dtype(node, precision)
+        if spatial.strides[1] > 1 and int(precision['lhs'].width) != 8:
+            raise NotImplementedError(
+                f'{node.name}: {self.variant_id} implements a horizontal stride for int8 inputs only, '
+                f'got {precision["lhs"].width}-bit.'
+            )
         generation = select_generation_key(device.generation)
-        m, k, n = MICROTILE_OPTIONS[generation][('int8', 'int8')][0]
+        m, k, n = _core_microtile(generation, int(precision['lhs'].width))
         microtiling = MatmulMicrotileConfig(microtile_m=m, microtile_k=k, microtile_n=n)
         out_w = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[1]
         spatial_blocks = min(_SPATIAL_BLOCKS[generation], key=lambda blocks: align_up(out_w, blocks * m))
@@ -129,8 +153,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         view = node.traits.get('output_view')
         flatten = view is not None and view.data['kind'] == VIEW_FLATTEN_2D
         parallelism = self._resolve_parallelism(node, parallel_cfg, input_contracts, flatten=flatten)
-        # Frames keep the generation's widest block: every op on a tensor must derive the same frame from it.
-        block = max(_SPATIAL_BLOCKS[generation]) * m
+        block, column_align = _frame_columns(generation)
         outer = parallelism.contract == 'outer'
         row_slices = parallelism.cas_num if outer else 1
         pool = fused_pool_of(node)
@@ -149,7 +172,11 @@ class Conv2dOpImplVariant(OpImplVariant):
 
         io_views = {
             lhs.name: frame_view(
-                lhs, column_block=block, column_align=m, channel_slices=parallelism.cas_length, row_slices=row_slices
+                lhs,
+                column_block=block,
+                column_align=column_align,
+                channel_slices=parallelism.cas_length,
+                row_slices=row_slices,
             ),
         }
         if flatten:
@@ -172,7 +199,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             io_views[out.name] = frame_view(
                 out,
                 column_block=block,
-                column_align=m,
+                column_align=column_align,
                 channel_slices=1 if outer else parallelism.cas_num,
                 row_slices=row_slices,
             )
@@ -308,8 +335,16 @@ class Conv2dOpImplVariant(OpImplVariant):
             # the weights in bank 2 of the kernel's tile, stack and bias in bank 1.
             bank = int(config.bank_mem_bytes)
             for what, size, splits in (
-                ('input frame', params['in_bytes'], "`cas_num` over rows ('outer') or `cas_length` over channels"),
-                ('output frame', params['out_bytes'], "`cas_num` over rows (contract 'outer') or over output channels"),
+                (
+                    'input frame',
+                    self._frame_bytes(config, 'lhs', params['in_elements']),
+                    "`cas_num` over rows ('outer') or `cas_length` over channels",
+                ),
+                (
+                    'output frame',
+                    self._frame_bytes(config, 'output', params['out_elements']),
+                    "`cas_num` over rows (contract 'outer') or over output channels",
+                ),
                 (
                     'weights',
                     params['weight_count'],
@@ -325,8 +360,8 @@ class Conv2dOpImplVariant(OpImplVariant):
             return
         # The stream wrapper owns one frame each way, and its staging, in its own tile.
         tile_bytes = (
-            params['in_bytes']
-            + params['out_bytes']
+            self._frame_bytes(config, 'lhs', params['in_elements'])
+            + self._frame_bytes(config, 'output', params['out_elements'])
             + params['weight_count']
             + 4 * params['bias_count']
             + self.staging_bytes(params)
@@ -337,6 +372,10 @@ class Conv2dOpImplVariant(OpImplVariant):
                 f'{device.platform} tile has {device.tile_mem_bytes} B; split the layer with '
                 '`parallelism: {cas_num: .., cas_length: ..}`.'
             )
+
+    @staticmethod
+    def _frame_bytes(config: Conv2dConfig, role: str, elements: int) -> int:
+        return int(elements) * int(config.precision[role].width) // 8
 
     def staging_bytes(self, _params) -> int:
         """Tile memory the kernel holds beyond its frames. A buffer kernel holds none."""
@@ -493,11 +532,13 @@ class Conv2dOpImplVariant(OpImplVariant):
             out_h=out_h,
             out_w=out_w,
             out_w_computed=out_w_computed,
-            in_bytes=int(np.prod(in_view.tile)),
-            out_bytes=int(np.prod(out_view.tile)),
+            in_elements=int(np.prod(in_view.tile)),
+            out_elements=int(np.prod(out_view.tile)),
             weight_count=kh * kw * in_blocks * out_blocks_padded * CHANNEL_BLOCK**2,
             bias_count=out_blocks_padded * CHANNEL_BLOCK,
             stream_io=self.port_kind == PORT_KIND_STREAM,
+            # aie_api's int16 x int8 mmul of 8-channel blocks accumulates in 64 bits whatever it is asked for
+            cascade_accumulator_tag='acc64' if int(config.precision['lhs'].width) == 16 else config.accumulator_tag,
         )
         if streamed:
             # A streamed kernel holds one band, not the image: the rows its window reads and the
@@ -511,8 +552,8 @@ class Conv2dOpImplVariant(OpImplVariant):
                 out_cols=int(out_view.tile[2]),
                 out_origin_c=int(out_view.origin[2]),
                 flat_k_padded=0,
-                in_bytes=params['in_blocks'] * (band + span_h - 1) * in_cols * CHANNEL_BLOCK,
-                out_bytes=params['out_blocks'] * band * int(out_view.tile[2]) * CHANNEL_BLOCK,
+                in_elements=params['in_blocks'] * (band + span_h - 1) * in_cols * CHANNEL_BLOCK,
+                out_elements=params['out_blocks'] * band * int(out_view.tile[2]) * CHANNEL_BLOCK,
             )
             return params
         if config.flags.emit_flattened:
@@ -717,11 +758,7 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
     kernel lands it in the blocked layout the compute core reads (`ports: stream`).
 
     It buys legality rather than speed: a frame of several channel blocks crosses the graph
-    boundary in one port, which a DMA-fed frame cannot do. Measured on AIE1 (8x8, 3x3, one channel
-    block): 1,279 cycles through buffer ports against 2,157 through streams, the difference being
-    the wire and the landing loop.
-
-    One tile only: a cascade would need its partial sums to share the core's two stream ports.
+    boundary in one port, which a DMA-fed frame cannot do. 
     """
 
     variant_id = 'conv2d.s.r.v1'
@@ -729,6 +766,8 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
         config = super().resolve(node, device, directives)
+        if (int(config.precision['lhs'].width), int(config.precision['output'].width)) != (8, 8):
+            raise NotImplementedError(f'{node.name}: {self.variant_id} streams int8 frames only.')
         if config.spatial.strides != (1, 1):
             raise NotImplementedError(
                 f'{node.name}: {self.variant_id} does not implement strides {config.spatial.strides}; the '

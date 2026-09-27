@@ -12,8 +12,8 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
                                          const typename ConfigT::weight_t* wts,
                                          const typename ConfigT::bias_t* bias,
                                          typename ConfigT::result_t* out,
-                                         input_cascade<typename ConfigT::acc_scalar_t>* inCascade,
-                                         output_cascade<typename ConfigT::acc_scalar_t>* outCascade)
+                                         input_cascade<typename ConfigT::cascade_t>* inCascade,
+                                         output_cascade<typename ConfigT::cascade_t>* outCascade)
 {
   using G = conv2d_geometry<ConfigT>;
   using data_t = typename ConfigT::data_t;

@@ -41,7 +41,7 @@ struct {{L.struct_name}} {
   static constexpr int OUT_ROWS = {{P.out_rows}}, OUT_COLS = {{P.out_cols}};
   static constexpr int OUT_ORIGIN_R = {{P.out_origin_r}}, OUT_ORIGIN_C = {{P.out_origin_c}};
   static constexpr int FLAT_K_PADDED = {{P.flat_k_padded}};
-  static constexpr int IN_BYTES = {{P.in_bytes}}, OUT_BYTES = {{P.out_bytes}};
+  static constexpr int IN_ELEMENTS = {{P.in_elements}}, OUT_ELEMENTS = {{P.out_elements}};
   static constexpr int WN = {{P.weight_count}}, BN = {{P.bias_count}};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
@@ -53,6 +53,8 @@ struct {{L.struct_name}} {
 {{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
 {{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
   using acc_scalar_t = {{ P.accumulator_tag }};
+  // The partial sums a cascade carries: the mmul's own accumulator.
+  using cascade_t = {{ P.cascade_accumulator_tag }};
   static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
   static constexpr const char* SATURATION_TOKEN = "saturate";
 #if __cplusplus >= 202002L

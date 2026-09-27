@@ -8,15 +8,15 @@
 #pragma once
 #include <adf.h>
 #include <aie_api/aie.hpp>
+#include <algorithm>
 #include <limits>
 #include "parameters.h"
 
 using namespace adf;
 
-// A channel block is eight bytes, which the frame stores as int8 and both wrappers move as two
-// 32-bit words. Naming the word type `may_alias` is what makes that access defined: the frame
-// really is addressed as both, and copying through `__builtin_memcpy` instead measured 17% slower
-// once a pixel spans more than one block.
+// A channel block is moved as 32-bit words where it is not a whole vector. Naming the word type
+// `may_alias` is what makes that access defined: the frame really is addressed as both, and copying
+// through `__builtin_memcpy` instead measured 17% slower once a pixel spans more than one block.
 using conv2d_word_t __attribute__((may_alias)) = int32;
 
 template<typename ConfigT>
@@ -158,6 +158,7 @@ struct conv2d_geometry {
 };
 
 // The DMA delivers only the image; the border of the frame is whatever the buffer held before.
+// Only the border the taps read is zeroed: rows [0, RR1), columns [RC0, RC1).
 template<typename ConfigT>
 static inline void conv2d_zero_border(typename ConfigT::data_t* frame) {
   using G = conv2d_geometry<ConfigT>;
@@ -165,23 +166,25 @@ static inline void conv2d_zero_border(typename ConfigT::data_t* frame) {
   constexpr int R0 = ConfigT::IN_ORIGIN_R, R1 = R0 + ConfigT::IN_H;
   constexpr int C0 = ConfigT::IN_ORIGIN_C, C1 = C0 + ConfigT::IN_W;
   constexpr int C1_EVEN = (C1 + 1) / 2 * 2;
+  constexpr int RR1 = std::min(ConfigT::IN_ROWS, (conv2d_rows<ConfigT> - 1) * ConfigT::STRIDE_H + ConfigT::KH);
+  constexpr int RC0 = ConfigT::IN_ORIGIN_C - ConfigT::PAD_L;
+  constexpr int RC1 = std::min(ConfigT::IN_COLS, RC0 + ConfigT::OUT_W_COMPUTED + ConfigT::KW - 1);
   const auto z32 = aie::zeros<data_t, 32>();
   const auto z16 = aie::zeros<data_t, 16>();
   for (int cb = 0; cb < ConfigT::CB; ++cb) {
     data_t* block = frame + cb * G::CHB;
-    for (int r = 0; r < ConfigT::IN_ROWS; ++r) {
+    for (int r = 0; r < RR1; ++r) {
       data_t* row = block + r * G::RB;
       if (r < R0 || r >= R1) {
-        for (int i = 0; i < G::RB / 32; ++i) aie::store_v(row + i * 32, z32);
+        for (int c = RC0 / 4 * 4; c < RC1; c += 4) aie::store_v(row + c * 8, z32);
         continue;
       }
-      for (int c = 0; c < C0; c += 2) aie::store_v(row + c * 8, z16);
-      if constexpr (C1 % 2) {  // one block: eight bytes is not a vector, so it goes as two words
+      for (int c = RC0 / 2 * 2; c < C0; c += 2) aie::store_v(row + c * 8, z16);
+      if constexpr (C1 % 2) {  // one block is not a vector, so it goes as words
         conv2d_word_t* const odd = reinterpret_cast<conv2d_word_t*>(row + C1 * 8);
-        odd[0] = 0;
-        odd[1] = 0;
+        for (int w = 0; w < 2 * int(sizeof(data_t)); ++w) odd[w] = 0;
       }
-      for (int c = C1_EVEN; c < ConfigT::IN_COLS; c += 2) aie::store_v(row + c * 8, z16);
+      for (int c = C1_EVEN; c < RC1; c += 2) aie::store_v(row + c * 8, z16);
     }
   }
 }
@@ -194,8 +197,8 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
                                const typename ConfigT::weight_t* wts,
                                const typename ConfigT::bias_t* bias,
                                typename ConfigT::result_t* out,
-                               input_cascade<typename ConfigT::acc_scalar_t>* inCascade,
-                               output_cascade<typename ConfigT::acc_scalar_t>* outCascade)
+                               input_cascade<typename ConfigT::cascade_t>* inCascade,
+                               output_cascade<typename ConfigT::cascade_t>* outCascade)
 {
   using G = conv2d_geometry<ConfigT>;
   using data_t = typename ConfigT::data_t;

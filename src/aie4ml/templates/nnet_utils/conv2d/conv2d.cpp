@@ -30,7 +30,7 @@ template<typename ConfigT>
 void conv2d_first<ConfigT>::run(input_buffer<data_t>& ifm,
                                 const weight_t (&wts)[ConfigT::WN],
                                 const bias_t (&bias)[ConfigT::BN],
-                                output_cascade<acc_scalar_t>* outCascade)
+                                output_cascade<cascade_t>* outCascade)
 {
   conv2d_compute<ConfigT, false, true>(
       const_cast<data_t*>(ifm.data()), wts, bias, nullptr, nullptr, outCascade);
@@ -39,8 +39,8 @@ void conv2d_first<ConfigT>::run(input_buffer<data_t>& ifm,
 template<typename ConfigT>
 void conv2d_middle<ConfigT>::run(input_buffer<data_t>& ifm,
                                  const weight_t (&wts)[ConfigT::WN],
-                                 input_cascade<acc_scalar_t>* inCascade,
-                                 output_cascade<acc_scalar_t>* outCascade)
+                                 input_cascade<cascade_t>* inCascade,
+                                 output_cascade<cascade_t>* outCascade)
 {
   conv2d_compute<ConfigT, true, true>(
       const_cast<data_t*>(ifm.data()), wts, nullptr, nullptr, inCascade, outCascade);
@@ -49,7 +49,7 @@ void conv2d_middle<ConfigT>::run(input_buffer<data_t>& ifm,
 template<typename ConfigT>
 void conv2d_last<ConfigT>::run(input_buffer<data_t>& ifm,
                                const weight_t (&wts)[ConfigT::WN],
-                               input_cascade<acc_scalar_t>* inCascade,
+                               input_cascade<cascade_t>* inCascade,
                                output_buffer<result_t>& ofm)
 {
   conv2d_compute<ConfigT, true, false>(const_cast<data_t*>(ifm.data()), wts, nullptr, ofm.data(), inCascade, nullptr);

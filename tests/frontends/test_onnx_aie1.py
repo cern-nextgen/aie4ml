@@ -343,6 +343,21 @@ def test_aie1_onnx_int16_int8_dense_uses_compile_proven_shape_and_acc48(tmp_path
     assert config.accumulator_tag == 'acc48'
 
 
+def test_aie_mlv2_int16_dense_takes_a_dense_acc64_shape(tmp_path):
+    """MLv2 builds int16 x int16 in acc64 only at K=4: its 8x2x8 is acc32-only and its K=8 shapes are sparse."""
+    model = _dense_model(TensorProto.INT16, TensorProto.INT16)
+    _ctx, config = _resolve_dense(model, tmp_path, part='xc2ve3858-ssva2112-2mp-e-s')
+    assert (config.microtiling.microtile_m, config.microtiling.microtile_k, config.microtiling.microtile_n) == (4, 4, 8)
+    assert config.accumulator_tag == 'acc64'
+    with pytest.raises(ValueError, match=r'microtiling \(4, 8, 8\) not supported'):
+        _resolve_dense(
+            model,
+            tmp_path,
+            part='xc2ve3858-ssva2112-2mp-e-s',
+            directives={'microtiling': {'microtile_m': 4, 'microtile_k': 8, 'microtile_n': 8}},
+        )
+
+
 def test_aie1_onnx_int8_int16_dense_is_rejected_before_shift_resolution(tmp_path):
     with pytest.raises(RuntimeError, match=r'unsupported int8 x int16.*output shift'):
         _resolve_dense(_dense_model(TensorProto.INT8, TensorProto.INT16), tmp_path)

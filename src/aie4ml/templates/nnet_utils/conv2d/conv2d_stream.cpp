@@ -280,8 +280,8 @@ void conv2d_stream<ConfigT>::run(input_stream<data_t>* ifm,
   using W = conv2d_wire<ConfigT>;
   using G = conv2d_geometry<ConfigT>;
   // The band, not the image: the rows one core call reads, and the rows it writes.
-  alignas(32) static data_t frame[ConfigT::IN_BYTES] = {};
-  alignas(32) static result_t out[ConfigT::OUT_BYTES];
+  alignas(32) static data_t frame[ConfigT::IN_ELEMENTS] = {};
+  alignas(32) static result_t out[ConfigT::OUT_ELEMENTS];
   conv2d_wire_reader<ConfigT> reader;
   conv2d_wire_writer<ConfigT> writer;
 

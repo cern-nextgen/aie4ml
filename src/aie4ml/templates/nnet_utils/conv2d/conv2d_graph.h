@@ -80,7 +80,7 @@ public:
       connect<parameter>(wts[idx], async(kk[idx].in[1]));
       connect<>(in1[OUTER ? idx : col], kk[idx].in[0]);
       if constexpr (!STREAM_IO) {
-        dimensions(kk[idx].in[0]) = { ConfigT::IN_BYTES };
+        dimensions(kk[idx].in[0]) = { ConfigT::IN_ELEMENTS };
       }
       if (col == 0) {
         connect<parameter>(bias[chain], async(kk[idx].in[2]));
@@ -89,7 +89,7 @@ public:
       if (col == CAS_LENGTH - 1) {
         connect<>(kk[idx].out[0], out1[chain]);
         if constexpr (!STREAM_IO) {
-          dimensions(kk[idx].out[0]) = { ConfigT::OUT_BYTES };
+          dimensions(kk[idx].out[0]) = { ConfigT::OUT_ELEMENTS };
         }
       }
     }
