@@ -24,7 +24,7 @@ AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
 
 @pytest.mark.parametrize(
     ('part', 'expected_width'),
-    [(AIE1_PART, 32), ('xilinx_vek280_base_202520_1', 32), ('vek385_base', 64)],
+    [(AIE1_PART, 32), ('xilinx_vek280_base_202610_1', 32), ('vek385_base', 64)],
 )
 def test_device_stream_switch_width(part, expected_width):
     device, _ = resolve_device(part, {})
@@ -449,7 +449,7 @@ def test_a_tensor_read_as_two_operands_is_refused(tmp_path):
 
 @pytest.mark.parametrize(
     ('part', 'expected_microtile'),
-    [('xilinx_vek280_base_202520_1', (4, 8, 8)), ('vek385_base', (8, 8, 8))],
+    [('xilinx_vek280_base_202610_1', (4, 8, 8)), ('vek385_base', (8, 8, 8))],
 )
 def test_existing_ml_generation_default_resolution_is_unchanged(tmp_path, part, expected_microtile):
     _ctx, config = _resolve_dense(_dense_model(), tmp_path, part=part)
@@ -692,7 +692,7 @@ def test_memtile_device_keeps_default_boundaries_and_publishes_io_ports(tmp_path
     aie_model = _run_pipeline(
         _dense_model(),
         tmp_path,
-        part='xilinx_vek280_base_202520_1',
+        part='xilinx_vek280_base_202610_1',
         project='aieml_dense',
     )
     plan = aie_model.context.ir.physical.plan
