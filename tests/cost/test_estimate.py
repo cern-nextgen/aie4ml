@@ -19,10 +19,10 @@ def _issue(features):
     return 100 + 2 * features['full_outer'] * features['tile_inner_lhs'] * features['tile_inner_rhs'] // 64
 
 
-def _dense(tmp_path, k, n):
+def _dense(tmp_path, k, n, part=PART):
     variant = next(v for v in get_op_impl_registry().candidates('dense') if v.variant_id == 'dense.b.r.v1')
     model, directives, _ = DESCRIPTORS['dense'].space.build('d', {**CHOICE, 'rows': 8, 'k': k, 'n': n}, 1, variant)
-    config = {'Part': PART, 'AIEConfig': {'BatchSize': 8, 'Iterations': 1}, 'LayerDirectives': directives}
+    config = {'Part': part, 'AIEConfig': {'BatchSize': 8, 'Iterations': 1}, 'LayerDirectives': directives}
     return from_onnx(model, config, output_dir=tmp_path / f'd{k}_{n}', project_name='d').run_pipeline()
 
 
@@ -70,3 +70,14 @@ def test_estimate_composes_the_calibrated_kernel_cost_and_the_exact_tile_use(tmp
     assert beyond.interval is None and 'beyond the calibrated range' in beyond.refusals[0]
     with pytest.raises(TypeError, match='AIEModel'):
         estimate(m.context, proxy)
+
+
+def test_a_cost_model_serves_every_part_of_its_generation(tmp_path, monkeypatch):
+    """Its cycles are the generation's cores: another AIE part takes them, an AIE-ML part is refused."""
+    monkeypatch.delenv('XILINX_VITIS', raising=False)
+    (inst,) = _dense(tmp_path, 64, 32).context.ir.execution
+    proxy = _artifact(kernel_specialization(inst))
+    other = estimate(_dense(tmp_path / 'vp2802', 64, 32, part='xcvp2802-vsva5601-2MHP-e-S'), proxy)
+    assert not other.refusals and f'calibrated on {PART}' in other.evidence
+    newer = estimate(_dense(tmp_path / 've2802', 64, 32, part='xcve2802-vsvh1760-2mp-e-s'), proxy)
+    assert newer.interval is None and 'calibrated for AIE, not AIE-ML' in newer.refusals[0]

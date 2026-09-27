@@ -1,7 +1,7 @@
 """A lowered design's interval, first-inference latency and tile use, compile-free -- the one estimate the optimizer
 ranks by and users read: `print(estimate(aie4ml.from_hls4ml(hls_model)))`.
 
-Kernel cycles come from the part's calibrated cost model (`ARTIFACTS`), composed along the physical plan with the
+Kernel cycles come from the generation's calibrated cost model (`ARTIFACTS`), composed along the physical plan with the
 chain solver and the handoffs, every rate and depth a device fact (aie_devices.json). Interval and latency are given
 at the kernels' point estimates and at the ends of their empirical ranges; hard latency claims need a measurement.
 Tile use is exact. A kernel or handoff the model does not cover leaves no estimate, only the reasons.
@@ -23,7 +23,7 @@ from .proxy import KernelProxy, cascade_timeline
 from .specialization import installed_compiler, kernel_specialization, kernel_templates
 
 LEVELS = ('low', 'cycles', 'high')
-ARTIFACTS = Path(__file__).parent / 'artifacts'  # one calibrated cost model per device part: <part>.json
+ARTIFACTS = Path(__file__).parent / 'artifacts'  # one calibrated cost model per generation: <generation>.json
 
 
 @dataclass(frozen=True)
@@ -50,7 +50,7 @@ class Estimate:
 
 def estimate(model: AIEModel, proxy: Union[KernelProxy, Path, None] = None) -> Estimate:
     """The estimate of a lowered design (aie4ml.from_onnx or aie4ml.from_hls4ml, its pipeline run) by the cost model
-    `proxy`: an artifact, its path, or by default the one shipped for the design's device part."""
+    `proxy`: an artifact, its path, or by default the one shipped for the design's generation."""
     if not isinstance(model, AIEModel):
         raise TypeError(
             f'estimate takes an AIEModel (aie4ml.from_onnx, aie4ml.from_hls4ml), not {type(model).__name__}.'
@@ -60,9 +60,9 @@ def estimate(model: AIEModel, proxy: Union[KernelProxy, Path, None] = None) -> E
         raise ValueError('the design is not lowered yet: run its pipeline (or compile it) first.')
     clock = ctx.device.aie_clock_mhz
     if not isinstance(proxy, KernelProxy):
-        path = Path(proxy) if proxy is not None else ARTIFACTS / f'{ctx.device.part}.json'
+        path = Path(proxy) if proxy is not None else ARTIFACTS / f'{ctx.device.generation.lower()}.json'
         if not path.exists():
-            refusal = f'no cost model is calibrated for {ctx.device.part} ({path}).'
+            refusal = f'no cost model is calibrated for {ctx.device.generation} ({path}).'
             return Estimate(_tiles(ctx), None, None, '', (refusal,), clock)
         proxy = KernelProxy.load(path)
     compiler = installed_compiler(ctx.device.generation)
@@ -82,9 +82,10 @@ def _tiles(ctx) -> int:
 def _estimate(ctx, proxy: KernelProxy) -> Estimate:
     ir = ctx.ir
     tiles, clock = _tiles(ctx), ctx.device.aie_clock_mhz
-    evidence = f'cost model for {proxy.part}, compiler {proxy.compiler}'
-    if ctx.device.part != proxy.part:
-        refusal = f'the cost model was calibrated for {proxy.part}, not {ctx.device.part}.'
+    # Cycles are the generation's: every part of it runs the same cores; its own clocks and ports apply below.
+    evidence = f'cost model for {proxy.generation} (calibrated on {proxy.part}), compiler {proxy.compiler}'
+    if ctx.device.generation != proxy.generation:
+        refusal = f'the cost model was calibrated for {proxy.generation}, not {ctx.device.generation}.'
         return Estimate(tiles, None, None, evidence, (refusal,), clock)
     chains: Dict[str, List[Chain]] = {level: [] for level in LEVELS}
     refusals = []

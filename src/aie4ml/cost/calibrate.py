@@ -7,7 +7,8 @@ Run where Vitis is installed. It lowers every discrete choice of the op type's c
 to find its code groups; per group and chain length it samples shape points far apart among those lowering accepts,
 inside the region, holding some out; compiles each kernel once ever (the evidence cache); simulates a few for stalls;
 adds points where held-out kernels miss the `--gate`; then fits the target's cascade link and handoff setups through
-`estimate` on simulated chains and multi-layer models. It writes the part's artifact into the package (`ARTIFACTS`).
+`estimate` on simulated chains and multi-layer models. It writes the generation's artifact into the package
+(`ARTIFACTS`).
 """
 
 from __future__ import annotations
@@ -127,7 +128,7 @@ def calibrate(
     link_latency, transport = _fit_transport(plan, evidence, threads, fitted)
     (work / 'transport.json').write_text(json.dumps({'link_latency': link_latency, 'transport': transport}))
     proxy = _artifact(fitted, link_latency, transport)
-    path = ARTIFACTS / f'{proxy.part}.json'
+    path = ARTIFACTS / f'{proxy.generation.lower()}.json'
     proxy.save(path)
     print(f'{path}: {sorted(proxy.sources)}, link latency {link_latency}, transport {transport}', flush=True)
     return path

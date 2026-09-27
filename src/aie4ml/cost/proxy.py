@@ -24,7 +24,7 @@ import numpy as np
 
 from ..device_catalog import lookup_device
 from .chain import Timeline, timeline
-from .listing import Loop, LoopPlan, ScheduleUnavailable
+from .listing import Loop, LoopPlan
 
 SCHEMA_VERSION = 6
 FOLDS = 5
@@ -63,7 +63,7 @@ class KernelProxy:
         """The cost of a kernel of `variant` whose kernel templates have the fingerprint `sources`."""
         model = self.models.get(_model(variant, role, group))
         if variant not in self.sources:
-            refusal = f'{variant} has no cost model for {self.part} and compiler {self.compiler}.'
+            refusal = f'{variant} has no cost model for {self.generation} and compiler {self.compiler}.'
         elif sources != self.sources[variant]:
             refusal = f'{variant} changed since its cost model was calibrated.'
         elif model is None:
@@ -93,7 +93,7 @@ class KernelProxy:
         if role != 'single':
             words = round(float(np.dot(model['words'], terms)))
             cascade = (words // self.blocks[variant], self.blocks[variant])
-        evidence = f"cost model of {model['kernels']} {role} kernels, {self.part}, compiler {self.compiler}"
+        evidence = f"cost model of {model['kernels']} {role} kernels, {self.generation}, compiler {self.compiler}"
         return KernelCost(
             issue * (1 + stall),
             issue * (1 + low) * (1 + least),
@@ -102,12 +102,6 @@ class KernelProxy:
             cascade,
             evidence,
         )
-
-    def check_target(self, part: str, compiler: str) -> None:
-        if (part, compiler) != (self.part, self.compiler):
-            raise ScheduleUnavailable(
-                f'the cost model was calibrated for {self.part}, compiler {self.compiler}; not {part}, {compiler}.'
-            )
 
     @classmethod
     def calibrate(
