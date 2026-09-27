@@ -31,6 +31,11 @@ class CostDescriptor:
     space: CalibrationSpace
 
 
+# Of every op type: every kernel saturates (its template fixes the mode) and sets its rounding mode in a control
+# register, so neither sets the code.
+NOT_CODE = ('rounding_mode', 'precision.*.rounding', 'precision.*.saturation')
+
+
 from .dense import DENSE  # noqa: E402
 
 DESCRIPTORS: Dict[str, CostDescriptor] = {'dense': DENSE}

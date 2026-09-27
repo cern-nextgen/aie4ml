@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from ..aie_types import AIEDataType
-from .variants import DESCRIPTORS
+from .variants import DESCRIPTORS, NOT_CODE
 
 # Bump when what a measurement records, or how a key is formed, changes.
 SCHEMA_VERSION = 1
@@ -120,7 +120,7 @@ def _schedule(inst) -> Dict[str, Any]:
     group = {
         path: value
         for path, value in params.items()
-        if path not in features and not any(_under(path, pattern) for pattern in spec.not_code)
+        if path not in features and not any(_under(path, pattern) for pattern in (*NOT_CODE, *spec.not_code))
     }
     return {
         'coordinate': json.dumps({**group, **features}, sort_keys=True),

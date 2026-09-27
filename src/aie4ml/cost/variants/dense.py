@@ -110,11 +110,8 @@ def _dense_handoffs(variant, choice: Dict[str, Any]) -> Dict[str, Model]:
 DENSE = CostDescriptor(
     features=('full_outer', 'tile_inner_lhs', 'tile_inner_rhs'),
     not_code=(
-        # run-time operands of the same instructions: shifts 0 to 31 and every rounding mode compiled to one
-        # schedule in every cascade role; a fraction only sets the shift
+        # a run-time operand: shifts 0 to 31 compiled to one schedule in every cascade role; a fraction only sets it
         'shift',
-        'rounding_mode',
-        'precision.*.rounding',
         'precision.*.frac',
         # signed or unsigned is a scale to the array; the width (precision.*.width) sets the code
         'precision.*.format',
