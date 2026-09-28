@@ -370,6 +370,24 @@ def test_a_graph_output_off_a_memory_tile_moves_whole_words(tmp_path, part):
     assert out['staging']['tiling_dimension'][0] == 12
 
 
+@pytest.mark.parametrize(
+    'part', ['xcve2802-vsvh1760-2mp-e-s', 'xc2ve3858-ssva2112-2mp-e-s'], ids=['aie-ml', 'aie-mlv2']
+)
+def test_every_output_port_reads_its_slice_inside_the_dma_boundary(tmp_path, part):
+    """A memory tile's DMA zero-fills past its boundary, a buffer coordinate: the second of two output chains starts
+    mid-buffer, and its slice must still lie inside."""
+    plan = _run_pipeline(
+        _dense_model(out_features=64), tmp_path, part=part, directives={'dense': {'parallelism': {'cas_num': 2}}}
+    ).context.ir.physical.plan
+    outs = [p['descriptor'] for p in plan['io_ports'] if p['direction'] == 'output']
+    assert len(outs) == 2
+    for d in outs:
+        for offset, tile, io_end, end in zip(
+            d['offset'], d['io_tiling_dimension'], d['io_boundary_dimension'], d['boundary_dimension']
+        ):
+            assert end >= min(offset + tile, io_end), d
+
+
 def test_aie1_onnx_int8_int16_dense_is_rejected_before_shift_resolution(tmp_path):
     with pytest.raises(RuntimeError, match=r'unsupported int8 x int16.*output shift'):
         _resolve_dense(_dense_model(TensorProto.INT8, TensorProto.INT16), tmp_path)

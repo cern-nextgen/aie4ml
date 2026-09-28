@@ -506,7 +506,9 @@ class _MemoryPlanMaterializer:
         boundary[shard_dim] = min(int(buf_dims[shard_dim]), max(0, int(io_boundary[shard_dim]) - int(unit_base_dim0)))
         inner = int(base['inner_dimension'])
         tile = self._whole_beats(entry, io_tile, inner)
-        boundary[inner] = min(int(buf_dims[inner]), tile[inner])
+        # The boundary is a buffer coordinate the DMA zero-fills past; it too ends on a whole word.
+        word = 32 // int(self._graph_output_dtype(entry).width)
+        boundary[inner] = min(int(buf_dims[inner]), -(-int(boundary[inner]) // word) * word)
         return {
             'access': 'read',
             'storage_layout': STORAGE_LAYOUT_LINEAR,
