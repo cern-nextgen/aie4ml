@@ -76,6 +76,16 @@ def _frame_columns(generation: str) -> Tuple[int, int]:
     return max(_SPATIAL_BLOCKS[generation]) * m, m
 
 
+def _depthwise_rows(compact: np.ndarray) -> np.ndarray:
+    """[block][ky][tap][channel] from the compact [kh, kw, 1, cout] depthwise weights: each kernel row's taps in
+    whole groups of four, the ones past kw zero."""
+    kh, kw, _, cout = compact.shape
+    blocks = align_up(cout, CHANNEL_BLOCK) // CHANNEL_BLOCK
+    taps = np.zeros((kh, align_up(kw, 4), blocks * CHANNEL_BLOCK), dtype=compact.dtype)
+    taps[:, :kw, :cout] = compact[:, :, 0, :]
+    return taps.reshape(kh, -1, blocks, CHANNEL_BLOCK).transpose(2, 0, 1, 3)
+
+
 def _padded_blocks(blocks: int) -> int:
     """Output blocks a tile's weights and bias hold: the paired core steps blocks two at a time, so it
     pads an odd count; a tile of one block runs the one-block core, which needs no padding."""
@@ -381,6 +391,24 @@ class Conv2dOpImplVariant(OpImplVariant):
         """Tile memory the kernel holds beyond its frames. A buffer kernel holds none."""
         return 0
 
+    def uses_depthwise_core(self, node, config: Conv2dConfig) -> bool:
+        """Whether one tile runs this depthwise conv (one channel per group) on the channelwise core, which AIE-ML
+        and AIE-MLv2 have (sliding_mul_ch; their int8 cores are 4 and 8 rows, AIE1's is 2). Anything else runs the
+        mmul core, a depthwise conv as block-diagonal tiles."""
+        lhs = input_tensor_for_role(node, 'lhs')
+        widths = tuple(int(config.precision[role].width) for role in ('lhs', 'rhs', 'output'))
+        return (
+            self.port_kind == PORT_KIND_BUFFER
+            and config.microtiling.microtile_m > 2
+            and int(config.groups) == int(lhs.shape[-1]) == int(input_tensor_for_role(node, 'rhs').shape[-1])
+            and widths == (8, 8, 8)
+            and int(config.parallelism.cas_num) == 1
+            and int(config.parallelism.cas_length) == 1
+            and int(config.spatial.strides[1]) == 1
+            and config.pool is None
+            and not config.flags.emit_flattened
+        )
+
     def retiles_input(self, config: Conv2dConfig) -> bool:
         """Whether this conv reads a frame a retiler built.
 
@@ -511,6 +539,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         out_blocks_padded = _padded_blocks(out_blocks)
         band = self.band_rows(node, config)
         streamed = self.port_kind == PORT_KIND_STREAM
+        depthwise = self.uses_depthwise_core(node, config)
         # A band's window starts mid-image, so the image no longer sits at the frame's origin.
         whole_image = not outer
         params = {field: getattr(config, field) for field in config.__dataclass_fields__}
@@ -534,8 +563,13 @@ class Conv2dOpImplVariant(OpImplVariant):
             out_w_computed=out_w_computed,
             in_elements=int(np.prod(in_view.tile)),
             out_elements=int(np.prod(out_view.tile)),
-            weight_count=kh * kw * in_blocks * out_blocks_padded * CHANNEL_BLOCK**2,
+            weight_count=(
+                out_blocks * kh * align_up(kw, 4) * CHANNEL_BLOCK
+                if depthwise
+                else kh * kw * in_blocks * out_blocks_padded * CHANNEL_BLOCK**2
+            ),
             bias_count=out_blocks_padded * CHANNEL_BLOCK,
+            depthwise_core=depthwise,
             stream_io=self.port_kind == PORT_KIND_STREAM,
             # aie_api's int16 x int8 mmul of 8-channel blocks accumulates in 64 bits whatever it is asked for
             cascade_accumulator_tag='acc64' if int(config.precision['lhs'].width) == 16 else config.accumulator_tag,
@@ -645,7 +679,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         )
 
     def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
-        """Weights per tile as Dense B tiles: [tap (ky, kx, cin block)][cout block][8 x 8].
+        """Weights per tile as Dense B tiles: [tap (ky, kx, cin block)][cout block][8 x 8], or for the depthwise
+        core each channel's own taps (see _depthwise_rows).
 
         The compact `[kh, kw, Cin/groups, Cout]` tensor expands here into the dense form the mmul
         core consumes -- a grouped conv simply leaves the off-diagonal tiles zero -- and is then
@@ -677,32 +712,35 @@ class Conv2dOpImplVariant(OpImplVariant):
         chain_blocks_padded = _padded_blocks(chain_blocks)
         column_blocks = in_channels // CHANNEL_BLOCK // cas_length
 
-        dense = np.zeros((kh, kw, in_channels, blocks * CHANNEL_BLOCK), dtype=np_dtype_for_spec(p.precision['rhs']))
-        for group in range(groups):
-            dense[:, :, group * cin_g : (group + 1) * cin_g, group * cout_g : (group + 1) * cout_g] = compact[
-                :, :, :, group * cout_g : (group + 1) * cout_g
-            ]
-        # (kh, kw, cb, 8, nb, 8) -> tap-major (ky, kx, cb) x (nb) x (8 x 8), then cut per tile.
-        tiles = dense.reshape(kh, kw, in_channels // CHANNEL_BLOCK, CHANNEL_BLOCK, blocks, CHANNEL_BLOCK).transpose(
-            0, 1, 2, 4, 3, 5
-        )
-        packed_weights = np.zeros(
-            (cas_num, cas_length, kh * kw * column_blocks * chain_blocks_padded * CHANNEL_BLOCK**2),
-            dtype=tiles.dtype,
-        )
-        for chain in range(cas_num):
-            block_base = 0 if outer else chain * chain_blocks
-            for column in range(cas_length):
-                tile = np.zeros(
-                    (kh, kw, column_blocks, chain_blocks_padded, CHANNEL_BLOCK, CHANNEL_BLOCK), dtype=tiles.dtype
-                )
-                tile[:, :, :, :chain_blocks] = tiles[
-                    :,
-                    :,
-                    column * column_blocks : (column + 1) * column_blocks,
-                    block_base : block_base + chain_blocks,
+        if self.uses_depthwise_core(inst.node, p):
+            packed_weights = _depthwise_rows(compact).reshape(1, 1, -1)
+        else:
+            dense = np.zeros((kh, kw, in_channels, blocks * CHANNEL_BLOCK), dtype=np_dtype_for_spec(p.precision['rhs']))
+            for group in range(groups):
+                dense[:, :, group * cin_g : (group + 1) * cin_g, group * cout_g : (group + 1) * cout_g] = compact[
+                    :, :, :, group * cout_g : (group + 1) * cout_g
                 ]
-                packed_weights[chain, column] = tile.reshape(-1)
+            # (kh, kw, cb, 8, nb, 8) -> tap-major (ky, kx, cb) x (nb) x (8 x 8), then cut per tile.
+            tiles = dense.reshape(kh, kw, in_channels // CHANNEL_BLOCK, CHANNEL_BLOCK, blocks, CHANNEL_BLOCK).transpose(
+                0, 1, 2, 4, 3, 5
+            )
+            packed_weights = np.zeros(
+                (cas_num, cas_length, kh * kw * column_blocks * chain_blocks_padded * CHANNEL_BLOCK**2),
+                dtype=tiles.dtype,
+            )
+            for chain in range(cas_num):
+                block_base = 0 if outer else chain * chain_blocks
+                for column in range(cas_length):
+                    tile = np.zeros(
+                        (kh, kw, column_blocks, chain_blocks_padded, CHANNEL_BLOCK, CHANNEL_BLOCK), dtype=tiles.dtype
+                    )
+                    tile[:, :, :, :chain_blocks] = tiles[
+                        :,
+                        :,
+                        column * column_blocks : (column + 1) * column_blocks,
+                        block_base : block_base + chain_blocks,
+                    ]
+                    packed_weights[chain, column] = tile.reshape(-1)
 
         packed_bias = np.zeros(
             (cas_num, chain_blocks_padded * CHANNEL_BLOCK), dtype=np_bias_dtype_for_spec(p.precision['bias'])

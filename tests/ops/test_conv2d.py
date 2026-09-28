@@ -299,8 +299,10 @@ def test_valid_conv_frame_covers_the_computed_width(k, tmp_path):
 
 
 def test_conv_weights_pack_compact_groups_into_dense_tiles(conv_model, tmp_path):
+    """AIE1 has no channelwise core: a depthwise conv runs the mmul core as block-diagonal tiles."""
     ctx = lower(conv_model, tmp_path, part=AIE1_PART)
     c2 = ctx.ir.execution.get('c2_aie')
+    assert not c2.variant.uses_depthwise_core(c2.node, c2.config)
     # The IR keeps the compact per-group form; the variant expands the groups when it packs.
     assert tuple(c2.node.inputs[1].shape) == (3, 3, 1, C2)
     packed = c2.artifacts['packed_weights']
@@ -320,6 +322,18 @@ def test_conv_weights_pack_compact_groups_into_dense_tiles(conv_model, tmp_path)
                 else:
                     assert np.array_equal(np.diag(block), np.rint(compact[ky, kx, 0, cb * 8 : cb * 8 + 8] * 16))
                     assert np.count_nonzero(block) == np.count_nonzero(np.diag(block))
+
+
+@pytest.mark.parametrize('part', [PART, MLV2_PART], ids=['aie-ml', 'aie-mlv2'])
+def test_depthwise_core_packs_only_the_channel_taps(conv_model, tmp_path, part):
+    """On one AIE-ML or AIE-MLv2 tile a depthwise conv runs the channelwise core, which reads each channel's own taps:
+    per block and kernel row, the taps in groups of four x 8 channels."""
+    c2 = lower(conv_model, tmp_path, part=part).ir.execution.get('c2_aie')
+    assert c2.variant.uses_depthwise_core(c2.node, c2.config)
+    compact = np.rint(np.asarray(c2.node.inputs[1].data).reshape(3, 3, C2) * 16)  # ky, kx, channel
+    want = np.zeros((C2 // 8, 3, 4, 8))  # block, ky, tap, channel
+    want[:, :, :3, :] = compact.reshape(3, 3, C2 // 8, 8).transpose(2, 0, 1, 3)
+    assert np.array_equal(c2.artifacts['packed_weights'].reshape(want.shape), want)
 
 
 def test_conv_partitions_channel_blocks_across_tiles(conv_model, tmp_path):
@@ -968,6 +982,45 @@ def test_outer_split_matches_onnx(tmp_path, part):
     are what this checks, so any mistake in the slice windows shows up as wrong pixels."""
     assert_x86_matches_onnx(
         _row_split_model(), {'x_q': _feed()}, ROW_SPLIT, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
+    )
+
+
+def _depthwise_model(k: int, pad: int):
+    """conv -> k x k depthwise -> 1x1: same-padded, the depthwise windows start on an odd frame column, valid on an
+    even one; a 5x5 takes two tap groups a row on AIE-ML."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a1', 'c1', CIN, C1, 3, pad=1, relu=True, seed=1)
+    _conv(nodes, inits, 'a1', 'a2', 'c2', C1, C1, k, pad=pad, groups=C1, relu=True, seed=2)
+    _conv(nodes, inits, 'a2', 'a3', 'c3', C1, C3, 1, pad=0, relu=False, seed=3)
+    nodes.append(helper.make_node('Transpose', ['a3'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    side = H - k + 1 + 2 * pad
+    return make_model(
+        f'depthwise_k{k}_pad{pad}',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, side, side, C3])],
+        initializers=inits,
+    )
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('k, pad', [(3, 1), (3, 0), (5, 2)], ids=['3x3-same', '3x3-valid', '5x5-same'])
+@pytest.mark.parametrize('part', [PART, MLV2_PART], ids=['aie-ml', 'aie-mlv2'])
+def test_depthwise_core_matches_onnx(tmp_path, part, k, pad):
+    feeds = np.random.default_rng(12).integers(-40, 40, size=(6, 1, H, W, CIN), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _depthwise_model(k, pad),
+        {'x_q': feeds},
+        {},
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=6,
+        per_iteration=True,
     )
 
 

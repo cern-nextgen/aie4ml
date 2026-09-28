@@ -43,6 +43,7 @@ struct {{L.struct_name}} {
   static constexpr int FLAT_K_PADDED = {{P.flat_k_padded}};
   static constexpr int IN_ELEMENTS = {{P.in_elements}}, OUT_ELEMENTS = {{P.out_elements}};
   static constexpr int WN = {{P.weight_count}}, BN = {{P.bias_count}};
+  static constexpr bool DEPTHWISE_CORE = {{ 'true' if P.depthwise_core else 'false' }};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
   static constexpr bool POOL = {{ 'true' if P.pool else 'false' }};
