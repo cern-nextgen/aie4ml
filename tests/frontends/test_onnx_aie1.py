@@ -259,7 +259,7 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
 
     assert device.generation == 'AIE'
     assert device.columns == 59
-    assert device.column_start == 7
+    assert (device.column_start, device.preferred_column_start) == (1, 6)
     assert device.rows == 8
     assert device.plio_width_bits == 128
     assert device.core_stream_inputs == 2

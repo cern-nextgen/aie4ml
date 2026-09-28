@@ -46,7 +46,8 @@ class DeviceSpec:
     pl_clock_mhz: float
     columns: int
     rows: int
-    column_start: int
+    column_start: int  # the placement region's first column
+    preferred_column_start: int  # where placement starts when the design fits from there
     row_start: int
     plio_width_bits: int
     core_stream_inputs: int
@@ -101,7 +102,11 @@ class DeviceSpec:
             pl_clock_mhz=float(require(cfg, 'PLClockFreqMHz')),
             columns=int(require(cfg, 'Columns')),
             rows=int(require(cfg, 'Rows')),
-            column_start=int(require(cfg, 'ColumnStart')),
+            # A user's ColumnStart bounds the region. Otherwise it spans every column but 0 -- a kernel keeps
+            # buffers in its west neighbour -- and placement prefers to start at the first shim column with a PL
+            # interface, where the PLIOs sit next to the kernels.
+            column_start=int(cfg.get('ColumnStart', 1)),
+            preferred_column_start=int(cfg['ColumnStart'] if 'ColumnStart' in cfg else require(cfg, 'PLColumnStart')),
             row_start=int(require(cfg, 'RowStart')),
             plio_width_bits=int(require(cfg, 'PLIOWidthBits')),
             core_stream_inputs=int(require(cfg, 'CoreStreamInputs')),

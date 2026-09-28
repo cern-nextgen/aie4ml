@@ -67,7 +67,7 @@
       "Generation": "AIE",
       "Columns": 50,
       "Rows": 8,
-      "ColumnStart": 7,
+      "PLColumnStart": 6,
       "RowStart": 0,
       "PLClockFreqMHz": 312.5,
       "AIEClockFreqMHz": 1250
@@ -77,7 +77,7 @@
       "Generation": "AIE",
       "Columns": 59,
       "Rows": 8,
-      "ColumnStart": 7,
+      "PLColumnStart": 6,
       "RowStart": 0,
       "PLClockFreqMHz": 312.5,
       "AIEClockFreqMHz": 1250
@@ -87,7 +87,7 @@
       "Generation": "AIE-ML",
       "Columns": 38,
       "Rows": 8,
-      "ColumnStart": 7,
+      "PLColumnStart": 5,
       "RowStart": 0,
       "PLClockFreqMHz": 312.5,
       "BlockRAM": {
@@ -107,7 +107,7 @@
       "Generation": "AIE-MLV2",
       "Columns": 36,
       "Rows": 4,
-      "ColumnStart": 7,
+      "PLColumnStart": 4,
       "RowStart": 0,
       "PLClockFreqMHz": 312.5,
       "AIEClockFreqMHz": 1250

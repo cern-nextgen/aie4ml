@@ -601,6 +601,11 @@ def _topological_order(
     return order
 
 
+def _placement_hint(ctx, node) -> Dict[str, Any]:
+    """Where a kernel is pinned: the user's placement directive, else the design search's choice."""
+    return node.directives.get('placement') or ctx.ir.optimizer.get('placement', {}).get(node.name, {})
+
+
 def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
     specs: Dict[str, NodeSpec] = {}
     stable_index: Dict[str, int] = {}
@@ -618,7 +623,7 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
         if rect.extras.get('row_parity') is not None:
             rect.extras['row_parity'] = (int(rect.extras['row_parity']) - row_offset) % 2
 
-        placement_hint = node.directives.get('placement') or ctx.ir.optimizer.get('placement', {}).get(node.name, {})
+        placement_hint = _placement_hint(ctx, node)
         anchor: Optional[Tuple[int, int]] = None
         if placement_hint.get('col') is not None and placement_hint.get('row') is not None:
             anchor = (
@@ -1333,8 +1338,25 @@ class PlaceKernels(AIEPass):
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         device = ctx.device
+        region, preferred = int(device.column_start), int(device.preferred_column_start)
+        pinned = [_placement_hint(ctx, inst.node).get('col') for inst in ctx.ir.execution]
+        # Start next to the PLIOs when the design fits there, else use the whole region.
+        if preferred > region and all(col is None or int(col) >= preferred for col in pinned):
+            try:
+                placements = self._place(ctx, preferred)
+            except PlacementInfeasibleError:
+                placements = self._place(ctx, region)
+        else:
+            placements = self._place(ctx, region)
+        if placements is None:
+            return False
+        changed = placements != ctx.ir.physical.placements
+        ctx.ir.physical.placements = placements
+        return changed
 
-        col_offset = int(device.column_start)
+    def _place(self, ctx, col_offset: int) -> Optional[Dict[str, Dict[str, int]]]:
+        """Every kernel's place in the region from column `col_offset`, or None when there is no kernel."""
+        device = ctx.device
         row_offset = int(device.row_start)
         W = int(device.columns) - col_offset
         H = int(device.rows) - row_offset
@@ -1346,7 +1368,7 @@ class PlaceKernels(AIEPass):
 
         graph = _build_graph(ctx, col_offset, row_offset)
         if not graph.specs:
-            return False
+            return None
 
         placed = _place_disjoint_fanout(
             graph=graph,
@@ -1369,8 +1391,7 @@ class PlaceKernels(AIEPass):
                 heuristics=self._heuristics,
                 max_states=self._max_states,
             )
-
-        placements = {
+        return {
             name: {
                 'col': int(p.x + col_offset),
                 'row': int(p.y + row_offset),
@@ -1379,6 +1400,3 @@ class PlaceKernels(AIEPass):
             }
             for name, p in placed.items()
         }
-        changed = placements != ctx.ir.physical.placements
-        ctx.ir.physical.placements = placements
-        return changed

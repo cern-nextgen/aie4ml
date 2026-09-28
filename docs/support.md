@@ -104,6 +104,9 @@ These never become kernels of their own:
   tile reorders it otherwise (one stage). AIE1 has no memory tile, so a layout mismatch there is refused.
 - An output may feed several layers (branches, residual Adds); each consumer is planned separately.
 - The graph input and output move over PLIO ports, split to match the first and last layers' tiles.
+- Placement starts at the device's first column with PL interfaces, next to the PLIOs, and spreads into the columns
+  before it (from column 1) only when the design does not fit otherwise; each column between a kernel and its PLIO
+  adds about 8 cycles of latency. `AIEConfig: ColumnStart` fixes where the placement region starts.
 - Not implemented: more than one memory-tile stage between two layers, and AIE-to-PL-to-AIE paths inside a model.
 
 ## Frontends

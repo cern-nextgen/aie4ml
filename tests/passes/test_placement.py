@@ -1,8 +1,11 @@
 """Focused placement legality tests."""
 
 import pytest
+from aie4ml.errors import ConfigRefused
 from aie4ml.op_impls.base import BufferLocation, row_flow
 from aie4ml.passes.placement import EdgeSpec, GraphSpec, Placed, PortFace, Rect, _placements_conflict
+from helpers import PART, lower
+from passes.test_choose_parallelism import _wide_model
 
 
 def _one_tile(name, col, row, locations):
@@ -32,3 +35,16 @@ def test_neighbours_share_only_an_exactly_aliased_buffer(row):
 
     other_banks = _one_tile('consumer', 8, row, lambda r: (BufferLocation('in', 0, flow.input_col, 0, (1, 2)),))
     assert _placements_conflict(producer, other_banks, graph)
+
+
+def test_placement_starts_next_to_the_plio_columns_and_widens_only_when_it_must(tmp_path):
+    def columns(ctx):
+        return sorted(p['col'] for p in ctx.ir.physical.placements.values())
+
+    assert columns(lower(_wide_model(), tmp_path / 'default', part=PART)) == [5, 6, 7]  # VE2802's first PL column: 5
+    # One tile from the preferred column on: the design widens into the columns before it.
+    narrow = {'Columns': 7, 'Rows': 1, 'PLColumnStart': 6}
+    assert columns(lower(_wide_model(), tmp_path / 'narrow', part=PART, aie_config=narrow)) == [1, 2, 3]
+    # A ColumnStart the user gives bounds the region.
+    with pytest.raises(ConfigRefused):
+        lower(_wide_model(), tmp_path / 'held', part=PART, aie_config={**narrow, 'ColumnStart': 6})

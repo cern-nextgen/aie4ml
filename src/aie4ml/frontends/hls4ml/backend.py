@@ -196,7 +196,6 @@ class AIEBackend(Backend):
 
         plio_width = plio_width_bits if plio_width_bits is not None else _require('PLIOWidthBits')
         pl_freq = pl_clock_freq_mhz if pl_clock_freq_mhz is not None else _require('PLClockFreqMHz')
-        col_start_val = column_start if column_start is not None else _require('ColumnStart')
         row_start_val = row_start if row_start is not None else _require('RowStart')
         if 'MaxMemTileInPorts' not in device_info or 'MaxMemTileOutPorts' not in device_info:
             raise KeyError(f'Device catalog entry "{part}" missing MaxMemTile port limits.')
@@ -208,7 +207,7 @@ class AIEBackend(Backend):
                 'Generation': _require('Generation'),
                 'Columns': _require('Columns'),
                 'Rows': _require('Rows'),
-                'ColumnStart': col_start_val,
+                **({'ColumnStart': int(column_start)} if column_start is not None else {}),
                 'RowStart': row_start_val,
                 'PLIOWidthBits': plio_width,
                 'PLClockFreqMHz': pl_freq,
