@@ -61,6 +61,7 @@ def _dense_model(
     lhs_type: int = TensorProto.INT8,
     rhs_type: int = TensorProto.INT8,
     out_features: int = 8,
+    in_features: int = 16,
 ):
     np_type = {TensorProto.INT8: np.int8, TensorProto.INT16: np.int16}
     nodes = [
@@ -73,13 +74,13 @@ def _dense_model(
     return make_model(
         'aie1_dense',
         nodes=nodes,
-        inputs=[('x_q', lhs_type, [8, 16])],
+        inputs=[('x_q', lhs_type, [8, in_features])],
         outputs=[('y', TensorProto.FLOAT, [8, out_features])],
         initializers=[
             *_qparams('x', lhs_type),
             *_qparams('w', rhs_type),
             *_qparams('y', TensorProto.INT8),
-            numpy_helper.from_array(np.ones((16, out_features), dtype=np_type[rhs_type]), 'w_q'),
+            numpy_helper.from_array(np.ones((in_features, out_features), dtype=np_type[rhs_type]), 'w_q'),
         ],
     )
 

@@ -75,6 +75,7 @@ class AIEProjectEmitter:
         else:
             pl_plan = None
         self._render_makefile(output_dir, ctx, env, pl_plan)
+        ctx.emitted = ctx.configuration_fingerprint()
 
     def _prepare_directories(self, output_dir: Path):
         (output_dir / 'src').mkdir(parents=True, exist_ok=True)

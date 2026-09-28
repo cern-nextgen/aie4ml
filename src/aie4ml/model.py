@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
-from pathlib import Path
 from typing import Any, Optional
 
-from .ir import PhysicalIR, get_backend_context
+from .ir import get_backend_context
 from .ir.context import CONTEXT_ATTR, AIEBackendContext
 from .passes import run_aie_passes
 from .pipeline import DEFAULT_PIPELINE
@@ -42,37 +40,9 @@ class AIEModel:
         return get_backend_context(self)
 
     def run_pipeline(self) -> 'AIEModel':
+        self.context.emitted = None
         run_aie_passes(self.context, [cls() for cls in DEFAULT_PIPELINE])
         return self
-
-    def _pipeline_json_path(self) -> Path:
-        return self.context.project_config.output_dir / 'aie_pipeline.json'
-
-    def _load_emitted_physical_plan(self) -> None:
-        ctx = self.context
-        source = self._pipeline_json_path()
-        if not source.exists():
-            raise FileNotFoundError(
-                f'Project directory "{ctx.project_config.output_dir}" exists but "{source.name}" is missing.'
-            )
-
-        data = json.loads(source.read_text())
-        try:
-            ctx.ir.physical = PhysicalIR.from_dict(data.get('physical'), require_plan_buffers=True)
-        except RuntimeError as exc:
-            raise RuntimeError(f'"{source}": {exc}') from exc
-
-    def _ensure_runtime_plan(self) -> None:
-        ctx = self.context
-        if ctx.ir.physical.plan and ctx.ir.physical.placements:
-            return
-
-        output_dir = ctx.project_config.output_dir
-        if not output_dir.exists():
-            self.run_pipeline()
-            return
-
-        self._load_emitted_physical_plan()
 
     def write(self) -> 'AIEModel':
         self.run_pipeline()
@@ -85,12 +55,11 @@ class AIEModel:
         make_target: 'all' compiles for the hardware target; others as in the Makefile ('x86com', ...).
         env: environment for make (default: this process's).
         log_to_stdout: stream the tools' output; otherwise it is captured into the log.
-        jobs: kernels compiled in parallel (make -jN); default: the compiler's own.
+        jobs: kernels compiled in parallel (make -jN); default: the AIE compiler's, 8.
         """
         ctx = self.context
         output_dir = ctx.project_config.output_dir
-        self._ensure_runtime_plan()
-        if not output_dir.exists():
+        if ctx.emitted != ctx.configuration_fingerprint():  # never written, or configured differently since
             self.write()
 
         cmd = ['make', make_target] + ([f'-j{int(jobs)}'] if jobs else [])  # -jN: kernels compiled at once
@@ -154,9 +123,10 @@ class AIEModel:
         """Write `X` into the written project's simulator input files, as `predict` does; returns the I/O layout."""
         ctx = self.context
         output_dir = ctx.project_config.output_dir
-        if not output_dir.exists():
-            raise FileNotFoundError(f'Output directory "{output_dir}" does not exist. Run write() first.')
-        self._ensure_runtime_plan()
+        if ctx.emitted != ctx.configuration_fingerprint():
+            raise RuntimeError(
+                f'"{output_dir}" does not hold this model\'s project as configured now. Run write() or build() first.'
+            )
         layout = build_io_layout(self)
         prepared = prepare_inputs(layout, X, iterations=int(ctx.aie_config['Iterations']), quantize=quantize_in)
         write_input_files(output_dir, layout, prepared, plio_width_bits=ctx.device.plio_width_bits)

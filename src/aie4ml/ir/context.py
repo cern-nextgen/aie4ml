@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
@@ -149,9 +151,27 @@ class AIEBackendContext:
     project_config: ProjectConfig
     aie_config: Dict[str, Any] = field(default_factory=dict)
     ir: AIEPipelineIR = field(default_factory=AIEPipelineIR)
+    emitted: Optional[str] = None  # configuration_fingerprint() of the project last written
+
+    def configuration_fingerprint(self) -> str:
+        """A hash of what a project is generated from: the device, the AIE configuration, every node's directives
+        and the design search's choice. Not of the whole project: the model's graph is fixed at conversion."""
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    'device': [self.device.platform, self.device.part],
+                    'aie_config': self.aie_config,
+                    'directives': {node.name: node.directives for node in self.ir.logical},
+                    'optimizer': self.ir.optimizer,
+                },
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest()
 
     def reset_ir(self) -> None:
         self.ir.reset()
+        self.emitted = None
 
 
 def ensure_backend_context(model, factory: Callable[[], AIEBackendContext]) -> AIEBackendContext:

@@ -535,25 +535,6 @@ class PhysicalIR:
             'plan': _deep_copy(self.plan),
         }
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any], *, require_plan_buffers: bool = False) -> 'PhysicalIR':
-        if not isinstance(data, dict):
-            raise RuntimeError('Missing or invalid physical IR section.')
-
-        placements = data.get('placements')
-        plan = data.get('plan')
-        if not isinstance(placements, dict):
-            raise RuntimeError('Physical IR is missing placements.')
-        if not isinstance(plan, dict):
-            raise RuntimeError('Physical IR is missing plan.')
-        if require_plan_buffers and not isinstance(plan.get('buffers'), list):
-            raise RuntimeError('Physical IR plan is missing buffers required for IO layout reconstruction.')
-
-        return cls(
-            placements=_deep_copy(placements),
-            plan=_deep_copy(plan),
-        )
-
 
 @dataclass
 class AIEPipelineIR:
