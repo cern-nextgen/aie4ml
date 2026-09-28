@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from aie4ml.ir import get_backend_context
 
 keras = pytest.importorskip('keras')
 
@@ -228,3 +229,27 @@ def test_aie_compile_x86_sim_nd_input(tmp_path: Path, input_shape):
 # def test_aie_build_and_hw_sim(...):
 #     aie_model.build()
 #
+
+
+@pytest.mark.aie_ir
+def test_a_permute_between_dense_layers_converts(tmp_path):
+    """hls4ml leaves a Keras Permute's data_format unset: its permutation is over the batchless axes, the
+    channels-last order the AIE folds a transpose in."""
+    _np, hls4ml, keras, qkeras = _imports()
+    q8 = qkeras.quantized_bits(8, 0, alpha=1)
+    model = keras.Sequential(
+        [
+            keras.layers.Input((16, 32)),
+            qkeras.QActivation(qkeras.quantized_bits(8, 2), name='in_q'),
+            qkeras.QDense(16, kernel_quantizer=q8, bias_quantizer=q8, name='fc1'),
+            qkeras.QActivation(qkeras.quantized_relu(8), name='relu1'),
+            keras.layers.Permute((2, 1), name='permute'),
+            qkeras.QDense(8, kernel_quantizer=q8, bias_quantizer=q8, name='fc2'),
+        ]
+    )
+    cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    aie_model = hls4ml.converters.convert_from_keras_model(
+        model, hls_config=cfg, output_dir=str(tmp_path), project_name='permute', backend='aie', batch_size=1
+    )
+    fc2 = get_backend_context(aie_model).ir.execution.get('fc2_aie')
+    assert [view.perm for view in fc2.port_views.values() if view.perm is not None] == [(0, 2, 1)]

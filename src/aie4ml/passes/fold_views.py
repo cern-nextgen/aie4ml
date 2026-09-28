@@ -76,7 +76,7 @@ class FoldViewOps(AIEPass):
             raise ValueError(f'{node.name}: transpose rank mismatch between input and output.')
         if sorted(perm) != list(range(rank)):
             raise ValueError(f'{node.name}: invalid permutation {perm} for rank {rank}.')
-        if (node.metadata.get('data_format', 'channels_last') or '').lower() != 'channels_last':
+        if (node.metadata.get('data_format') or 'channels_last').lower() != 'channels_last':  # unset: channels-last
             raise ValueError(f'{node.name}: only channels_last transpose is supported.')
 
         views = [c.name for c in out_tv.consumers if c.op_type in _VIEW_OPS]
