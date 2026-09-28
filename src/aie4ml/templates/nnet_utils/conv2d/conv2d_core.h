@@ -19,6 +19,10 @@ using namespace adf;
 // through `__builtin_memcpy` instead measured 17% slower once a pixel spans more than one block.
 using conv2d_word_t __attribute__((may_alias)) = int32;
 
+// A fused pool drops an odd last row, in every kernel of a chain alike.
+template<typename ConfigT>
+inline constexpr int conv2d_rows = ConfigT::POOL ? ConfigT::OUT_H / 2 * 2 : ConfigT::OUT_H;
+
 template<typename ConfigT>
 inline void conv2d_check_contract() {
   static_assert(ConfigT::K == 8 && ConfigT::N == 8, "conv2d taps are 8-channel blocks");
@@ -55,11 +59,11 @@ inline void conv2d_check_contract() {
   static_assert(ConfigT::FLATTEN || ConfigT::OUT_ORIGIN_C + ConfigT::OUT_W_COMPUTED / (ConfigT::POOL ? 2 : 1) <=
                                         ConfigT::OUT_COLS,
                 "output frame holds every column the computed tiles write");
+  static_assert(!ConfigT::PARALLELISM_CONTRACT_OUTER || ConfigT::FLATTEN ||
+                    (ConfigT::OUT_ORIGIN_R == 0 && ConfigT::OUT_ORIGIN_C == 0 &&
+                     ConfigT::OUT_ROWS == conv2d_rows<ConfigT> / (ConfigT::POOL ? 2 : 1)),
+                "a row slice writes its own rows once: no border, no rows another slice holds");
 }
-
-// A fused pool drops an odd last row, in every kernel of a chain alike.
-template<typename ConfigT>
-inline constexpr int conv2d_rows = ConfigT::POOL ? ConfigT::OUT_H / 2 * 2 : ConfigT::OUT_H;
 
 // AIE1 has no 8-bit vector ALU: it pools in int16 and packs once on the store.
 template<typename ConfigT>

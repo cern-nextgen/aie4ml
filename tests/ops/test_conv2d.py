@@ -220,19 +220,21 @@ ROW_SPLIT = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
 STREAM_DIRECTIVES = {'b': {'ports': 'stream'}}
 
 
-def _padded_pair_model(size=H):
-    """conv(3x3, same) -> conv(3x3, same) -> NHWC output: the first conv stores into the second's bordered frame."""
+def _padded_pair_model(size=H, pad=1):
+    """conv(3x3, same) -> conv(3x3, `pad`) -> NHWC output: the first conv stores into the second's frame, bordered
+    when the second is same-padded."""
     nodes: list = []
     inits: list = []
     _start(nodes, inits)
     _conv(nodes, inits, 'x_nchw', 'a', 'b', CIN, C1, 3, pad=1, relu=True, seed=41)
-    _conv(nodes, inits, 'a', 'c', 'd', C1, 8, 3, pad=1, relu=True, seed=42)
+    _conv(nodes, inits, 'a', 'c', 'd', C1, 8, 3, pad=pad, relu=True, seed=42)
     nodes.append(helper.make_node('Transpose', ['c'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    out = size - 2 + 2 * pad
     return make_model(
         'conv_padded_pair',
         nodes=nodes,
         inputs=[('x_q', TensorProto.INT8, [1, size, size, CIN])],
-        outputs=[('y', TensorProto.FLOAT, [1, size, size, 8])],
+        outputs=[('y', TensorProto.FLOAT, [1, out, out, 8])],
         initializers=inits,
     )
 
@@ -429,6 +431,14 @@ def test_outer_splits_rows_into_overlapping_slices(tmp_path):
     edges = {(e['source'], e['target']) for e in plan['direct_edges']}
     assert {('ifm[0]', 'b_aie.in1[0]'), ('ifm[1]', 'b_aie.in1[1]')} <= edges
     assert {('b_aie.out1[0]', 'ofm[0]'), ('b_aie.out1[1]', 'ofm[1]')} <= edges
+
+
+@pytest.mark.parametrize('pad', [1, 0], ids=['bordered', 'overlapping'])
+def test_row_slices_feed_no_window_past_their_rows(tmp_path, pad):
+    """A row slice writes its own rows once, so it cannot fill the consumer's zero border (same) nor the rows its
+    neighbour's window also reads (valid)."""
+    with pytest.raises(NotImplementedError, match='rows past its slice'):
+        lower(_padded_pair_model(pad=pad), tmp_path, ROW_SPLIT, part=AIE1_PART)
 
 
 def test_stream_conv_carries_the_logical_tensor(tmp_path):

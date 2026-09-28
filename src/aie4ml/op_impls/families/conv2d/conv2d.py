@@ -213,10 +213,13 @@ class Conv2dOpImplVariant(OpImplVariant):
                 channel_slices=1 if outer else parallelism.cas_num,
                 row_slices=row_slices,
             )
-            if outer and any(io_views[out.name].origin):
+            # Each row slice writes its own rows once: no zero border, and no rows another slice also holds.
+            view = io_views[out.name]
+            if outer and (any(view.origin) or int(view.tile[1]) * row_slices > int(view.full[1])):
                 raise NotImplementedError(
-                    f"{node.name}: an output split by rows (contract 'outer') cannot carry the zero border its "
-                    'consumer reads; partition the channels instead, or let the consumer pad its own input.'
+                    f"{node.name}: an output split by rows (contract 'outer') cannot feed a consumer whose window "
+                    'reads a zero border or rows past its slice; partition the channels instead, or let the row '
+                    'slices end at a 1x1 conv or the graph output.'
                 )
 
         shift = resolve_accumulator_output_shift(lhs.precision, out.precision, rhs.precision)
