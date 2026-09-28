@@ -61,7 +61,8 @@ depthwise_conv2d_single<ConfigT>::depthwise_conv2d_single()
   conv2d_check_contract<ConfigT>();
   static_assert(__AIE_ARCH__ != 10, "sliding_mul_ch is AIE-ML and AIE-MLv2 only");
   static_assert(ConfigT::DEPTHWISE_CORE, "depthwise kernel requires its compact weight layout");
-  static_assert(ConfigT::CAS_NUM == 1 && ConfigT::CAS_LENGTH == 1, "depthwise kernel owns the whole channel axis");
+  static_assert(ConfigT::CAS_LENGTH == 1 && (ConfigT::CAS_NUM == 1 || ConfigT::PARALLELISM_CONTRACT_OUTER),
+                "a depthwise tile owns the whole channel axis: row bands only");
   static_assert(ConfigT::CB == ConfigT::NB, "one input block per output block");
   static_assert(ConfigT::WN == ConfigT::NB * ConfigT::KH * depthwise_geometry<ConfigT>::KWP * 8,
                 "weights hold each block's taps row by row");

@@ -394,7 +394,8 @@ class Conv2dOpImplVariant(OpImplVariant):
     def uses_depthwise_core(self, node, config: Conv2dConfig) -> bool:
         """Whether one tile runs this depthwise conv (one channel per group) on the channelwise core, which AIE-ML
         and AIE-MLv2 have (sliding_mul_ch; their int8 cores are 4 and 8 rows, AIE1's is 2). Anything else runs the
-        mmul core, a depthwise conv as block-diagonal tiles."""
+        mmul core, a depthwise conv as block-diagonal tiles. Row bands keep it, each holding every channel; channel
+        chains don't, each owning some channels of a frame that holds them all."""
         lhs = input_tensor_for_role(node, 'lhs')
         widths = tuple(int(config.precision[role].width) for role in ('lhs', 'rhs', 'output'))
         return (
@@ -402,7 +403,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             and config.microtiling.microtile_m > 2
             and int(config.groups) == int(lhs.shape[-1]) == int(input_tensor_for_role(node, 'rhs').shape[-1])
             and widths == (8, 8, 8)
-            and int(config.parallelism.cas_num) == 1
+            and (int(config.parallelism.cas_num) == 1 or config.parallelism.contract == 'outer')
             and int(config.parallelism.cas_length) == 1
             and int(config.spatial.strides[1]) == 1
             and config.pool is None
@@ -713,7 +714,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         column_blocks = in_channels // CHANNEL_BLOCK // cas_length
 
         if self.uses_depthwise_core(inst.node, p):
-            packed_weights = _depthwise_rows(compact).reshape(1, 1, -1)
+            packed_weights = np.tile(_depthwise_rows(compact).reshape(1, 1, -1), (cas_num, 1, 1))  # every band
         else:
             dense = np.zeros((kh, kw, in_channels, blocks * CHANNEL_BLOCK), dtype=np_dtype_for_spec(p.precision['rhs']))
             for group in range(groups):

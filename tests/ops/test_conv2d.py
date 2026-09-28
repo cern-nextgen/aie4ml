@@ -985,35 +985,53 @@ def test_outer_split_matches_onnx(tmp_path, part):
     )
 
 
-def _depthwise_model(k: int, pad: int):
-    """conv -> k x k depthwise -> 1x1: same-padded, the depthwise windows start on an odd frame column, valid on an
-    even one; a 5x5 takes two tap groups a row on AIE-ML."""
+DW = 24  # three channel blocks
+DEPTHWISE_ROWS = {'d1': {'parallelism': {'cas_num': 2, 'contract': 'outer'}}}
+
+
+def _depthwise_model():
+    """Every path of the channelwise core in one graph, two outputs of one input: a layer in two row bands, which read
+    the graph input whose border the host delivers and write a graph output; and a chain whose depthwise layers
+    re-border the kernel frames they read -- a valid 3x3 (windows on an even frame column), a same 3x3 (odd) and a
+    same 5x5 (two tap groups a row on AIE-ML), over three channel blocks."""
     nodes: list = []
     inits: list = []
     _start(nodes, inits)
-    _conv(nodes, inits, 'x_nchw', 'a1', 'c1', CIN, C1, 3, pad=1, relu=True, seed=1)
-    _conv(nodes, inits, 'a1', 'a2', 'c2', C1, C1, k, pad=pad, groups=C1, relu=True, seed=2)
-    _conv(nodes, inits, 'a2', 'a3', 'c3', C1, C3, 1, pad=0, relu=False, seed=3)
-    nodes.append(helper.make_node('Transpose', ['a3'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
-    side = H - k + 1 + 2 * pad
+    _conv(nodes, inits, 'x_nchw', 'a1', 'd1', 8, 8, 3, pad=1, groups=8, relu=True, seed=1)
+    nodes.append(helper.make_node('Transpose', ['a1'], ['y1'], perm=[0, 2, 3, 1], name='y1_nhwc'))
+    _conv(nodes, inits, 'x_nchw', 'a2', 'c2', 8, DW, 3, pad=1, relu=True, seed=2)  # one window of the input
+    _conv(nodes, inits, 'a2', 'a3', 'd3', DW, DW, 3, pad=0, groups=DW, relu=True, seed=3)
+    _conv(nodes, inits, 'a3', 'a4', 'd4', DW, DW, 3, pad=1, groups=DW, relu=True, seed=4)
+    _conv(nodes, inits, 'a4', 'a5', 'd5', DW, DW, 5, pad=2, groups=DW, relu=True, seed=5)
+    _conv(nodes, inits, 'a5', 'a6', 'c6', DW, 8, 1, pad=0, relu=False, seed=6)
+    nodes.append(helper.make_node('Transpose', ['a6'], ['y2'], perm=[0, 2, 3, 1], name='y2_nhwc'))
     return make_model(
-        f'depthwise_k{k}_pad{pad}',
+        'depthwise',
         nodes=nodes,
-        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
-        outputs=[('y', TensorProto.FLOAT, [1, side, side, C3])],
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, 8])],
+        outputs=[('y1', TensorProto.FLOAT, [1, H, W, 8]), ('y2', TensorProto.FLOAT, [1, H - 2, W - 2, 8])],
         initializers=inits,
     )
 
 
+@pytest.mark.parametrize('part', [AIE1_PART, PART, MLV2_PART], ids=['aie1', 'aie-ml', 'aie-mlv2'])
+def test_depthwise_layers_take_the_channelwise_core_where_it_exists(tmp_path, part):
+    # AIE1's mmul core holds the 5x5 as block-diagonal tiles, three blocks of which overflow a bank
+    split = {'d5': {'parallelism': {'cas_num': 3}}} if part == AIE1_PART else {}
+    ctx = lower(_depthwise_model(), tmp_path, {**DEPTHWISE_ROWS, **split}, part=part)
+    for name in ('d1', 'd3', 'd4', 'd5'):
+        inst = ctx.ir.execution.get(f'{name}_aie')
+        assert inst.variant.uses_depthwise_core(inst.node, inst.config) == (part != AIE1_PART), name
+
+
 @pytest.mark.requires_vitis
-@pytest.mark.parametrize('k, pad', [(3, 1), (3, 0), (5, 2)], ids=['3x3-same', '3x3-valid', '5x5-same'])
 @pytest.mark.parametrize('part', [PART, MLV2_PART], ids=['aie-ml', 'aie-mlv2'])
-def test_depthwise_core_matches_onnx(tmp_path, part, k, pad):
-    feeds = np.random.default_rng(12).integers(-40, 40, size=(6, 1, H, W, CIN), dtype=np.int8)
+def test_depthwise_core_matches_onnx(tmp_path, part):
+    feeds = np.random.default_rng(12).integers(-40, 40, size=(6, 1, H, W, 8), dtype=np.int8)
     assert_x86_matches_onnx(
-        _depthwise_model(k, pad),
+        _depthwise_model(),
         {'x_q': feeds},
-        {},
+        DEPTHWISE_ROWS,
         tmp_path,
         batch=1,
         frac=FRAC,
