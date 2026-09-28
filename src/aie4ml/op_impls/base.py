@@ -96,10 +96,12 @@ class OpImplVariant:
     # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
     supported_directives: ClassVar[frozenset] = frozenset()
 
-    def matches(self, _node: OpNode, _device: Any) -> bool:
+    def matches(self, _node: OpNode, _device: Any, _directives: Dict[str, Any]) -> bool:
         raise NotImplementedError
 
-    def resolve(self, _node: OpNode, _device: Any, _directives: Optional[Dict[str, Any]] = None) -> Any:
+    def resolve(
+        self, _node: OpNode, _device: Any, _directives: Dict[str, Any], _input_contracts: Dict[str, Any]
+    ) -> Any:
         raise NotImplementedError
 
     def validate_config(self, _node: OpNode, _config: Any, _device: Any) -> None:
@@ -165,6 +167,11 @@ class OpImplVariant:
 
     def footprint(self, node: OpNode, config: Any) -> OpImplFootprint:
         raise NotImplementedError
+
+    def work(self, node: OpNode, config: Any) -> int:
+        """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which a
+        performance search compares designs. A proxy for time, not a measure of it."""
+        raise NotImplementedError(f'{node.name}: {self.variant_id} gives no work estimate to compare designs by.')
 
     def build_ports(self, _node: OpNode, _config: Any) -> PortMap:
         """Assemble the PortMap for this variant.  Must be overridden."""

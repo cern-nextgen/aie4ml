@@ -5,7 +5,12 @@ from __future__ import annotations
 from ....ir.graph import VIEW_FLATTEN_2D, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import SpatialAccess2D
-from .common import fused_pool_of, spatial_access_of
+from ...utils.math import align_up
+from .common import CHANNEL_BLOCK, fused_pool_of, spatial_access_of
+
+
+def _divisors(n: int) -> list[int]:
+    return [d for d in range(1, n + 1) if n % d == 0]
 
 
 @family_resolver('conv2d')
@@ -15,6 +20,19 @@ class Conv2dFamilyResolver(FamilyResolver):
     op_type = 'conv2d'
     supported_fusions = frozenset({'bias', 'relu', 'max_pool'})
     supported_output_views = frozenset({VIEW_FLATTEN_2D})
+
+    def parallelism_candidates(self, node, _device):
+        """The partitions the core cuts: divisors of the input and output channel blocks, and of the output rows."""
+        _, h, w, cin = (int(d) for d in input_tensor_for_role(node, 'lhs').shape)
+        in_blocks = align_up(cin, CHANNEL_BLOCK) // CHANNEL_BLOCK
+        out_blocks = align_up(int(input_tensor_for_role(node, 'rhs').shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
+        out_rows = spatial_access_of(node).output_extent(h, w)[0]
+        return tuple(
+            {'contract': contract, 'cas_num': cas_num, 'cas_length': cas_length}
+            for contract, extent in (('inner', out_blocks), ('outer', out_rows))
+            for cas_num in _divisors(extent)
+            for cas_length in _divisors(in_blocks)
+        )
 
     def spatial_access(self, node) -> SpatialAccess2D:
         return spatial_access_of(node)

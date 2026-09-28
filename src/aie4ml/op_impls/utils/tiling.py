@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Callable
 
+from ...errors import ConfigRefused
 from ...ir.graph import TENSOR_LAYOUTS
 from ..common_types import PORT_KIND_BUFFER, PORT_KINDS
 from .tensor_view import microtile_from_staging
@@ -26,14 +27,9 @@ class ParallelismConfig:
     contract: str = 'inner'
 
 
-def parse_directives(directives) -> tuple[dict, dict, dict]:
-    """Return (io_route, input_contracts, parallel_cfg) from a directives dict."""
-    d = directives or {}
-    return (
-        dict(d.get('io_route', {})),
-        d.get('input_contracts', {}),
-        dict(d.get('parallelism', {}) or {}),
-    )
+def parse_directives(directives) -> tuple[dict, dict]:
+    """Return (io_route, parallel_cfg) from a directives dict."""
+    return dict(directives.get('io_route', {})), dict(directives.get('parallelism') or {})
 
 
 def extract_inner_outer(shape: tuple[int, ...]) -> tuple[int, int, int]:
@@ -130,7 +126,7 @@ def find_tile_split(
         requested = len(ic.port_staging) if (ic is not None and ic.contract == contract) else None
 
     if require_match and requested is None:
-        raise ValueError(
+        raise ConfigRefused(
             f'{contract!r} contract requires a matching producer port count; '
             'ensure the producer op is resolved before this one.'
         )
@@ -151,7 +147,7 @@ def find_tile_split(
         if tile_bytes_fn(tile_size) <= bank_bytes:
             return int(cas_num), int(tile_size)
 
-    raise ValueError(
+    raise ConfigRefused(
         f'No legal {contract} parallelism: partition_size={partition_size} cannot be split '
         f'into cas_num<={max_rows} where tile fits {bank_bytes}B bank.'
     )

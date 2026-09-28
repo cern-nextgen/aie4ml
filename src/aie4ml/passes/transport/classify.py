@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from ...errors import ConfigRefused
 from ...ir import get_backend_context
 from ...ir.graph import ROUTE_MODES
 from ..base import AIEPass
 from .legality import direct_transport_failure, memtile_staging_failure, uses_stream
-from .model import TransportDecision
+from .model import Connection, TransportDecision
 
 
 class ClassifyTransportEntries(AIEPass):
@@ -18,79 +19,12 @@ class ClassifyTransportEntries(AIEPass):
         entries = ctx.ir.physical.plan['_memory_plan_state']['entries']
         changed = False
         for entry in entries:
-            decision = self._classify_entry(entry, ctx)
+            self._validate_entry(entry)
+            leg = entry.consumers[0] if entry.consumers else Connection(entry.logical_tensor, entry.producer, None)
+            decision = classify_connection(leg, ctx.ir.execution, ctx.device.has_memtile)
             changed = changed or entry.decision != decision
             entry.decision = decision
         return changed
-
-    def _classify_entry(self, entry, ctx) -> TransportDecision:
-        self._validate_entry(entry)
-        route = self._route_policy(entry, ctx)
-        is_boundary = entry.producer.node is None or entry.graph_output
-        has_memtile = bool(ctx.device.has_memtile)
-
-        restage_failure = memtile_staging_failure(ctx, entry)
-        if route == 'memtile' and restage_failure is not None:
-            raise NotImplementedError(
-                f'{entry.logical_tensor}: io_route=memtile needs re-staging, but {restage_failure}.'
-            )
-        can_memtile = has_memtile and restage_failure is None
-
-        if uses_stream(ctx, entry):
-            # A stream port has no buffer for a memory tile to stage, so the leg is
-            # point-to-point (or PLIO) and must already agree on its element order.
-            if route == 'memtile':
-                raise RuntimeError(f'{entry.logical_tensor}: io_route=memtile requested on a stream port.')
-            if not is_boundary:
-                consumer = entry.single_consumer()
-                if self._has_consumer_perm(ctx, consumer):
-                    failure = f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
-                else:
-                    failure = direct_transport_failure(ctx, entry.logical_tensor, entry.producer, consumer)
-                if failure is not None:
-                    raise RuntimeError(
-                        f'{entry.logical_tensor}: point-to-point ports cannot connect directly: {failure}.'
-                    )
-            return TransportDecision('direct', True)
-
-        if is_boundary:
-            if route == 'memtile' and not has_memtile:
-                raise RuntimeError(
-                    f'{entry.logical_tensor}: io_route=memtile requested on a device without memory tiles.'
-                )
-            realization = 'direct' if route == 'direct' or (route == 'auto' and not can_memtile) else 'memtile'
-            return TransportDecision(realization, True if realization == 'direct' else None)
-
-        consumer = entry.single_consumer()
-        if self._has_consumer_perm(ctx, consumer):
-            direct_failure = f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
-        else:
-            direct_failure = direct_transport_failure(ctx, entry.logical_tensor, entry.producer, consumer)
-        staging_compatible = direct_failure is None
-        if route == 'direct':
-            if not staging_compatible:
-                raise RuntimeError(
-                    f'{entry.logical_tensor}: io_route=direct requested but point-to-point transport '
-                    f'is not staging-compatible: {direct_failure}.'
-                )
-            realization = 'direct'
-        elif route == 'memtile':
-            if not has_memtile:
-                raise RuntimeError(
-                    f'{entry.logical_tensor}: io_route=memtile requested on a device without memory tiles.'
-                )
-            realization = 'memtile'
-        else:
-            if staging_compatible:
-                realization = 'direct'
-            elif not can_memtile:
-                raise RuntimeError(
-                    f'{entry.logical_tensor}: AIE1 cannot directly connect this transport: {direct_failure}; '
-                    'relay/relayout is not implemented.'
-                )
-            else:
-                realization = 'memtile'
-        return TransportDecision(realization, staging_compatible)
 
     @staticmethod
     def _validate_entry(entry) -> None:
@@ -105,31 +39,87 @@ class ClassifyTransportEntries(AIEPass):
         if entry.producer.node is not None and not entry.graph_output and not entry.consumers:
             raise RuntimeError(f'{entry.logical_tensor}: internal transport entry has no consumer.')
 
-    @staticmethod
-    def _route_policy(entry, ctx) -> str:
-        modes = set()
-        if entry.producer.node is not None:
-            producer_inst = ctx.ir.execution.get(entry.producer.node.name)
-            producer_mode = producer_inst.io_route.get('outputs', {}).get(entry.producer.tensor)
-            if producer_mode:
-                modes.add(str(producer_mode))
 
-        if entry.consumers:
-            consumer = entry.single_consumer()
-            consumer_inst = ctx.ir.execution.get(consumer.node.name)
-            consumer_mode = consumer_inst.io_route.get('inputs', {}).get(consumer.tensor)
-            if consumer_mode:
-                modes.add(str(consumer_mode))
+def classify_connection(leg: Connection, execution, has_memtile) -> TransportDecision:
+    """How one transport leg is realised; `leg.consumer` is None for a graph output. Reads only the resolved
+    instances and contracts in `execution`, so the parallelism search decides every leg by this rule too."""
+    tensor, producer, consumer = leg.logical_tensor, leg.producer, leg.consumer
+    route = _route_policy(leg, execution)
+    is_boundary = producer.node is None or consumer is None
+    has_memtile = bool(has_memtile)
 
-        bad = [mode for mode in modes if mode not in ROUTE_MODES]
-        if bad:
-            raise ValueError(f'{entry.logical_tensor}: unsupported io_route mode(s) {bad}.')
-        if 'memtile' in modes:
-            return 'memtile'
-        if modes == {'direct'}:
-            return 'direct'
-        return 'auto'
+    restage_failure = memtile_staging_failure(execution, leg.endpoints())
+    if route == 'memtile' and restage_failure is not None:
+        raise ConfigRefused(f'{tensor}: io_route=memtile needs re-staging, but {restage_failure}.')
+    can_memtile = has_memtile and restage_failure is None
 
-    @staticmethod
-    def _has_consumer_perm(ctx, consumer) -> bool:
-        return ctx.ir.execution.get(consumer.node.name).port_views[consumer.tensor].perm is not None
+    if uses_stream(execution, leg.endpoints()):
+        # A stream port has no buffer for a memory tile to stage, so the leg is
+        # point-to-point (or PLIO) and must already agree on its element order.
+        if route == 'memtile':
+            raise ConfigRefused(f'{tensor}: io_route=memtile requested on a stream port.')
+        if not is_boundary:
+            failure = _direct_failure(leg, execution)
+            if failure is not None:
+                raise ConfigRefused(f'{tensor}: point-to-point ports cannot connect directly: {failure}.')
+        return TransportDecision('direct', True)
+
+    if is_boundary:
+        if route == 'memtile' and not has_memtile:
+            raise ConfigRefused(f'{tensor}: io_route=memtile requested on a device without memory tiles.')
+        realization = 'direct' if route == 'direct' or (route == 'auto' and not can_memtile) else 'memtile'
+        return TransportDecision(realization, True if realization == 'direct' else None)
+
+    direct_failure = _direct_failure(leg, execution)
+    staging_compatible = direct_failure is None
+    if route == 'direct':
+        if not staging_compatible:
+            raise ConfigRefused(
+                f'{tensor}: io_route=direct requested but point-to-point transport '
+                f'is not staging-compatible: {direct_failure}.'
+            )
+        realization = 'direct'
+    elif route == 'memtile':
+        if not has_memtile:
+            raise ConfigRefused(f'{tensor}: io_route=memtile requested on a device without memory tiles.')
+        realization = 'memtile'
+    else:
+        if staging_compatible:
+            realization = 'direct'
+        elif not can_memtile:
+            raise ConfigRefused(
+                f'{tensor}: AIE1 cannot directly connect this transport: {direct_failure}; '
+                'relay/relayout is not implemented.'
+            )
+        else:
+            realization = 'memtile'
+    return TransportDecision(realization, staging_compatible)
+
+
+def _direct_failure(leg: Connection, execution) -> str | None:
+    consumer = leg.consumer
+    if execution.get(consumer.node.name).port_views[consumer.tensor].perm is not None:
+        return f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
+    return direct_transport_failure(execution, leg.logical_tensor, leg.producer, consumer)
+
+
+def _route_policy(leg: Connection, execution) -> str:
+    modes = set()
+    if leg.producer.node is not None:
+        producer_mode = execution.get(leg.producer.node.name).io_route.get('outputs', {}).get(leg.producer.tensor)
+        if producer_mode:
+            modes.add(str(producer_mode))
+
+    if leg.consumer is not None:
+        consumer_mode = execution.get(leg.consumer.node.name).io_route.get('inputs', {}).get(leg.consumer.tensor)
+        if consumer_mode:
+            modes.add(str(consumer_mode))
+
+    bad = [mode for mode in modes if mode not in ROUTE_MODES]
+    if bad:
+        raise ValueError(f'{leg.logical_tensor}: unsupported io_route mode(s) {bad}.')
+    if 'memtile' in modes:
+        return 'memtile'
+    if modes == {'direct'}:
+        return 'direct'
+    return 'auto'

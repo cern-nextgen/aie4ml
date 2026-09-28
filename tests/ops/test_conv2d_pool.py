@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from aie4ml.errors import ConfigRefused
 from aie4ml.op_impls import get_family_resolver_registry
 from helpers import TensorProto, assert_x86_matches_onnx, helper, lower, make_model, qdq, qparams
 from ops.test_conv2d import CIN, CLASSES, FRAC, _conv, _head, _start
@@ -136,7 +137,7 @@ def test_row_slices_write_their_pooled_rows(tmp_path):
 
 
 def test_row_slices_that_split_a_pool_window_are_refused(tmp_path):
-    with pytest.raises(NotImplementedError, match='whole pool windows'):
+    with pytest.raises(ConfigRefused, match='whole pool windows'):
         lower(
             _row_split_model(),
             tmp_path,
@@ -182,7 +183,7 @@ def test_a_malformed_fused_pool_trait_is_refused(tmp_path):
     conv = _pooled(ctx).node
     conv.traits['fused_pool'].data['ceil_mode'] = 1
     with pytest.raises(ValueError, match='holds its kind and window'):
-        get_family_resolver_registry().get('conv2d').resolve(conv, ctx.device)
+        get_family_resolver_registry().get('conv2d').resolve(conv, ctx.device, dict(conv.directives), {})
 
 
 @pytest.mark.parametrize(

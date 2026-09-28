@@ -9,33 +9,32 @@ from .descriptors import localize_descriptor
 from .model import Endpoint
 
 
-def endpoint_port_kind(ctx, endpoint: Endpoint) -> str:
+def endpoint_port_kind(execution, endpoint: Endpoint) -> str:
     """The ADF port kind behind a kernel endpoint; a graph boundary (PLIO) takes either kind."""
     if endpoint.node is None:
         return PORT_KIND_BUFFER
-    inst = ctx.ir.execution.get(endpoint.node.name)
+    inst = execution.get(endpoint.node.name)
     if inst is None:
         raise RuntimeError(f'{endpoint.tensor}: endpoint {endpoint.node.name!r} has no resolved execution instance.')
     bindings = inst.ports.outputs if endpoint.tensor in inst.ports.outputs else inst.ports.inputs
     return bindings[endpoint.tensor].kind
 
 
-def uses_stream(ctx, entry) -> bool:
-    """Whether any kernel endpoint of a transport entry is a stream port."""
-    endpoints = [entry.producer] + [conn.consumer for conn in entry.consumers if conn.consumer is not None]
-    return any(endpoint_port_kind(ctx, endpoint) == PORT_KIND_STREAM for endpoint in endpoints)
+def uses_stream(execution, endpoints) -> bool:
+    """Whether any kernel endpoint of a transport leg is a stream port."""
+    return any(endpoint_port_kind(execution, endpoint) == PORT_KIND_STREAM for endpoint in endpoints)
 
 
-def memtile_staging_failure(ctx, entry) -> str | None:
+def memtile_staging_failure(execution, endpoints) -> str | None:
     """Why a memory tile cannot re-stage this entry, or None when it can.
 
     Storage encoding and routing are separate concerns: this answers only whether the memtile
     pass knows how to shard the layout the endpoints use.
     """
-    for endpoint in [entry.producer] + [conn.consumer for conn in entry.consumers if conn.consumer is not None]:
+    for endpoint in endpoints:
         if endpoint.node is None:
             continue
-        inst = ctx.ir.execution.get(endpoint.node.name)
+        inst = execution.get(endpoint.node.name)
         if endpoint.tensor in inst.ports.outputs:
             desc = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, 0, None)
         else:
@@ -54,15 +53,15 @@ def memtile_staging_failure(ctx, entry) -> str | None:
 
 
 def direct_transport_failure(
-    ctx,
+    execution,
     logical_tensor: str,
     producer: Endpoint,
     consumer: Endpoint,
 ) -> str | None:
     if producer.node is None or consumer.node is None:
         return 'direct transport requires resolved kernel endpoints'
-    producer_inst = ctx.ir.execution.get(producer.node.name)
-    consumer_inst = ctx.ir.execution.get(consumer.node.name)
+    producer_inst = execution.get(producer.node.name)
+    consumer_inst = execution.get(consumer.node.name)
     if producer_inst is None or consumer_inst is None:
         raise RuntimeError(f'{logical_tensor}: direct transport legality requires resolved execution instances.')
 
@@ -80,7 +79,7 @@ def direct_transport_failure(
     if len(producer_ports) != len(consumer_ports):
         return f'producer ports {producer_ports} do not match consumer ports {consumer_ports}'
 
-    tc = ctx.ir.execution.tensor_contracts.get(producer.tensor)
+    tc = execution.tensor_contracts.get(producer.tensor)
     if tc is not None:
         if any(int(port) < 0 or int(port) >= len(tc.port_staging) for port in producer_ports):
             return f'producer ports {producer_ports} exceed the published staging contract'

@@ -55,11 +55,11 @@ class AddOpImplVariant(OpImplVariant):
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism'})
 
-    def matches(self, _node: OpNode, device) -> bool:
+    def matches(self, _node: OpNode, device, _directives) -> bool:
         return device.generation in ('AIE', 'AIE-ML', 'AIE-MLV2')
 
-    def resolve(self, node: OpNode, device, directives=None) -> AddConfig:
-        io_route, input_contracts, parallel_cfg = parse_directives(directives)
+    def resolve(self, node: OpNode, device, directives, input_contracts) -> AddConfig:
+        io_route, parallel_cfg = parse_directives(directives)
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')

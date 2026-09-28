@@ -438,35 +438,10 @@ class ExecutionIR:
     graph_inputs: Tuple[str, ...] = ()
     graph_outputs: Tuple[str, ...] = ()
 
-    def register(
-        self,
-        node: OpNode,
-        variant: 'OpImplVariant',
-        ports: Any,
-        io_route: Dict[str, Any],
-        port_views: Dict[str, Any],
-        config: Any,
-        graph_header: str,
-        graph_name: str,
-        param_template: str,
-        inputs: Tuple[ExecutionInput, ...],
-        outputs: Tuple[str, ...],
-    ) -> ExecutionInstance:
-        inst = ExecutionInstance(
-            node=node,
-            variant=variant,
-            ports=ports,
-            io_route=io_route,
-            port_views=port_views,
-            config=config,
-            graph_header=graph_header,
-            graph_name=graph_name,
-            param_template=param_template,
-            inputs=tuple(inputs),
-            outputs=tuple(outputs),
-        )
-        self.instances[node.name] = inst
-        return inst
+    def add(self, inst: ExecutionInstance) -> None:
+        if inst.name in self.instances:
+            raise ValueError(f'{inst.name}: an execution instance of that name already exists.')
+        self.instances[inst.name] = inst
 
     def insert_before(self, name: str, inst: ExecutionInstance) -> None:
         if inst.name in self.instances:
@@ -587,8 +562,10 @@ class AIEPipelineIR:
     logical: LogicalIR = field(default_factory=LogicalIR)
     execution: ExecutionIR = field(default_factory=ExecutionIR)
     physical: PhysicalIR = field(default_factory=PhysicalIR)
+    optimizer: Dict[str, Any] = field(default_factory=dict)  # the design search's choice, when it ran
 
     def reset(self) -> None:
         self.logical = LogicalIR()
         self.execution = ExecutionIR()
         self.physical = PhysicalIR()
+        self.optimizer = {}

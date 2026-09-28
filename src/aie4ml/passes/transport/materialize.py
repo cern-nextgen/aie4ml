@@ -89,7 +89,7 @@ class _MemoryPlanMaterializer:
         self.layer_indices = {inst.name: idx for idx, inst in enumerate(self.ctx.ir.execution, start=1)}
         return {
             'layer_indices': dict(self.layer_indices),
-            'entries': TransportCollector(self.ctx).collect(),
+            'entries': TransportCollector(self.ctx.ir.execution).collect(),
         }
 
     def materialize(self, state):

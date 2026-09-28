@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from aie4ml.errors import ConfigRefused
 from helpers import (
     PART,
     TensorProto,
@@ -366,10 +367,10 @@ def test_conv_partitions_channel_blocks_across_tiles(conv_model, tmp_path):
 
 
 def test_conv_rejects_partitions_it_cannot_cut(conv_model, tmp_path):
-    with pytest.raises(ValueError, match='cas_num=5 does not split'):
+    with pytest.raises(ConfigRefused, match='cas_num=5 does not split'):
         lower(conv_model, tmp_path, {'c1': {'parallelism': {'cas_num': 5}}}, part=AIE1_PART)
     # c1 feeds a 3x3 conv, so its output frame carries a border no row slice can own.
-    with pytest.raises(NotImplementedError, match='output split by rows'):
+    with pytest.raises(ConfigRefused, match='output split by rows'):
         lower(conv_model, tmp_path, {'c1': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}, part=AIE1_PART)
 
 
@@ -437,7 +438,7 @@ def test_outer_splits_rows_into_overlapping_slices(tmp_path):
 def test_row_slices_feed_no_window_past_their_rows(tmp_path, pad):
     """A row slice writes its own rows once, so it cannot fill the consumer's zero border (same) nor the rows its
     neighbour's window also reads (valid)."""
-    with pytest.raises(NotImplementedError, match='rows past its slice'):
+    with pytest.raises(ConfigRefused, match='rows past its slice'):
         lower(_padded_pair_model(pad=pad), tmp_path, ROW_SPLIT, part=AIE1_PART)
 
 
@@ -859,11 +860,15 @@ def test_convs_of_different_blockings_share_one_frame(tmp_path):
     assert [ctx.ir.execution.get(n).config.spatial_blocks for n in ('first_aie', 'second_aie')] == [4, 2]
 
 
-def test_frame_larger_than_a_bank_is_refused(tmp_path):
+def test_frame_larger_than_a_bank_is_split(tmp_path):
     """Each activation copy sits in one bank, as for Dense: AIE-MLv2's 16x16x16 frame is 19.6 KB, over its
-    16 KB bank, so the layer must be split rather than placed some other way."""
-    with pytest.raises(ValueError, match='memory bank holds'):
-        lower(_strided_chain_model(), tmp_path, part='vek385_base')
+    16 KB bank, so the layer is split -- and refused when the user holds it to one tile."""
+    ctx = lower(_strided_chain_model(), tmp_path, part='vek385_base')
+    split = ctx.ir.execution.get('first_aie').config.parallelism
+    assert split.cas_num * split.cas_length > 1
+    one = {'first': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}
+    with pytest.raises(ConfigRefused, match='memory bank holds'):
+        lower(_strided_chain_model(), tmp_path / 'one', one, part='vek385_base')
 
 
 def _compiled_buffers(project, port: str):
@@ -1119,7 +1124,7 @@ def test_int16_frames_take_the_int16_core(tmp_path, part):
 
 
 def test_int16_conv_is_refused_where_no_core_takes_it(tmp_path):
-    with pytest.raises(ValueError, match='no conv2d variant matches'):
+    with pytest.raises(ConfigRefused, match='no conv2d variant matches'):
         lower(_int16_model(), tmp_path, INT16_DIRECTIVES, part=AIE1_PART)
 
 

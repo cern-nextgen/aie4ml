@@ -1,6 +1,7 @@
 """Core AIE compiler pipeline definition."""
 
 from .passes import (
+    ChooseParallelism,
     ClassifyTransportEntries,
     CollectMemoryEntries,
     CompactBufferRank,
@@ -30,6 +31,7 @@ HLS4ML_FLOW_SPEC = (
     ('fuse_pool', FusePool),
     ('fuse_pooled', FuseActivationCasts),  # a ReLU after a fused pool: max and ReLU commute
     ('fold_views', FoldViewOps),
+    ('choose_parallelism', ChooseParallelism),  # AIEConfig Optimize
     ('resolve', Resolve),
     ('legalize_layouts', LegalizeLayouts),
     ('pack', PackKernelArtifacts),

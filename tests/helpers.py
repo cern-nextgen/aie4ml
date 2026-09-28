@@ -74,10 +74,11 @@ def lower(
     part: str = PART,
     batch: int = 1,
     project: str = 'proj',
+    aie_config: Optional[Dict[str, Any]] = None,
 ):
     config = {
         'Part': part,
-        'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+        'AIEConfig': {'BatchSize': batch, 'Iterations': 1, **(aie_config or {})},
         'LayerDirectives': dict(directives or {}),
     }
     aie_model = from_onnx(model, config, output_dir=Path(tmp_path) / project, project_name=project)
@@ -140,6 +141,7 @@ def assert_aie_matches_onnx(
     part=PART,
     iterations=2,
     per_iteration=False,
+    aie_config=None,
 ):
     """The same check through aiesim rather than x86sim, for what x86 cannot see."""
     return _assert_matches_onnx(
@@ -155,6 +157,7 @@ def assert_aie_matches_onnx(
         iterations=iterations,
         simulator='aie',
         per_iteration=per_iteration,
+        aie_config=aie_config,
     )
 
 
@@ -171,6 +174,7 @@ def assert_x86_matches_onnx(
     part=PART,
     iterations=1,
     per_iteration=False,
+    aie_config=None,
 ):
     """Compile a model for x86, simulate it, and check every output against onnxruntime.
 
@@ -197,6 +201,7 @@ def assert_x86_matches_onnx(
         iterations=iterations,
         simulator='x86',
         per_iteration=per_iteration,
+        aie_config=aie_config,
     )
 
 
@@ -214,6 +219,7 @@ def _assert_matches_onnx(
     iterations,
     simulator,
     per_iteration,
+    aie_config=None,
 ):
     import onnxruntime as ort
 
@@ -221,7 +227,7 @@ def _assert_matches_onnx(
         model,
         {
             'Part': part,
-            'AIEConfig': {'BatchSize': batch, 'Iterations': iterations},
+            'AIEConfig': {'BatchSize': batch, 'Iterations': iterations, **(aie_config or {})},
             'LayerDirectives': dict(directives),
         },
         output_dir=Path(tmp_path) / project,

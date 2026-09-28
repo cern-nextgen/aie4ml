@@ -8,7 +8,7 @@ from ..op_impls.common_types import PORT_KINDS
 _DIRECTIVE_FIELDS = {
     'placement': ('col', 'row'),
     'microtiling': ('microtile_m', 'microtile_k', 'microtile_n'),
-    'parallelism': ('cas_num', 'cas_length', 'parallel_factor', 'contract'),
+    'parallelism': ('cas_num', 'cas_length', 'contract'),
     'io_route': ('inputs', 'outputs'),
     'hccs': ('B', 'S', 'Dmax', 'param_sets', 'inv_shift', 'use_clb'),
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Tuple
 
+from ...errors import ConfigRefused
 from ...ir import ExecutionView, OpNode
 from ...op_impls.utils.tensor_view import map_view_axis
 from .model import Connection, EdgeEntry, Endpoint
@@ -13,56 +14,59 @@ class TransportCollector:
     It reads the execution IR only: entries, the values they read and write, and the graph boundary.
     """
 
-    def __init__(self, ctx):
-        self.ctx = ctx
-        self.execution = ctx.ir.execution
+    def __init__(self, execution):
+        self.execution = execution
+        self.producers: Dict[str, Tuple[OpNode, str]] = {
+            tname: (inst.node, inst.ports.outputs[tname].group) for inst in execution for tname in inst.outputs
+        }
 
     def collect(self) -> List[EdgeEntry]:
         return self._group_edges(self._collect_connections())
 
-    def _collect_connections(self) -> List[Connection]:
-        producers: Dict[str, Tuple[OpNode, str]] = {}
-        for inst in self.execution:
-            for tname in inst.outputs:
-                producers[tname] = (inst.node, inst.ports.outputs[tname].group)
-
+    def input_connections(self, inst) -> List[Connection]:
+        """The legs into one instance: from a kernel, through a folded view, or from the graph boundary."""
         connections: List[Connection] = []
-        seen_outputs: set[str] = set()
-        graph_output_names = set(self.execution.graph_outputs)
-        for name in graph_output_names:
+        for item in inst.inputs:
+            tname = item.tensor
+            cg = inst.ports.inputs[tname].group
+            view = self.execution.values[tname].view
+            if view is not None:
+                if view.kind == 'concat':
+                    connections.extend(self._concat_connections(inst.node, tname, cg, view))
+                else:
+                    connections.append(self._slice_connection(inst.node, tname, cg, view))
+            elif tname in self.producers:
+                p, pg = self.producers[tname]
+                connections.append(Connection(tname, Endpoint(p, tname, pg), Endpoint(inst.node, tname, cg)))
+            else:
+                connections.append(
+                    Connection(tname, Endpoint(None, tname, 'graph_input'), Endpoint(inst.node, tname, cg))
+                )
+        return connections
+
+    def output_connections(self, inst, read) -> List[Connection]:
+        """The graph-boundary legs out of one instance: its graph outputs, and any output nothing in `read` reads."""
+        return [
+            Connection(tname, Endpoint(inst.node, tname, inst.ports.outputs[tname].group), None)
+            for tname in inst.outputs
+            if tname in self.execution.graph_outputs or tname not in read
+        ]
+
+    def _collect_connections(self) -> List[Connection]:
+        for name in self.execution.graph_outputs:
             view = self.execution.values[name].view
             if view is not None:
                 raise NotImplementedError(f'{name}: {view.kind}-backed graph outputs are not implemented.')
 
+        connections: List[Connection] = []
+        read: set[str] = set()
         for inst in self.execution:
-            n = inst.node
+            connections.extend(self.input_connections(inst))
             for item in inst.inputs:
-                tname = item.tensor
-                cg = inst.ports.inputs[tname].group
-                view = self.execution.values[tname].view
-                if view is not None:
-                    if view.kind == 'concat':
-                        connections.extend(self._concat_connections(n, tname, cg, view, producers))
-                    else:
-                        connections.append(self._slice_connection(n, tname, cg, view, producers))
-                    seen_outputs.add(tname)
-                    seen_outputs.update(view.sources)
-                    continue
-                if tname in producers:
-                    p, pg = producers[tname]
-                    connections.append(Connection(tname, Endpoint(p, tname, pg), Endpoint(n, tname, cg)))
-                    seen_outputs.add(tname)
-                else:
-                    connections.append(Connection(tname, Endpoint(None, tname, 'graph_input'), Endpoint(n, tname, cg)))
-
-        # graph outputs
+                view = self.execution.values[item.tensor].view
+                read.update(view.sources if view is not None else (item.tensor,))
         for inst in self.execution:
-            for tname in inst.outputs:
-                if tname not in graph_output_names and tname in seen_outputs:
-                    continue
-                pg = inst.ports.outputs[tname].group
-                connections.append(Connection(tname, Endpoint(inst.node, tname, pg), None))
-
+            connections.extend(self.output_connections(inst, read))
         return connections
 
     def _slice_connection(
@@ -71,14 +75,12 @@ class TransportCollector:
         slice_tensor: str,
         consumer_group: str,
         view: ExecutionView,
-        producers: Dict[str, Tuple[OpNode, str]],
     ) -> Connection:
         part = view.parts[0]
         source_name = part.source
         producer, producer_group = self._kernel_source(
             slice_tensor,
             source_name,
-            producers,
             view_kind='slice',
         )
         ports, offset_base, buffer_dimension = self._slice_producer_ports(
@@ -118,7 +120,7 @@ class TransportCollector:
             port_start, port_end = self._descriptor_axis_range(desc, axis_dim)
             overlaps = port_start < end and port_end > start
             if overlaps and not (port_start >= start and port_end <= end):
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f'{source_tensor}: slice range [{start}, {end}) crosses producer port {port} '
                     f'range [{port_start}, {port_end}); packed slice/relay is not implemented.'
                 )
@@ -128,7 +130,7 @@ class TransportCollector:
         ordered_ranges = sorted(ranges)
         contiguous = all(left[1] == right[0] for left, right in zip(ordered_ranges, ordered_ranges[1:]))
         if not selected or ordered_ranges[0][0] != start or ordered_ranges[-1][1] != end or not contiguous:
-            raise NotImplementedError(
+            raise ConfigRefused(
                 f'{source_tensor}: slice range [{start}, {end}) does not align exactly with producer ports.'
             )
 
@@ -143,7 +145,6 @@ class TransportCollector:
         concat_tensor: str,
         consumer_group: str,
         concat_view: ExecutionView,
-        producers: Dict[str, Tuple[OpNode, str]],
     ) -> List[Connection]:
         ports_by_source = self._concat_consumer_ports(consumer, concat_tensor, concat_view)
         conns: List[Connection] = []
@@ -156,7 +157,6 @@ class TransportCollector:
             producer, producer_group = self._kernel_source(
                 concat_tensor,
                 source_name,
-                producers,
                 view_kind='concat',
             )
             conns.append(
@@ -200,7 +200,7 @@ class TransportCollector:
 
             owners = [name for name, lo, hi in slices if start >= lo and end <= hi]
             if len(owners) != 1:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f'{concat_tensor}: concat consumer port {port} axis {axis} range [{start}, {end}) does not '
                     'fit exactly inside one concat input slice; packed concat/relay is not implemented.'
                 )
@@ -265,12 +265,11 @@ class TransportCollector:
         self,
         logical_tensor: str,
         source_name: str,
-        producers: Dict[str, Tuple[OpNode, str]],
         *,
         view_kind: str,
     ) -> Tuple[OpNode, str]:
-        if source_name in producers:
-            return producers[source_name]
+        if source_name in self.producers:
+            return self.producers[source_name]
 
         value = self.execution.values.get(source_name)
         if value is None:
@@ -295,7 +294,7 @@ class TransportCollector:
         )
 
     def _kernel_inst(self, node):
-        return self.ctx.ir.execution.get(node.name) if node else None
+        return self.execution.get(node.name) if node else None
 
     def _producer_port_count(self, endpoint: Endpoint):
         if endpoint.node is None:

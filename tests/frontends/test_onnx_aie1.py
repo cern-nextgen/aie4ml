@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from aie4ml.device_catalog import resolve_device
+from aie4ml.errors import ConfigRefused
 from aie4ml.frontends.onnx import from_onnx, lower_onnx_model
 from aie4ml.ir import TraitInstance
 from aie4ml.op_impls.common_types import PortBinding, kernel_endpoints, to_plain
@@ -411,7 +412,7 @@ def test_aie1_onnx_dense_rejects_emulated_int8_microtile(tmp_path):
 
 
 def test_aie1_onnx_dense_rejects_unenabled_int16_int16(tmp_path):
-    with pytest.raises(ValueError, match=r'no dense variant matches.*generation=.AIE.'):
+    with pytest.raises(ConfigRefused, match=r'no dense variant matches.*generation=.AIE.'):
         _resolve_dense(_dense_model(TensorProto.INT16, TensorProto.INT16), tmp_path)
 
 
@@ -692,7 +693,9 @@ def test_aie1_dense_cascade_ports_follow_logical_snake_order(tmp_path):
 
 
 def test_aie1_dense_stack_inherits_direct_producer_partition(tmp_path):
-    aie_model = _run_pipeline(_dense_stack_model(), tmp_path, project='aie1_dense_stack')
+    """dense0 held to four output chains hands dense1 four slices, which dense1 takes as a four-stage cascade."""
+    directives = {'dense0': {'parallelism': {'cas_num': 4, 'cas_length': 1}}}
+    aie_model = _run_pipeline(_dense_stack_model(), tmp_path, directives=directives, project='aie1_dense_stack')
     first = aie_model.context.ir.execution.get('dense0_aie').config
     second = aie_model.context.ir.execution.get('dense1_aie').config
 
@@ -722,7 +725,7 @@ def test_aie1_direct_buffer_fanout_keeps_each_compatible_leg(tmp_path):
 
 
 def test_aie1_staging_mismatch_requires_an_explicit_relayout(tmp_path):
-    with pytest.raises(ValueError, match=r'no supported microtiling accepts producer output microtile'):
+    with pytest.raises(ConfigRefused, match=r'no supported microtiling accepts producer output microtile'):
         _run_pipeline(
             _fanout_dense_model(),
             tmp_path,

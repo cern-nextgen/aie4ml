@@ -7,11 +7,13 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from ....aie_types import AIEDataType, legality_format
+from ....errors import ConfigRefused
 from ....ir import input_role, input_tensor_for_role
+from ....ir.graph import STAGING_CONTRACTS
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
 from ...utils.io import view_shape
-from ...utils.precision import element_bytes
+from ...utils.precision import element_bytes, resolve_operand_precision
 from .common import MICROTILE_OPTIONS, select_generation_key
 from .config import MatmulMicrotileConfig
 
@@ -98,7 +100,7 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype, required_lhs_microtile
             int(required_lhs_microtile.outer),
             int(required_lhs_microtile.inner),
         ):
-            raise ValueError(
+            raise ConfigRefused(
                 f'{node.name}: microtiling {candidate} does not match the producer output microtile '
                 f'({required_lhs_microtile.outer}, {required_lhs_microtile.inner}).'
             )
@@ -108,7 +110,7 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype, required_lhs_microtile
         required = (int(required_lhs_microtile.outer), int(required_lhs_microtile.inner))
         options = [option for option in options if option[:2] == required]
         if not options:
-            raise ValueError(
+            raise ConfigRefused(
                 f'{node.name}: no supported microtiling accepts producer output microtile {required} for '
                 f'Generation={device.generation}.'
             )
@@ -175,22 +177,64 @@ def _parallelism_candidate(
     )
 
 
+def _partition_ranges(node, device, microtiling: MatmulMicrotileConfig, contract: str) -> tuple[range, range]:
+    """The cas_num and cas_length the tiling search tries: no more than the device's rows and columns, and no more
+    chains or cascade stages than the partitioned extent holds aligned tiles or a memory tile has ports."""
+    lhs_shape = view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')
+    in_shape = int(lhs_shape[-1])
+    out_shape = int(view_shape(node, node.outputs[0], 'outputs')[-1])
+    outer_granularity = 2 * microtiling.microtile_m
+    last_outer = int(lhs_shape[-2]) if len(lhs_shape) > 1 else 1
+    full_outer = int(math.prod(lhs_shape[:-1])) // max(1, last_outer) * align_up(last_outer, outer_granularity)
+    # cas_num partitions N under 'inner' but the outer (M) rows under 'outer', so the
+    # upper bound comes from whichever axis it slices.
+    partitioned_extent, partition_align = (
+        (full_outer, outer_granularity) if contract == 'outer' else (out_shape, 2 * microtiling.microtile_n)
+    )
+    max_chains = min(
+        max(1, int(device.rows) - int(device.row_start)),
+        max(max(1, int(device.max_mem_out_ports)), ceildiv(partitioned_extent, partition_align)),
+    )
+    max_lengths = min(
+        max(1, int(device.columns) - int(device.column_start)),
+        max(max(1, int(device.max_mem_in_ports)), ceildiv(in_shape, 2 * microtiling.microtile_k)),
+    )
+    return range(1, max_chains + 1), range(1, max_lengths + 1)
+
+
+def matmul_parallelism_candidates(node, device) -> tuple[Dict[str, Any], ...]:
+    """Every (contract, cas_num, cas_length) the tiling search would try under any microtile the precision allows;
+    whether one fits is the tiling's to decide."""
+    precision, _ = resolve_operand_precision(node, device)
+    rank = len(view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs'))
+    contracts = sorted(STAGING_CONTRACTS) if rank <= 2 else ['inner']  # rows of a rank-3 input span its leading axes
+    found = set()
+    for m, k, n in _supported_microtile_options(device.generation, precision['lhs'], precision['rhs']):
+        microtiling = MatmulMicrotileConfig(microtile_m=m, microtile_k=k, microtile_n=n)
+        for contract in contracts:
+            chains, lengths = _partition_ranges(node, device, microtiling, contract)
+            found |= {(contract, cas_num, cas_length) for cas_num in chains for cas_length in lengths}
+    return tuple({'contract': c, 'cas_num': n, 'cas_length': k} for c, n, k in sorted(found))
+
+
 def _resolve_parallelism(
     node,
     device,
     microtiling: MatmulMicrotileConfig,
     precision: Dict[str, AIEDataType],
-    contract: str = 'inner',
-    parallel_cfg=None,
+    contract: str,
+    parallel_cfg: Dict[str, Any],
 ) -> MatmulTiling:
     lhs_tensor = input_tensor_for_role(node, 'lhs')
     lhs_shape = view_shape(node, lhs_tensor, 'inputs')
     in_shape = lhs_shape[-1]
     out_shape = view_shape(node, node.outputs[0], 'outputs')[-1]
-    parallel_cfg = dict(node.directives.get('parallelism', {}) or {}) if parallel_cfg is None else dict(parallel_cfg)
-    user_num_chains = parallel_cfg.get('cas_num')
-    user_cas_length = parallel_cfg.get('cas_length')
-    target_parallel_factor = parallel_cfg.get('parallel_factor')
+    cas_num, cas_length = int(parallel_cfg.get('cas_num', 1)), int(parallel_cfg.get('cas_length', 1))
+    if contract == 'outer' and len(lhs_shape) > 2:
+        raise ConfigRefused(
+            f"{node.name}: its rank-{len(lhs_shape)} input cannot be split by rows (contract 'outer'): the rows span "
+            'its leading axes.'
+        )
 
     lhs_bytes = element_bytes(precision['lhs'])
     rhs_bytes = element_bytes(precision['rhs'])
@@ -205,108 +249,28 @@ def _resolve_parallelism(
     padded_last_outer = align_up(last_outer, outer_granularity)
     full_outer = (outer_extent // max(1, last_outer)) * padded_last_outer
 
-    def _candidate(cas_num, cas_length):
-        return _parallelism_candidate(
-            op_type=node.op_type,
-            device=device,
-            in_shape=int(in_shape),
-            out_shape=int(out_shape),
-            lhs_align=int(lhs_align),
-            rhs_align=int(rhs_align),
-            lhs_bytes=int(lhs_bytes),
-            rhs_bytes=int(rhs_bytes),
-            output_bytes=int(output_bytes),
-            full_outer=int(full_outer),
-            cas_num=int(cas_num),
-            cas_length=int(cas_length),
-            outer_granularity=int(outer_granularity),
-            contract=contract,
+    tiling = _parallelism_candidate(
+        op_type=node.op_type,
+        device=device,
+        in_shape=int(in_shape),
+        out_shape=int(out_shape),
+        lhs_align=int(lhs_align),
+        rhs_align=int(rhs_align),
+        lhs_bytes=int(lhs_bytes),
+        rhs_bytes=int(rhs_bytes),
+        output_bytes=int(output_bytes),
+        full_outer=int(full_outer),
+        cas_num=int(cas_num),
+        cas_length=int(cas_length),
+        outer_granularity=int(outer_granularity),
+        contract=contract,
+    )
+    if tiling is None:
+        raise ConfigRefused(
+            f'{node.name}: cas_num={cas_num} x cas_length={cas_length} does not tile it under the {contract!r} '
+            'contract: a slice would end mid-word, or a tile would overflow a memory bank.'
         )
-
-    if user_num_chains and user_cas_length:
-        tiling = _candidate(user_num_chains, user_cas_length)
-        if tiling is None:
-            raise ValueError(
-                f'{node.name}: user-provided parallelism overrides are invalid for the '
-                f'{contract!r} staging contract (cas_num={user_num_chains}, cas_length={user_cas_length}).'
-            )
-        return tiling
-
-    # cas_num partitions N under 'inner' but the outer (M) rows under 'outer', so the
-    # upper bound comes from whichever axis it slices.
-    partitioned_extent, partition_align = (
-        (int(full_outer), int(outer_granularity)) if contract == 'outer' else (int(out_shape), int(rhs_align))
-    )
-    max_chain_candidates = min(
-        max(1, int(device.rows) - int(device.row_start)),
-        max(
-            max(1, int(getattr(device, 'max_mem_out_ports', 0) or 0)),
-            ceildiv(partitioned_extent, max(1, partition_align)),
-        ),
-    )
-    max_cas_candidates = min(
-        max(1, int(device.columns) - int(device.column_start)),
-        max(max(1, int(getattr(device, 'max_mem_in_ports', 0) or 0)), ceildiv(int(in_shape), max(1, lhs_align))),
-    )
-    chain_candidates = [int(user_num_chains)] if user_num_chains else list(range(1, max_chain_candidates + 1))
-    cas_candidates = [int(user_cas_length)] if user_cas_length else list(range(1, max_cas_candidates + 1))
-
-    best: Optional[tuple] = None
-    for cas_length in cas_candidates:
-        for cas_num in chain_candidates:
-            tiling = _candidate(cas_num, cas_length)
-            if tiling is None:
-                continue
-
-            parallel_factor = tiling.cas_num * tiling.cas_length
-            bank_usage = _tile_bank_usage(
-                op_type=node.op_type,
-                device=device,
-                outer_extent=int(tiling.tile_outer),
-                tile_inner_lhs=tiling.tile_inner_lhs,
-                tile_inner_rhs=tiling.tile_inner_rhs,
-                lhs_bytes=int(lhs_bytes),
-                rhs_bytes=int(rhs_bytes),
-                output_bytes=int(output_bytes),
-            )
-            utilization_penalty = abs(
-                1.0 - float(bank_usage['max_bank_tile_bytes']) / max(1.0, float(bank_usage['bank_capacity_bytes']))
-            )
-            shape_penalty = max(
-                0.0,
-                (float(tiling.tile_inner_rhs) - float(tiling.tile_inner_lhs)) / max(1.0, float(tiling.tile_inner_lhs)),
-            )
-            padding_waste = (
-                tiling.tile_inner_lhs * tiling.cas_length
-                - int(in_shape)
-                + tiling.tile_inner_rhs * tiling.cas_num
-                - int(out_shape)
-            )
-            if target_parallel_factor is not None:
-                target_parallel_factor = int(target_parallel_factor)
-                score = (
-                    int(parallel_factor != target_parallel_factor),
-                    abs(parallel_factor - target_parallel_factor),
-                    tiling.cas_length,
-                    shape_penalty,
-                    padding_waste,
-                    utilization_penalty,
-                )
-            else:
-                score = (
-                    parallel_factor,
-                    tiling.cas_length,
-                    shape_penalty,
-                    padding_waste,
-                    utilization_penalty,
-                )
-
-            if best is None or score < best[0]:
-                best = (score, tiling)
-
-    if best is None:
-        raise ValueError(f'{node.name}: no valid parallelism fits tile memory.')
-    return best[1]
+    return tiling
 
 
 def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: MatmulTiling) -> Dict[str, TensorView]:
@@ -414,6 +378,9 @@ class _MatmulFamilyBase(FamilyResolver):
     """Shared capabilities of the GEMM families: both reduce over their LHS rows."""
 
     supported_fusions = frozenset({'bias', 'relu'})
+
+    def parallelism_candidates(self, node, device):
+        return matmul_parallelism_candidates(node, device)
 
     def reorder_reduction_rows(self, node, tensor, order) -> None:
         rhs = input_tensor_for_role(node, 'rhs')

@@ -37,14 +37,14 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
     param_template = 'matmul'
     plevel = 10
 
-    def matches(self, node: OpNode, device) -> bool:
-        return requested_contract(node) == self.contract and bitwidths_supported(node, device)
+    def matches(self, node: OpNode, device, directives) -> bool:
+        return requested_contract(node, directives) == self.contract and bitwidths_supported(node, device)
 
-    def resolve(self, node: OpNode, device, directives=None) -> MatmulConfig:
-        io_route, _, _ = parse_directives(directives)
+    def resolve(self, node: OpNode, device, directives, _input_contracts) -> MatmulConfig:
+        io_route, parallel_cfg = parse_directives(directives)
         precision, accumulator_tag = resolve_operand_precision(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
+        tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract, parallel_cfg)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')

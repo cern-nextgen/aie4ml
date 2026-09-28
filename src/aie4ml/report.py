@@ -632,6 +632,7 @@ def collect_report(model_or_path) -> 'Report':
         'kernels': kernels,
         'bottleneck': _bottleneck(kernels),
         'memory': _memory(project),
+        'optimizer': doc.get('optimizer') or None,
     }
 
     interval = (latency or {}).get('global') or {}
@@ -700,6 +701,14 @@ def format_report(report: Dict[str, Any]) -> str:
             line += f' ({design["memtile_bytes"]:,} B)'
         add(line)
     add(f'  AIE clock: {clock} GHz' if clock else '  AIE clock: unknown (cycles omitted)')
+    chosen = report.get('optimizer')
+    if chosen:
+        work = chosen.get('work_per_tile')
+        add(
+            f'  Design search ({chosen["mode"]}): {chosen["tiles"]} tiles of {chosen["max_tiles"]}, '
+            f'{chosen["memtile_legs"]} legs through a memory tile'
+            + (f', busiest tile {work:,} MACs (proxy)' if work is not None else '')
+        )
 
     latency = (report.get('latency') or {}).get('global') or {}
     first_cc = (report.get('latency') or {}).get('latency_cc')

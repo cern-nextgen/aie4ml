@@ -11,6 +11,7 @@ from itertools import permutations
 from statistics import median
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..errors import ConfigRefused
 from ..ir import get_backend_context
 from ..op_impls.base import BufferLocation
 from .base import AIEPass
@@ -139,7 +140,7 @@ class Placed:
     rect: Rect
 
 
-class PlacementInfeasibleError(RuntimeError):
+class PlacementInfeasibleError(ConfigRefused):
     """Raised when no legal placement exists within the current search domain."""
 
 
@@ -617,7 +618,7 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
         if rect.extras.get('row_parity') is not None:
             rect.extras['row_parity'] = (int(rect.extras['row_parity']) - row_offset) % 2
 
-        placement_hint = node.directives.get('placement', {})
+        placement_hint = node.directives.get('placement') or ctx.ir.optimizer.get('placement', {}).get(node.name, {})
         anchor: Optional[Tuple[int, int]] = None
         if placement_hint.get('col') is not None and placement_hint.get('row') is not None:
             anchor = (

@@ -4,6 +4,7 @@ import math
 from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
+from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PortBinding, PortMap, kernel_endpoints
@@ -71,7 +72,7 @@ class _SoftmaxVariantBase(OpImplVariant):
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'approximation', 'layout', 'parallelism'})
 
-    def matches(self, node: OpNode, device) -> bool:
+    def matches(self, node: OpNode, device, _directives) -> bool:
         if not layout_variant_matches(node, self.layout_name):
             return False
         if _requested_approximation(node) != self.approximation:
@@ -96,8 +97,8 @@ class _SoftmaxVariantBase(OpImplVariant):
         """Approximation-specific config fields (score parameters)."""
         raise NotImplementedError
 
-    def resolve(self, node: OpNode, device, directives=None) -> SoftmaxConfig:
-        io_route, input_contracts, parallel_cfg = parse_directives(directives)
+    def resolve(self, node: OpNode, device, directives, input_contracts) -> SoftmaxConfig:
+        io_route, parallel_cfg = parse_directives(directives)
 
         in_tensor = input_tensor_for_role(node, 'lhs')
         out_tensor = node.outputs[0]
@@ -262,7 +263,7 @@ class _SoftmaxTiledMixin:
         rows = int(in_view.compacted_tile_outer)
         cols = int(in_view.full_inner)
         if rows % mt.outer:
-            raise ValueError(
+            raise ConfigRefused(
                 f'{node.name}: rows={rows} must be a whole number of {mt.outer}-row microtile bands. '
                 f'Partitioning across kernels chose this tile height, so adjust cas_num.'
             )

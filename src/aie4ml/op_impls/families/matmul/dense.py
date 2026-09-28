@@ -5,6 +5,7 @@ from typing import Any, ClassVar, Dict
 import numpy as np
 
 from ....aie_types import FloatIntent
+from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
@@ -44,6 +45,10 @@ class _BaseDenseMatmulVariant(OpImplVariant):
     contract: ClassVar[str]
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism', 'microtiling'})
 
+    def work(self, node, config) -> int:
+        lhs = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
+        return int(np.prod(lhs)) * int(config.io_views[node.outputs[0].name].tile[-1])
+
     def kernel_params(self, node, config):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         lhs_view = config.io_views[lhs_tensor.name]
@@ -79,11 +84,11 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
     param_template = 'dense_bias_relu'
     plevel = 10
 
-    def matches(self, node: OpNode, device) -> bool:
-        return requested_contract(node) == self.contract and bitwidths_supported(node, device)
+    def matches(self, node: OpNode, device, directives) -> bool:
+        return requested_contract(node, directives) == self.contract and bitwidths_supported(node, device)
 
-    def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
-        io_route, input_contracts, parallel_cfg = parse_directives(directives)
+    def resolve(self, node: OpNode, device, directives, input_contracts) -> DenseConfig:
+        io_route, parallel_cfg = parse_directives(directives)
         precision, accumulator_tag = resolve_operand_precision(node, device)
         precision['bias'] = resolve_bias_dtype(node, precision)
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -94,14 +99,14 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         direct_only = not device.has_memtile or self.port_kind == PORT_KIND_STREAM
         if direct_only and self.contract == 'inner' and producer_contract is not None:
             if producer_contract.contract != 'inner':
-                raise ValueError(
+                raise ConfigRefused(
                     f'{node.name}: dense inner contract cannot directly consume producer '
                     f'{producer_contract.contract!r} staging.'
                 )
             required_cas_length = len(producer_contract.port_staging)
             requested_cas_length = parallel_cfg.get('cas_length')
             if requested_cas_length is not None and int(requested_cas_length) != required_cas_length:
-                raise ValueError(
+                raise ConfigRefused(
                     f'{node.name}: cas_length={requested_cas_length} conflicts with the producer port count '
                     f'{required_cas_length} required for direct AIE1 transport.'
                 )

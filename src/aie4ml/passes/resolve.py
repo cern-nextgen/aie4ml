@@ -1,37 +1,70 @@
 from __future__ import annotations
 
 from ..ir import get_backend_context
-from ..ir.graph import ExecutionInput, ExecutionValue, ExecutionView, TensorContract, ViewPart, input_role
+from ..ir.graph import (
+    ExecutionInput,
+    ExecutionInstance,
+    ExecutionValue,
+    ExecutionView,
+    TensorContract,
+    ViewPart,
+    input_role,
+)
 from ..op_impls import get_family_resolver_registry
 from ..op_impls.utils.io import check_io_view, normalized_staging, resolve_io_route
 from .base import AIEPass
 
 
-def _propagate_contracts(ctx, node, inst, config) -> None:
-    """
-    Propagates TensorContracts from producer outputs to consumer inputs based on the resolved execution instance.
-    Requires LogicalIR.nodes to be in producer-before-consumer (topological) order.
-    """
-    for tensor in node.outputs:
-        contract = inst.variant.output_staging_contract(node, config, tensor.name)
+def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
+    """The TensorContracts an instance publishes for its outputs, which its consumers adopt."""
+    contracts = {}
+    for tensor in inst.outputs:
+        contract = inst.variant.output_staging_contract(inst.node, inst.config, tensor)
         if contract is None:
             continue
-        port_count = inst.variant.output_port_count(node, config)
-        ctx.ir.execution.tensor_contracts[tensor.name] = TensorContract(
+        ports = range(int(inst.variant.output_port_count(inst.node, inst.config)))
+        contracts[tensor] = TensorContract(
             contract=contract,
             port_staging=tuple(
-                normalized_staging(inst.variant.describe_output_staging(node, config, tensor.name, port, None))
-                for port in range(int(port_count))
+                normalized_staging(inst.variant.describe_output_staging(inst.node, inst.config, tensor, port, None))
+                for port in ports
             ),
         )
+    return contracts
 
 
-def _resolved_input_contracts(ctx, node) -> dict[str, TensorContract]:
-    return {
-        tensor.name: ctx.ir.execution.tensor_contracts[tensor.name]
-        for tensor in node.inputs
-        if tensor.name in ctx.ir.execution.tensor_contracts
-    }
+def resolve_instance(node, device, input_contracts, parallelism=None) -> ExecutionInstance:
+    """The kernel graph that implements `node`, given the contracts its inputs arrive in and, when given, the
+    parallelism to resolve it under instead of its own directive. Pure: nothing is registered."""
+    directives = dict(node.directives or {})
+    if parallelism is not None:
+        directives['parallelism'] = dict(parallelism)
+    directives['io_route'] = resolve_io_route(node)  # user intents
+
+    check_io_view(node, device.generation)
+    config, variant = (
+        get_family_resolver_registry().get(node.op_type).resolve(node, device, directives, input_contracts)
+    )
+    _check_transposed_views(node, config, variant)
+    variant.validate_config(node, config, device)
+    ports = variant.build_ports(node, config)
+    variant.validate_ports(node, ports, device)
+
+    inputs = tuple(ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter)
+    outputs = tuple(t.name for t in node.outputs)
+    return ExecutionInstance(
+        node=node,
+        variant=variant,
+        ports=ports,
+        io_route=dict(config.io_route),
+        port_views={name: config.io_views[name] for name in (*(item.tensor for item in inputs), *outputs)},
+        config=config,
+        graph_header=variant.graph_header,
+        graph_name=variant.graph_name,
+        param_template=variant.param_template,
+        inputs=inputs,
+        outputs=outputs,
+    )
 
 
 def _check_transposed_views(node, config, variant) -> None:
@@ -78,23 +111,16 @@ def _folded_views(node):
     return views
 
 
-def _build_execution_values(ctx) -> None:
-    """The values the execution graph moves, copied once from the logical graph: its boundary, the
-    views folding left without a kernel, and every instance's outputs. From here on transport reads
-    these, never the logical tensors."""
-    execution = ctx.ir.execution
-    execution.values = {}
-    execution.graph_inputs = tuple(ctx.ir.logical.input_tensor_names)
-    execution.graph_outputs = tuple(ctx.ir.logical.output_tensor_names)
-    for name in execution.graph_inputs:
-        execution.add_value(ExecutionValue(name))
-    for node in ctx.ir.logical:
+def logical_values(logical) -> dict[str, ExecutionValue]:
+    """The values execution moves, read off the logical graph: its inputs, the views folding left without a
+    kernel, and every other node's outputs, which the kernel graph of that node's name writes."""
+    values = {name: ExecutionValue(name) for name in logical.input_tensor_names}
+    for node in logical:
         if node.is_folded_view:
-            for name, view in _folded_views(node):
-                execution.add_value(ExecutionValue(name, view=view))
-    for inst in execution:
-        for name in inst.outputs:
-            execution.add_value(ExecutionValue(name, producer=inst.name))
+            values.update({name: ExecutionValue(name, view=view) for name, view in _folded_views(node)})
+        else:
+            values.update({t.name: ExecutionValue(t.name, producer=node.name) for t in node.outputs})
+    return values
 
 
 class Resolve(AIEPass):
@@ -102,46 +128,28 @@ class Resolve(AIEPass):
 
     def __init__(self):
         self.name = 'resolve'
-        self._registry = get_family_resolver_registry()
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         ctx.ir.logical.verify()
         ctx.ir.execution.clear()
-
+        execution = ctx.ir.execution
+        # Producer before consumer (the logical order), so each node reads its inputs' published contracts.
         for node in ctx.ir.logical:
             if node.is_folded_view:
                 continue
+            inputs = {
+                t.name: execution.tensor_contracts[t.name] for t in node.inputs if t.name in execution.tensor_contracts
+            }
+            # the design search's choice where it made one; otherwise the node's own directive
+            inst = resolve_instance(node, ctx.device, inputs, ctx.ir.optimizer.get('parallelism', {}).get(node.name))
+            execution.add(inst)
+            execution.tensor_contracts.update(output_contracts(inst))
 
-            resolver = self._registry.get(node.op_type)
-            check_io_view(node, ctx.device.generation)
-
-            resolved_directives = dict(node.directives or {})
-            resolved_directives['io_route'] = resolve_io_route(node)  # user intents
-            resolved_directives['input_contracts'] = _resolved_input_contracts(ctx, node)
-
-            config, variant = resolver.resolve(node, ctx.device, resolved_directives)
-            _check_transposed_views(node, config, variant)
-            variant.validate_config(node, config, ctx.device)
-            ports = variant.build_ports(node, config)
-            variant.validate_ports(node, ports, ctx.device)
-
-            inputs = tuple(ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter)
-            outputs = tuple(t.name for t in node.outputs)
-            inst = ctx.ir.execution.register(
-                node=node,
-                variant=variant,
-                ports=ports,
-                io_route=dict(config.io_route),
-                port_views={name: config.io_views[name] for name in (*(item.tensor for item in inputs), *outputs)},
-                config=config,
-                graph_header=variant.graph_header,
-                graph_name=variant.graph_name,
-                param_template=variant.param_template,
-                inputs=inputs,
-                outputs=outputs,
-            )
-            _propagate_contracts(ctx, node, inst, config)
-
-        _build_execution_values(ctx)
+        # From here on transport reads these values, never the logical tensors.
+        execution.graph_inputs = tuple(ctx.ir.logical.input_tensor_names)
+        execution.graph_outputs = tuple(ctx.ir.logical.output_tensor_names)
+        execution.values = {}
+        for value in logical_values(ctx.ir.logical).values():
+            execution.add_value(value)
         return True

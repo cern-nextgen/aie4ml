@@ -7,6 +7,25 @@ back silently.
 
 Quantization is static and per tensor. Scales are powers of two, so rescaling is a shift.
 
+### Parallelism
+
+Each compute kernel that is not fused (Dense/MatMul, Conv2D, etc.) can span several AI Engine tiles. The compiler chooses every layer's split for the whole model at once, keeping the hand-overs between layers direct where it can and falling back to a memory tile
+where it must (`AIEConfig`):
+
+- `Optimize: 'resource'` (default) uses the fewest tiles that fit.
+- `Optimize: 'performance'` splits the layers with the most multiply-accumulates per tile first, within
+  `MaxTiles` (default: the whole array). Multiply-accumulates are a proxy for time, not a timing model.
+
+A layer's split can be fixed per layer (`LayerDirectives` in the ONNX config, or the hls4ml layer config); the
+compiler keeps what is given and chooses the rest:
+
+- `parallelism: {cas_length: L}` splits the reduction (input features or channels) over a chain of `L` tiles.
+- `parallelism: {cas_num: C}` runs `C` chains side by side, each computing a share of the output features or
+  channels (`contract: 'inner'`) or of the rows (`contract: 'outer'`).
+- `ports: 'stream'`(exp) moves a Dense or a Conv2D over streams instead of memory buffers.
+
+The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml.report` summary.
+
 ## Dense and MatMul
 
 - **Formats** (inputs × weights): int8 × int8, int16 × int8 and float32 × float32 on every generation; int16 × int16
@@ -14,8 +33,8 @@ Quantization is static and per tensor. Scales are powers of two, so rescaling is
 - **Dense** has constant weights, an optional bias and a fused ReLU. **MatMul** multiplies two activations; its
   right operand is 2-D and may be broadcast across the left operand's leading axes. A batched right operand is refused.
 - **Parallelism**: `cas_length` splits the reduction over a cascade chain; `cas_num` runs parallel chains over the
-  output features (`contract: 'inner'`) or the rows (`'outer'`). Without a directive, the smallest split whose tiles
-  fit in memory is chosen.
+  output features (`contract: 'inner'`) or the rows (`'outer'`). What a directive leaves open, the compiler chooses for
+  the whole model (`AIEConfig.Optimize`, see the README).
 - **Microtile**: each generation has a default mmul shape per format. `microtiling: {microtile_m, microtile_k,
   microtile_n}` picks another shape the generation supports; the error lists the allowed ones.
 - **Ports**: buffers by default; `ports: 'stream'` moves each tile's padded block over core streams, for any split.
@@ -33,9 +52,14 @@ Quantization is static and per tensor. Scales are powers of two, so rescaling is
 - **Parallelism**: `cas_length` splits the input channels over a cascade and `cas_num` splits the output channels
   (`'inner'`) or the output rows (`'outer'`); every split must be whole 8-channel blocks or equal row bands. A row
   split whose window reads neighbouring rows must read from the graph input, since row bands overlap by the window
-  height. With a fused pool, each row band must hold whole pool windows.
+  height, and its output may feed only a 1×1 conv or the graph output. With a fused pool, each row band must hold
+  whole pool windows.
+- **Depthwise** (one channel per group): on AIE-ML and AIE-MLv2, an int8 layer with a horizontal stride of 1 and no
+  fused pool or flatten runs a channelwise kernel, on one tile or split by rows. Otherwise, and on AIE1, it runs the
+  general kernel on block-diagonal weights.
 - **Memory**: each tile's input, output and weights must each fit one memory bank (8 KB on AIE1, 16 KB on AIE-ML
-  and AIE-MLv2). A layer that does not fit stops conversion, and the error names the split that would make it fit.
+  and AIE-MLv2). The compiler splits a layer that does not fit; held by a directive to a split that does not, the
+  conversion stops and says why.
 - **Stride > 1**: runs on buffer ports. A small retiler kernel on the neighbouring tile regroups the input columns,
   which costs one extra tile and one pipeline stage of latency. A row-only stride needs no retiler. A strided conv
   split by rows must read from the graph input.

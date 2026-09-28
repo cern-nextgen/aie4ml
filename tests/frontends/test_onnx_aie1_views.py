@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from aie4ml.errors import ConfigRefused
 from helpers import TensorProto, dq, helper, lower, make_model, numpy_helper, qdq, qparams
 
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
@@ -131,7 +132,7 @@ def test_port_aligned_split_maps_disjoint_producer_ports_directly(tmp_path):
 
 def test_slice_crossing_producer_port_requires_relay(tmp_path):
     with pytest.raises(
-        NotImplementedError,
+        ConfigRefused,
         match=r'slice range \[2, 6\) crosses producer port 0 range \[0, 4\); packed slice/relay',
     ):
         lower(
@@ -160,7 +161,7 @@ def test_port_aligned_concat_maps_each_source_to_one_consumer_port(tmp_path):
 
 def test_concat_port_spanning_two_sources_requires_relay(tmp_path):
     with pytest.raises(
-        NotImplementedError,
+        ConfigRefused,
         match=r'concat consumer port 0.*range \[0, 4\).*packed concat/relay',
     ):
         lower(

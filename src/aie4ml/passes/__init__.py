@@ -1,6 +1,7 @@
 """Optimizer passes specific to the AIE backend."""
 
 from .base import AIEPass, run_aie_passes
+from .choose_parallelism import ChooseParallelism
 from .compact_buffer_rank import CompactBufferRank
 from .fold_apply_alpha import FoldApplyAlpha
 from .fold_bias import FoldBias
@@ -24,6 +25,7 @@ from .transport import (
 from .verify_physical import VerifyPhysicalPlan
 
 __all__ = [
+    'ChooseParallelism',
     'AIEPass',
     'run_aie_passes',
     'FuseActivationCasts',

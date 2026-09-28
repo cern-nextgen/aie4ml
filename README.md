@@ -20,16 +20,16 @@ The full constraints are in [docs/support.md](docs/support.md).
 | --- | :---: | :---: | :---: | --- | --- |
 | Dense (Gemm, MatMul with constant weights) | ✅ | ✅ | ✅ | int8 × int8, int16 × int8, float32 on all; int16 × int16 and bfloat16 on AIE-ML and AIE-MLv2; FP8 (E4M3) on AIE-MLv2 | Optional bias, fused ReLU. |
 | MatMul (two activations) | ✅ | ✅ | ✅ | As Dense | The right operand is 2-D; it may be broadcast over the left operand's batch axes. |
-| Conv2D, grouped and depthwise | ✅ | ✅ | ✅ | int8 × int8 on all; int16 × int8 on AIE-ML and AIE-MLv2 (int8 or int16 output) | Batch 1, kernels up to 7×7, padding smaller than the kernel, any stride (int16 inputs: horizontal stride 1), no dilation. Fuses bias, ReLU and a following MaxPool. |
+| Conv2D (including grouped, depthwise and pointwise) | ✅ | ✅ | ✅ | int8 × int8 on all; int16 × int8 on AIE-ML and AIE-MLv2 (int8 or int16 output) | Batch 1, kernels up to 7×7, padding smaller than the kernel, any stride (int16 inputs: horizontal stride 1), no dilation. Fuses bias, ReLU and a following MaxPool. Depthwise runs a channelwise kernel on AIE-ML and AIE-MLv2. |
 | MaxPool | ✅ | ✅ | ✅ | As its Conv2D | 2×2, stride 2, directly after a Conv2D (ReLU on either side). |
-| BatchNormalization | ✅ | ✅ | ✅ | — | Folded into the preceding Conv2D or Dense before quantization: QKeras `QConv2DBatchnorm`, a float Dense followed by BatchNormalization, or an ONNX export that folds Conv + BatchNormalization. |
+| BatchNormalization | ✅ | ✅ | ✅ | — | Folded into the preceding Conv2D or Dense (`QConv2DBatchnorm`, Dense + BatchNormalization, or a folded ONNX export). |
 | ReLU | ✅ | ✅ | ✅ | — | Fused into the Dense or Conv2D. |
 | Add | ✅ | ✅ | ✅ | Both inputs and the output of one type | Same shapes; no broadcasting. |
 | LayerNorm | ✅ | ✅ | ✅ | int8 | Last axis. |
 | Softmax | ✅ | ✅ | ✅ | int8 in, uint8 or int16 out | Last axis. Exact integer exponential (beta), or a faster surrogate for models trained with it. |
 | Flatten / Reshape | ✅ | ✅ | ✅ | — | One sample to `[1, K]`, from a Conv2D into a Dense; no data is copied. |
 | Transpose | ✖️ | ✅ | ✅ | — | Of the last two axes. |
-| Slice, Split, Concat | ✅* | ✅ | ✅ | — | Along the boundaries of the producing layer's tiles; no data is copied. |
+| Slice, Split, Concat | ✅ | ✅ | ✅ | — | Along the boundaries of the producing layer's tiles; no data is copied. |
 
 8-bit inputs against 16-bit weights (int8 × int16) are not supported.
 
@@ -61,21 +61,6 @@ Tutorial 2: [`tutorials/tutorial_2.ipynb`](tutorials/tutorial_2.ipynb)
 
 General `hls4ml` concepts: [https://fastmachinelearning.org/hls4ml](https://fastmachinelearning.org/hls4ml)
 
-### Parallelism
-
-Each Dense, MatMul and Conv2D layer can span several AI Engine tiles, set per layer (`LayerDirectives` in the ONNX
-config, or the hls4ml layer config):
-
-- `parallelism: {cas_length: L}` splits the reduction (input features or channels) over a chain of `L` tiles.
-- `parallelism: {cas_num: C}` runs `C` chains side by side, each computing a share of the output features or
-  channels (`contract: 'inner'`, the default) or of the rows (`contract: 'outer'`).
-- `ports: 'stream'`(beta) moves a Dense or a single-tile int8 Conv2D over streams instead of memory buffers.
-
-### Model structure
-
-- Branches (one output feeding several layers) and residual connections through Add.
-- On AIE-ML and AIE-MLv2, a memory tile reorders data between layers that lay it out differently. AIE1 has no memory
-  tile, so connected layers must agree on the layout; conversion says when they do not.
 
 ### Frontends
 

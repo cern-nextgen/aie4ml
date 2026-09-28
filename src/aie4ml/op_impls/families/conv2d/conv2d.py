@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Dict, Optional, Tuple
 import numpy as np
 
 from ....aie_types import FloatIntent
+from ....errors import ConfigRefused
 from ....ir.graph import (
     STAGING_CONTRACTS,
     VIEW_FLATTEN_2D,
@@ -109,7 +110,7 @@ class Conv2dOpImplVariant(OpImplVariant):
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism'})
 
-    def matches(self, node: OpNode, device) -> bool:
+    def matches(self, node: OpNode, device, _directives) -> bool:
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')
         out = node.outputs[0]
@@ -126,8 +127,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         # int16 activations, in or out, need a core for them on the generation
         return _core_microtile(select_generation_key(device.generation), max(lhs_width, out_width)) is not None
 
-    def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
-        io_route, input_contracts, parallel_cfg = parse_directives(directives)
+    def resolve(self, node: OpNode, device, directives, input_contracts) -> Conv2dConfig:
+        io_route, parallel_cfg = parse_directives(directives)
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')
         out = node.outputs[0]
@@ -175,7 +176,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 )
             conv_rows = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
             if outer and (conv_rows // parallelism.cas_num) % 2:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f"{node.name}: each of its {parallelism.cas_num} row slices (contract 'outer') must hold whole "
                     f'pool windows, but {conv_rows} output rows split into odd slices.'
                 )
@@ -216,7 +217,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             # Each row slice writes its own rows once: no zero border, and no rows another slice also holds.
             view = io_views[out.name]
             if outer and (any(view.origin) or int(view.tile[1]) * row_slices > int(view.full[1])):
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f"{node.name}: an output split by rows (contract 'outer') cannot feed a consumer whose window "
                     'reads a zero border or rows past its slice; partition the channels instead, or let the row '
                     'slices end at a 1x1 conv or the graph output.'
@@ -262,17 +263,17 @@ class Conv2dOpImplVariant(OpImplVariant):
             # The rows arrive already split ('outer'); a window that reaches past its own row slice
             # would need rows another chain owns.
             if reads_neighbour_rows:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f"{node.name}: its input arrives split by rows (contract 'outer'), but its {spatial.kernel} "
                     f'window with pads {spatial.pads} reads rows a neighbouring chain owns.'
                 )
             if contract == 'inner' and 'contract' in parallel_cfg:
-                raise ValueError(
+                raise ConfigRefused(
                     f"{node.name}: its input is split by rows (contract 'outer'), so it cannot be partitioned "
                     'by channel.'
                 )
             if flatten:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f"{node.name}: its input arrives split by rows (contract 'outer'), but a flattened output is one "
                     'row that the consuming Dense reads whole.'
                 )
@@ -282,7 +283,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             # producer wrote -- the same rule the Dense 'inner' contract follows.
             required = len(producer.port_staging)
             if 'cas_length' in parallel_cfg and cas_length != required:
-                raise ValueError(
+                raise ConfigRefused(
                     f'{node.name}: cas_length={cas_length} conflicts with the {required} ports its producer '
                     'writes; a spatial frame is handed over slice for slice.'
                 )
@@ -293,34 +294,32 @@ class Conv2dOpImplVariant(OpImplVariant):
             # Only the graph boundary can serve that: the host clips each port's window against
             # the tensor and zero-fills the rest, while a producing kernel writes each row once.
             if lhs.producer is not None and reads_neighbour_rows:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f"{node.name}: an input split by rows (contract 'outer') whose window reads neighbouring rows "
                     'must come from the graph boundary, because the row slices overlap and a kernel writes every '
                     'row exactly once.'
                 )
             if flatten:
-                raise NotImplementedError(
-                    f"{node.name}: a flattened output cannot be split by rows (contract 'outer')."
-                )
+                raise ConfigRefused(f"{node.name}: a flattened output cannot be split by rows (contract 'outer').")
             out_rows = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
             if cas_num < 1 or out_rows % cas_num:
-                raise ValueError(
+                raise ConfigRefused(
                     f'{node.name}: cas_num={cas_num} does not split {out_rows} output rows into equal row slices.'
                 )
             if cas_length < 1 or in_blocks % cas_length:
-                raise ValueError(
+                raise ConfigRefused(
                     f'{node.name}: cas_length={cas_length} does not split {in_blocks} '
                     f'{CHANNEL_BLOCK}-channel blocks evenly.'
                 )
             return ParallelismConfig(cas_num=cas_num, cas_length=cas_length, contract=contract)
         if flatten and cas_num != 1:
-            raise NotImplementedError(
+            raise ConfigRefused(
                 f'{node.name}: a flattened output interleaves the channel blocks of every pixel, so it cannot '
                 f'be split across {cas_num} chains.'
             )
         for name, value, blocks in (('cas_length', cas_length, in_blocks), ('cas_num', cas_num, out_blocks)):
             if value < 1 or blocks % value:
-                raise ValueError(
+                raise ConfigRefused(
                     f'{node.name}: {name}={value} does not split {blocks} {CHANNEL_BLOCK}-channel blocks evenly.'
                 )
         return ParallelismConfig(cas_num=cas_num, cas_length=cas_length, contract=contract)
@@ -366,7 +365,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 ),
             ):
                 if int(size) > bank:
-                    raise ValueError(
+                    raise ConfigRefused(
                         f"{node.name}: each tile's {what} is {size} B but one {device.platform} memory bank holds "
                         f'{bank} B. What shrinks it, where the shape splits evenly: {splits}.'
                     )
@@ -380,7 +379,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             + self.staging_bytes(params)
         )
         if tile_bytes > int(device.tile_mem_bytes):
-            raise ValueError(
+            raise ConfigRefused(
                 f'{node.name}: one tile needs {tile_bytes} B for its frames, weights and bias but a '
                 f'{device.platform} tile has {device.tile_mem_bytes} B; split the layer with '
                 '`parallelism: {cas_num: .., cas_length: ..}`.'
@@ -441,7 +440,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         from_boundary = source.producer is None
         row_slices = int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else 1
         if row_slices > 1 and not from_boundary:
-            raise NotImplementedError(
+            raise ConfigRefused(
                 f'{node.name}: its strided input arrives from {source.producer} split by rows; a retiler reads a '
                 "producer's frame whole."
             )
@@ -608,6 +607,13 @@ class Conv2dOpImplVariant(OpImplVariant):
 
     def footprint(self, _node, config) -> OpImplFootprint:
         return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
+
+    def work(self, node, config) -> int:
+        in_blocks, out_blocks, out_h, _, out_w_computed = self._tile_extent(node, config)
+        kh, kw = config.spatial.kernel
+        if self.uses_depthwise_core(node, config):
+            return out_h * out_w_computed * kh * kw * out_blocks * CHANNEL_BLOCK
+        return out_h * out_w_computed * kh * kw * in_blocks * _padded_blocks(out_blocks) * CHANNEL_BLOCK**2
 
     def output_staging_contract(self, _node, config, _tensor_name):
         return str(config.parallelism.contract)
@@ -806,8 +812,8 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
     variant_id = 'conv2d.s.r.v1'
     port_kind = PORT_KIND_STREAM
 
-    def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
-        config = super().resolve(node, device, directives)
+    def resolve(self, node: OpNode, device, directives, input_contracts) -> Conv2dConfig:
+        config = super().resolve(node, device, directives, input_contracts)
         if (int(config.precision['lhs'].width), int(config.precision['output'].width)) != (8, 8):
             raise NotImplementedError(f'{node.name}: {self.variant_id} streams int8 frames only.')
         if config.spatial.strides != (1, 1):
@@ -816,7 +822,7 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
                 'band it keeps and the columns it places are both written for a dense window.'
             )
         if config.parallelism.cas_num != 1 or config.parallelism.cas_length != 1:
-            raise NotImplementedError(f'{node.name}: {self.variant_id} does not implement partitioning yet.')
+            raise ConfigRefused(f'{node.name}: {self.variant_id} does not implement partitioning yet.')
         if config.flags.emit_flattened:
             raise NotImplementedError(f'{node.name}: {self.variant_id} writes a frame, not a flattened row.')
         if config.pool is not None:

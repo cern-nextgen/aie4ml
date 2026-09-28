@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 
+from ...errors import ConfigRefused
 from ...ir import get_backend_context
 from ..base import AIEPass
 from .boundary import (
@@ -41,7 +42,10 @@ class LegalizeMemtilePortLimits(AIEPass):
                     next_graph_input_port += len(producer_ports)
                     descriptors = graph_input_port_descs(entry, ctx, port_base)
                     entry.graph_input = GraphInputSpec(
-                        descriptors, graph_input_writer_port_descs(descriptors, stream=uses_stream(ctx, entry))
+                        descriptors,
+                        graph_input_writer_port_descs(
+                            descriptors, stream=uses_stream(ctx.ir.execution, entry.endpoints())
+                        ),
                     )
                     producer_ports = tuple(port_base + index for index in range(len(producer_ports)))
                 entry.unit = TransportUnit(producer_ports, consumer_ports)
@@ -76,7 +80,7 @@ class LegalizeMemtilePortLimits(AIEPass):
 
             changed = True
             if entry.producer.ports is not None:
-                raise NotImplementedError(f'{entry.logical_tensor}: sharded slice transport is not implemented.')
+                raise ConfigRefused(f'{entry.logical_tensor}: sharded slice transport is not implemented.')
             self._validate_one_stage_ratio(entry, p, c)
 
             p_chunks = self._split_ports_serial(p, units)
@@ -158,12 +162,12 @@ class LegalizeMemtilePortLimits(AIEPass):
     @staticmethod
     def _validate_one_stage_ratio(entry, producer_count: int, consumer_count: int) -> None:
         if entry.consumers and consumer_count < producer_count:
-            raise NotImplementedError(
+            raise ConfigRefused(
                 f'{entry.logical_tensor}: shard transport requires relay; one-stage sharding cannot contract '
                 f'producer_ports={producer_count} to consumer_ports={consumer_count}.'
             )
         if entry.consumers and consumer_count % producer_count != 0:
-            raise NotImplementedError(
+            raise ConfigRefused(
                 f'{entry.logical_tensor}: shard transport requires relay; one-stage sharding cannot regroup '
                 f'producer_ports={producer_count} to consumer_ports={consumer_count}.'
             )
@@ -174,7 +178,7 @@ class LegalizeMemtilePortLimits(AIEPass):
         c_per_p = c // p
         per_shard_out = max((len(chunk) * c_per_p for chunk in p_chunks), default=0)
         if entry.producer.node is not None and per_shard_out > max_out:
-            raise NotImplementedError(
+            raise ConfigRefused(
                 f'{entry.logical_tensor}: shard transport requires relay; one-stage sharding cannot realize '
                 f'producer_ports={p} -> consumer_ports={c} under memtile out-port limit {max_out}.'
             )
@@ -212,13 +216,13 @@ class LegalizeMemtilePortLimits(AIEPass):
             offset = int(desc['offset'][shard_dim])
             extent = int(desc['io_tiling_dimension'][shard_dim])
             if offset < 0 or extent <= 0 or offset + extent > full_dim:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f'{entry.logical_tensor}: shard transport requires relay; consumer port {c_port} range '
                     f'[{offset}, {offset + extent}) is invalid for producer shard dim{shard_dim} extent {full_dim}.'
                 )
             group = offset // port_stride
             if group < 0 or group >= len(producer_ports) or offset + extent > (group + 1) * port_stride:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f'{entry.logical_tensor}: shard transport requires relay; consumer port {c_port} range '
                     f'[{offset}, {offset + extent}) crosses producer shard boundary for slice {group}.'
                 )
@@ -232,7 +236,7 @@ class LegalizeMemtilePortLimits(AIEPass):
             chunk.sort()
             expected = len(p_ports) * c_per_p
             if len(chunk) != expected:
-                raise NotImplementedError(
+                raise ConfigRefused(
                     f'{entry.logical_tensor}: shard transport requires relay; expected {expected} consumer ports '
                     f'for producer slice set {p_ports}, got {len(chunk)}.'
                 )
@@ -244,10 +248,10 @@ class LegalizeMemtilePortLimits(AIEPass):
     @staticmethod
     def _validate_limits(entry, max_in: int, max_out: int) -> None:
         if len(entry.unit.producer_ports) > max_in:
-            raise RuntimeError(f'{entry.logical_tensor}: shard exceeds memtile in-port limit {max_in}.')
+            raise ConfigRefused(f'{entry.logical_tensor}: shard exceeds memtile in-port limit {max_in}.')
         output_count = len(entry.unit.consumer_ports) if entry.consumers else len(entry.unit.producer_ports)
         if output_count > max_out:
-            raise RuntimeError(f'{entry.logical_tensor}: shard exceeds memtile out-port limit {max_out}.')
+            raise ConfigRefused(f'{entry.logical_tensor}: shard exceeds memtile out-port limit {max_out}.')
 
     @staticmethod
     def _producer_port_ids(entry, ctx):
@@ -300,7 +304,7 @@ class LegalizeMemtilePortLimits(AIEPass):
         )
         full_dim = int(d0['buffer_dimension'][shard_dim])
         if full_dim != port_stride * len(ports):
-            raise RuntimeError(
+            raise ConfigRefused(
                 f'{entry.logical_tensor}: shard transport is not legal on dim{shard_dim}; expected '
                 f'buffer_dimension[{shard_dim}] == port_stride * ports ({full_dim} != {port_stride} * {len(ports)}).'
             )

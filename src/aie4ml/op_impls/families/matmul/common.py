@@ -82,9 +82,9 @@ def bitwidths_supported(node, device) -> bool:
 DEFAULT_CONTRACT = 'inner'
 
 
-def requested_contract(node) -> str:
-    """The parallelism contract asked of this node; selects between the family's variants."""
-    contract = str((node.directives.get('parallelism', {}) or {}).get('contract', DEFAULT_CONTRACT))
+def requested_contract(node, directives) -> str:
+    """The parallelism contract the directives ask of this node; selects between the family's variants."""
+    contract = str((directives.get('parallelism') or {}).get('contract', DEFAULT_CONTRACT))
     if contract not in STAGING_CONTRACTS:
         raise ValueError(
             f'{node.name}: unknown parallelism contract {contract!r}; expected one of {sorted(STAGING_CONTRACTS)}.'

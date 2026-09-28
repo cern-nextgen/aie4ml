@@ -183,6 +183,8 @@ class AIEBackend(Backend):
         pl_memory='uram',
         enable_pl_timing=False,
         pl_data_mover_mode='benchmark',
+        optimize='resource',
+        max_tiles=None,
         **_,
     ):
         device_info = copy.deepcopy(self._get_device_info(part))
@@ -219,6 +221,8 @@ class AIEBackend(Backend):
                 'Memory': device_info.get('Memory'),
                 'MaxMemTileInPorts': int(device_info['MaxMemTileInPorts']),
                 'MaxMemTileOutPorts': int(device_info['MaxMemTileOutPorts']),
+                'Optimize': optimize,
+                **({'MaxTiles': int(max_tiles)} if max_tiles is not None else {}),
                 **({'ComputeDtype': compute_dtype} if compute_dtype else {}),
             },
             'HLSConfig': {},
@@ -231,8 +235,8 @@ class AIEBackend(Backend):
         normalize_pl_config(config['AIEConfig'])
         return config
 
-    def build(self, model, make_target='all', env=None, log_to_stdout=True):
-        return self._aie_model(model).build(make_target=make_target, env=env, log_to_stdout=log_to_stdout)
+    def build(self, model, make_target='all', env=None, log_to_stdout=True, jobs=None):
+        return self._aie_model(model).build(make_target=make_target, env=env, log_to_stdout=log_to_stdout, jobs=jobs)
 
     @model_optimizer()
     def write_aie(self, model):

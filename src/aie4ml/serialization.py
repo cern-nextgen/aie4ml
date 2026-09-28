@@ -25,6 +25,7 @@ def dump_pipeline_ir(ctx, destination: Path) -> None:
             for v in ctx.ir.execution.values.values()
         ],
         'physical': serialize_physical_ir(ctx.ir.physical),
+        'optimizer': ctx.ir.optimizer,
     }
 
     destination.write_text(json.dumps(data, indent=2))

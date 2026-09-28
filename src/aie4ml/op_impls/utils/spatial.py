@@ -8,6 +8,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
+from ...errors import ConfigRefused
 from .math import align_up
 from .tensor_view import TensorView
 
@@ -115,14 +116,14 @@ def build_padded_spatial_view(
         columns = max(columns, stride_w * phase_cols)
     padded_channels = align_up(channels, int(inner_block))
     if padded_channels % (int(inner_block) * int(inner_slices)):
-        raise ValueError(
+        raise ConfigRefused(
             f'{padded_channels} channels do not split into {inner_slices} ports of whole {inner_block}-blocks.'
         )
     span_h = access.window[0] if access else 1
     stride_h = int(access.strides[0]) if access else 1
     out_height = access.output_extent(height, width)[0] if access else height
     if out_height % int(row_slices):
-        raise ValueError(f'{out_height} output rows do not split into {row_slices} equal bands.')
+        raise ConfigRefused(f'{out_height} output rows do not split into {row_slices} equal bands.')
     column_align_bytes = int(row_bytes_align) * stride_w // math.gcd(int(row_bytes_align) or 1, stride_w)
     full = (batch, top + height + bottom, align_up(columns, max(1, column_align_bytes)), padded_channels)
     tile = (

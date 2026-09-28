@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from aie4ml.errors import ConfigRefused
 from aie4ml.writer import AIEProjectEmitter
 from helpers import PART, TensorProto, assert_x86_matches_onnx, helper, lower, make_model, numpy_helper, qdq
 
@@ -170,13 +171,13 @@ def test_stream_dense_emits_stream_graph(stream_dense_model, tmp_path):
 
 def test_stream_dense_refuses_buffer_consumer(stream_dense_model, tmp_path):
     directives = dict(DIRECTIVES, l2={'parallelism': {'cas_num': 1}})
-    with pytest.raises(RuntimeError, match=r'l1_aie\.out1 is a stream port but consumer l2_aie\.in1 is a buffer port'):
+    with pytest.raises(ConfigRefused, match=r'l1_aie\.out1 is a stream port but consumer l2_aie\.in1 is a buffer port'):
         lower(stream_dense_model, tmp_path, directives, part=AIE1_PART, batch=ROWS)
 
 
 def test_stream_dense_refuses_memtile_route(stream_dense_model, tmp_path):
     directives = dict(DIRECTIVES, l2=dict(_stream(1), io_route={'inputs': {'l1_relu': 'memtile'}}))
-    with pytest.raises(RuntimeError, match=r'io_route=memtile requested on a stream port'):
+    with pytest.raises(ConfigRefused, match=r'io_route=memtile requested on a stream port'):
         lower(stream_dense_model, tmp_path, directives, part=PART, batch=ROWS)
 
 

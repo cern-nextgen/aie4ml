@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from aie4ml.errors import ConfigRefused
 from aie4ml.op_impls.utils.tensor_view import microtile_from_staging
 from helpers import (
     PART,
@@ -99,7 +100,7 @@ def test_a_linear_consumer_of_tiled_data_needs_a_memtile(dense_then_layernorm, t
 
 def test_aie1_staging_mismatch_identifies_the_ports_and_descriptor_fields(dense_then_layernorm, tmp_path):
     with pytest.raises(
-        RuntimeError,
+        ConfigRefused,
         match=r'staging mismatch at fc_aie\.out1\[0\] -> ln_aie\.in1\[0\] \([^)]*tiling_dimension',
     ):
         lower(

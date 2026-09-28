@@ -53,6 +53,9 @@ class Connection:
         if self.producer.node is None and self.consumer is None:
             raise ValueError(f'{self.logical_tensor}: transport leg cannot have two graph-boundary endpoints.')
 
+    def endpoints(self) -> Tuple[Endpoint, ...]:
+        return (self.producer,) if self.consumer is None else (self.producer, self.consumer)
+
 
 @dataclass(frozen=True)
 class TransportDecision:
@@ -107,6 +110,9 @@ class EdgeEntry:
     decision: Optional[TransportDecision] = None
     unit: Optional[TransportUnit] = None
     graph_input: Optional[GraphInputSpec] = None
+
+    def endpoints(self) -> Tuple[Endpoint, ...]:
+        return (self.producer, *(conn.consumer for conn in self.consumers if conn.consumer is not None))
 
     def single_consumer(self) -> Endpoint:
         if len(self.consumers) != 1 or self.consumers[0].consumer is None:
