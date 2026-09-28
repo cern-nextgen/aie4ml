@@ -61,67 +61,89 @@ inline void conv2d_check_contract() {
 template<typename ConfigT>
 inline constexpr int conv2d_rows = ConfigT::POOL ? ConfigT::OUT_H / 2 * 2 : ConfigT::OUT_H;
 
-// The max's identity; zero also applies the ReLU, which commutes with the max.
+// AIE1 has no 8-bit vector ALU: it pools in int16 and packs once on the store.
 template<typename ConfigT>
-static inline void conv2d_pool_fill(typename ConfigT::result_t* out)
-{
-  using result_t = typename ConfigT::result_t;
-  constexpr int M = ConfigT::M, SA = M * 8, ROWS = conv2d_rows<ConfigT> / 2;
-  const auto identity =
-      aie::broadcast<result_t, SA>(ConfigT::USE_RELU ? result_t(0) : std::numeric_limits<result_t>::lowest());
-  if constexpr (ConfigT::FLATTEN) {
-    for (int slot = 0; slot < ROWS * (ConfigT::OUT_W / 2) * ConfigT::NB; ++slot)
-      aie::store_v(out + slot * SA, identity);
-  } else {
-    for (int nb = 0; nb < ConfigT::NB; ++nb)
-      for (int py = 0; py < ROWS; ++py) {
-        result_t* row = out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + py) * ConfigT::OUT_COLS +
-                               ConfigT::OUT_ORIGIN_C) * 8;
-        for (int px = 0; px < ConfigT::OUT_W_COMPUTED / 2; px += M) aie::store_v(row + px * 8, identity);
-      }
-  }
-}
+using conv2d_pool_t = std::conditional_t<__AIE_ARCH__ == 10 && sizeof(typename ConfigT::result_t) == 1, int16,
+                                         typename ConfigT::result_t>;
 
-// Pools two register tiles at a time: M is even, so no pixel pair straddles them, and vectors stay
-// within 1024 bits.
+// Pools a register-tile pair of one output row along the row: 2M pixels to M. M is even, so no pixel pair
+// straddles the tiles, and vectors stay within 1024 bits.
 template<typename ConfigT, typename MMUL>
-static inline void conv2d_store_pooled(typename ConfigT::result_t* out, int oy, int x, int nb, MMUL& lo, MMUL& hi)
+__attribute__((always_inline)) static inline aie::vector<conv2d_pool_t<ConfigT>, ConfigT::M * 8>
+conv2d_pool_row(MMUL& lo, MMUL& hi)
 {
   using result_t = typename ConfigT::result_t;
-  // AIE1 has no 8-bit vector ALU: pool in int16, pack once on the store.
-  using pool_t = std::conditional_t<__AIE_ARCH__ == 10 && sizeof(result_t) == 1, int16, result_t>;
-  constexpr int M = ConfigT::M, SA = M * 8, PIXEL_WORDS = 8 * sizeof(pool_t) / 4;
-  static_assert(M % 2 == 0, "a register tile holds whole pixel pairs");
+  using pool_t = conv2d_pool_t<ConfigT>;
+  constexpr int SA = ConfigT::M * 8, PIXEL_WORDS = 8 * sizeof(pool_t) / 4;
+  static_assert(ConfigT::M % 2 == 0, "a register tile holds whole pixel pairs");
   auto widen = [](aie::vector<result_t, SA> v) {
     if constexpr (std::is_same_v<pool_t, result_t>) return v; else return v.template unpack<pool_t>();
-  };
-  auto narrow = [](aie::vector<pool_t, SA> v) {
-    if constexpr (std::is_same_v<pool_t, result_t>) return v; else return v.template pack<result_t>();
-  };
-  auto merge = [&](result_t* o, aie::vector<pool_t, SA> v) {
-    aie::store_v(o, narrow(aie::max(v, widen(aie::load_v<SA>(o)))));
   };
   const auto row = aie::concat(widen(lo.template to_vector<result_t>(ConfigT::SHIFT)),
                                widen(hi.template to_vector<result_t>(ConfigT::SHIFT)));
   // Word permutes are native; AIE1 runs byte permutes through the multiplier.
   const auto words = row.template cast_to<int32>();
-  const aie::vector<pool_t, SA> pooled = aie::max(aie::filter_even(words, PIXEL_WORDS).template cast_to<pool_t>(),
-                                                   aie::filter_odd(words, PIXEL_WORDS).template cast_to<pool_t>());
-  const int py = oy / 2, px = x / 2;
-  if constexpr (ConfigT::FLATTEN) {
-    // As the unpooled store: each pixel at row 0 of its M-row slot.
-    auto pair = aie::concat(pooled, pooled).template cast_to<int32>();
-    for (int i = 0; i < M; ++i) {
-      if (px + i < ConfigT::OUT_W / 2)
-        merge(out + ((py * (ConfigT::OUT_W / 2) + px + i) * ConfigT::NB + nb) * SA,
-              aie::shuffle_down(pair, PIXEL_WORDS * i)
-                  .template extract<SA * sizeof(pool_t) / 4>(0)
-                  .template cast_to<pool_t>());
+  return aie::max(aie::filter_even(words, PIXEL_WORDS).template cast_to<pool_t>(),
+                  aie::filter_odd(words, PIXEL_WORDS).template cast_to<pool_t>());
+}
+
+// The max identity a pool window starts from: 0 under a fused ReLU, which the max then applies.
+template<typename ConfigT, typename T = conv2d_pool_t<ConfigT>>
+__attribute__((always_inline)) static inline aie::vector<T, ConfigT::M * 8> conv2d_pool_init()
+{
+  return aie::broadcast<T, ConfigT::M * 8>(ConfigT::USE_RELU ? T(0) : std::numeric_limits<T>::lowest());
+}
+
+// A pooled frame: the kernel fills it with the identity, then merges each row into it as it goes.
+template<typename ConfigT>
+static inline void conv2d_pool_fill(typename ConfigT::result_t* out)
+{
+  using result_t = typename ConfigT::result_t;
+  const auto identity = conv2d_pool_init<ConfigT, result_t>();
+  for (int nb = 0; nb < ConfigT::NB; ++nb)
+    for (int py = 0; py < conv2d_rows<ConfigT> / 2; ++py) {
+      result_t* row = out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + py) * ConfigT::OUT_COLS +
+                             ConfigT::OUT_ORIGIN_C) * 8;
+      for (int px = 0; px < ConfigT::OUT_W_COMPUTED / 2; px += ConfigT::M) aie::store_v(row + px * 8, identity);
     }
+}
+
+template<typename ConfigT, typename MMUL>
+static inline void conv2d_merge_pooled(typename ConfigT::result_t* out, int oy, int x, int nb, MMUL& lo, MMUL& hi)
+{
+  using result_t = typename ConfigT::result_t;
+  using pool_t = conv2d_pool_t<ConfigT>;
+  constexpr int SA = ConfigT::M * 8;
+  result_t* o = out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + oy / 2) * ConfigT::OUT_COLS +
+                       ConfigT::OUT_ORIGIN_C + x / 2) * 8;
+  const auto have = aie::load_v<SA>(o);
+  if constexpr (std::is_same_v<pool_t, result_t>) {
+    aie::store_v(o, aie::max(conv2d_pool_row<ConfigT>(lo, hi), have));
   } else {
-    merge(out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + py) * ConfigT::OUT_COLS +
-                 ConfigT::OUT_ORIGIN_C + px) * 8,
-          pooled);
+    const auto merged = aie::max(conv2d_pool_row<ConfigT>(lo, hi), have.template unpack<pool_t>());
+    aie::store_v(o, merged.template pack<result_t>());
+  }
+}
+
+// A pooled flatten pools both rows of a window in registers, then stores M pixels of output block nb, pooled
+// row py, from pooled column px: each at row 0 of its M-row Dense LHS slot, the pad rows don't-care.
+template<typename ConfigT>
+static inline void conv2d_store_pooled(typename ConfigT::result_t* out, int py, int px, int nb,
+                                       aie::vector<conv2d_pool_t<ConfigT>, ConfigT::M * 8> pooled)
+{
+  using result_t = typename ConfigT::result_t;
+  constexpr int M = ConfigT::M, SA = M * 8, PIXEL_WORDS = 8 * sizeof(result_t) / 4;
+  aie::vector<result_t, SA> tile;
+  if constexpr (std::is_same_v<conv2d_pool_t<ConfigT>, result_t>)
+    tile = pooled;
+  else
+    tile = pooled.template pack<result_t>();
+  auto pair = aie::concat(tile, tile).template cast_to<int32>();
+  for (int i = 0; i < M; ++i) {
+    if (px + i < ConfigT::OUT_W / 2)
+      aie::store_v(out + ((py * (ConfigT::OUT_W / 2) + px + i) * ConfigT::NB + nb) * SA,
+                   aie::shuffle_down(pair, PIXEL_WORDS * i).template extract<SA * sizeof(result_t) / 4>(0)
+                       .template cast_to<result_t>());
   }
 }
 
@@ -171,14 +193,16 @@ static inline void conv2d_zero_border(typename ConfigT::data_t* frame) {
   constexpr int RC1 = std::min(ConfigT::IN_COLS, RC0 + ConfigT::OUT_W_COMPUTED + ConfigT::KW - 1);
   const auto z32 = aie::zeros<data_t, 32>();
   const auto z16 = aie::zeros<data_t, 16>();
+  // Border rows and image rows in loops of their own: a branch in the row loop keeps it from pipelining.
+  auto border_row = [&](data_t* row) __attribute__((always_inline)) {
+    for (int c = RC0 / 4 * 4; c < RC1; c += 4) aie::store_v(row + c * 8, z32);
+  };
   for (int cb = 0; cb < ConfigT::CB; ++cb) {
     data_t* block = frame + cb * G::CHB;
-    for (int r = 0; r < RR1; ++r) {
+    for (int r = 0; r < std::min(R0, RR1); ++r) border_row(block + r * G::RB);
+    for (int r = R1; r < RR1; ++r) border_row(block + r * G::RB);
+    for (int r = R0; r < std::min(R1, RR1); ++r) {
       data_t* row = block + r * G::RB;
-      if (r < R0 || r >= R1) {
-        for (int c = RC0 / 4 * 4; c < RC1; c += 4) aie::store_v(row + c * 8, z32);
-        continue;
-      }
       for (int c = RC0 / 2 * 2; c < C0; c += 2) aie::store_v(row + c * 8, z16);
       if constexpr (C1 % 2) {  // one block is not a vector, so it goes as words
         conv2d_word_t* const odd = reinterpret_cast<conv2d_word_t*>(row + C1 * 8);
@@ -211,114 +235,143 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
   using MMUL = aie::mmul<M, 8, 8, data_t, weight_t, acc_scalar_t>;
 
   if constexpr (ConfigT::FILLS_BORDER) conv2d_zero_border<ConfigT>(frame);
-  if constexpr (ConfigT::POOL && !CASC_OUT) conv2d_pool_fill<ConfigT>(out);
+  if constexpr (ConfigT::POOL && !ConfigT::FLATTEN && !CASC_OUT) conv2d_pool_fill<ConfigT>(out);
 
-  for (int oy = 0; oy < conv2d_rows<ConfigT>; ++oy) {
+  // A pooled flatten computes each register block for both rows of its pool windows in turn and pools them in
+  // registers; every kernel of its cascade walks the rows in that order, so the partial sums line up. A pooled
+  // frame merges row by row instead: a row loop that holds no pool state keeps its software pipelining.
+  constexpr bool PAIRS = ConfigT::POOL && ConfigT::FLATTEN;
+  constexpr int ROWS = PAIRS ? 2 : 1;
+  for (int oy0 = 0; oy0 < conv2d_rows<ConfigT>; oy0 += ROWS) {
     for (int z = 0; z < ConfigT::OUT_W_COMPUTED; z += MB * M) {
-      const data_t* pA = frame + oy * ConfigT::STRIDE_H * G::RB + z * 8;
       for (int j = 0; j < NB; j += 2) {
-        aie::vector<bias_t, M * 8> bb0, bb1;
-        if constexpr (!CASC_IN) {
-          aie::vector<bias_t, 8> b0 = aie::load_v<8>(bias + j * 8);
-          aie::vector<bias_t, 8> b1 = aie::load_v<8>(bias + (j + 1) * 8);
-          for (int m = 0; m < M; ++m) {
-            bb0.template insert<8>(m, b0);
-            bb1.template insert<8>(m, b1);
-          }
-        }
-        MMUL C00, C01, C10, C11, C20, C21, C30, C31;
-        if constexpr (CASC_IN) {
-          C00 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-          C01 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-          C10 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-          C11 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-          if constexpr (MB == 4) {
-            C20 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-            C21 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-            C30 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-            C31 = MMUL(readincr_v<MMUL::size_C>(inCascade));
-          }
-        } else {
-          C00 = bb0; C10 = bb0; C01 = bb1; C11 = bb1;
-          if constexpr (MB == 4) { C20 = bb0; C30 = bb0; C21 = bb1; C31 = bb1; }
-        }
-
-        const weight_t __aie_dm_resource_a* __restrict pB = (const weight_t __aie_dm_resource_a*)(wts + j * SB);
-        for (int t = 0; t < G::T; ++t)
-          chess_prepare_for_pipelining
+        [[maybe_unused]] aie::vector<conv2d_pool_t<ConfigT>, SA> p0, p1, p2, p3;
+        if constexpr (PAIRS) p0 = p1 = p2 = p3 = conv2d_pool_init<ConfigT>();
+        for (int dy = 0; dy < ROWS; ++dy)
+          chess_flatten_loop
         {
-          const data_t __aie_dm_resource_b* __restrict a = (const data_t __aie_dm_resource_b*)(pA + G::TBL.off[t]);
-          aie::vector<weight_t, SB> B0 = aie::load_v<SB>(pB);
-          aie::vector<weight_t, SB> B1 = aie::load_v<SB>(pB + SB);
-          pB += NBP * SB;
-          if constexpr (MB == 2) {
-            aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, 8);
-            aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
-            aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
-            C00.mac(A0, B0); C01.mac(A0, B1); C10.mac(A1, B0); C11.mac(A1, B1);
-          } else {
-            aie::vector<data_t, 4 * SA> w;
-            if constexpr (4 * SA <= 64) {
-              w = aie::load_unaligned_v<4 * SA>(a, 8);
-            } else {
-              for (int q = 0; q < 4 * SA / 64; ++q) w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, 8));
+          const int oy = oy0 + dy;
+          const data_t* pA = frame + oy * ConfigT::STRIDE_H * G::RB + z * 8;
+          aie::vector<bias_t, M * 8> bb0, bb1;
+          if constexpr (!CASC_IN) {
+            aie::vector<bias_t, 8> b0 = aie::load_v<8>(bias + j * 8);
+            aie::vector<bias_t, 8> b1 = aie::load_v<8>(bias + (j + 1) * 8);
+            for (int m = 0; m < M; ++m) {
+              bb0.template insert<8>(m, b0);
+              bb1.template insert<8>(m, b1);
             }
-            aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
-            aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
-            aie::vector<data_t, SA> A2 = w.template extract<SA>(2);
-            aie::vector<data_t, SA> A3 = w.template extract<SA>(3);
-            C00.mac(A0, B0); C01.mac(A0, B1); C10.mac(A1, B0); C11.mac(A1, B1);
-            C20.mac(A2, B0); C21.mac(A2, B1); C30.mac(A3, B0); C31.mac(A3, B1);
+          }
+          MMUL C00, C01, C10, C11, C20, C21, C30, C31;
+          if constexpr (CASC_IN) {
+            C00 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+            C01 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+            C10 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+            C11 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+            if constexpr (MB == 4) {
+              C20 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+              C21 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+              C30 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+              C31 = MMUL(readincr_v<MMUL::size_C>(inCascade));
+            }
+          } else {
+            C00 = bb0; C10 = bb0; C01 = bb1; C11 = bb1;
+            if constexpr (MB == 4) { C20 = bb0; C30 = bb0; C21 = bb1; C31 = bb1; }
+          }
+
+          const weight_t __aie_dm_resource_a* __restrict pB = (const weight_t __aie_dm_resource_a*)(wts + j * SB);
+          for (int t = 0; t < G::T; ++t)
+            chess_prepare_for_pipelining
+          {
+            const data_t __aie_dm_resource_b* __restrict a = (const data_t __aie_dm_resource_b*)(pA + G::TBL.off[t]);
+            aie::vector<weight_t, SB> B0 = aie::load_v<SB>(pB);
+            aie::vector<weight_t, SB> B1 = aie::load_v<SB>(pB + SB);
+            pB += NBP * SB;
+            if constexpr (MB == 2) {
+              aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, 8);
+              aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
+              aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
+              C00.mac(A0, B0); C01.mac(A0, B1); C10.mac(A1, B0); C11.mac(A1, B1);
+            } else {
+              aie::vector<data_t, 4 * SA> w;
+              if constexpr (4 * SA <= 64) {
+                w = aie::load_unaligned_v<4 * SA>(a, 8);
+              } else {
+                for (int q = 0; q < 4 * SA / 64; ++q)
+                  w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, 8));
+              }
+              aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
+              aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
+              aie::vector<data_t, SA> A2 = w.template extract<SA>(2);
+              aie::vector<data_t, SA> A3 = w.template extract<SA>(3);
+              C00.mac(A0, B0); C01.mac(A0, B1); C10.mac(A1, B0); C11.mac(A1, B1);
+              C20.mac(A2, B0); C21.mac(A2, B1); C30.mac(A3, B0); C31.mac(A3, B1);
+            }
+          }
+
+          if constexpr (CASC_OUT) {
+            writeincr(outCascade, C00.to_accum());
+            writeincr(outCascade, C01.to_accum());
+            writeincr(outCascade, C10.to_accum());
+            writeincr(outCascade, C11.to_accum());
+            if constexpr (MB == 4) {
+              writeincr(outCascade, C20.to_accum());
+              writeincr(outCascade, C21.to_accum());
+              writeincr(outCascade, C30.to_accum());
+              writeincr(outCascade, C31.to_accum());
+            }
+          } else if constexpr (PAIRS) {
+            p0 = aie::max(p0, conv2d_pool_row<ConfigT>(C00, C10));
+            p1 = aie::max(p1, conv2d_pool_row<ConfigT>(C01, C11));
+            if constexpr (MB == 4) {
+              p2 = aie::max(p2, conv2d_pool_row<ConfigT>(C20, C30));
+              p3 = aie::max(p3, conv2d_pool_row<ConfigT>(C21, C31));
+            }
+          } else if constexpr (ConfigT::POOL) {
+            conv2d_merge_pooled<ConfigT>(out, oy, z, j, C00, C10);
+            if (j + 1 < NB) conv2d_merge_pooled<ConfigT>(out, oy, z, j + 1, C01, C11);
+            if constexpr (MB == 4) {
+              conv2d_merge_pooled<ConfigT>(out, oy, z + 2 * M, j, C20, C30);
+              if (j + 1 < NB) conv2d_merge_pooled<ConfigT>(out, oy, z + 2 * M, j + 1, C21, C31);
+            }
+          } else {
+            // Inlined: an outlined call would spill every accumulator it takes by reference (MLv2 outlines it).
+            auto store_tile = [&](int nb, int mm, MMUL& acc) __attribute__((always_inline)) {
+              if (nb >= NB) return;
+              aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
+              if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));
+              if constexpr (ConfigT::FLATTEN) {
+                // Dense LHS row: chunk (pixel, nb) sits at row 0 of its M-row slot; the pad rows are
+                // don't-care, so each pixel stores the tile rotated to start at itself.
+                auto pair = aie::concat(tile, tile).template cast_to<int32>();
+                for (int i = 0; i < M; ++i) {
+                  const int ox = z + mm * M + i;
+                  if (ox < ConfigT::OUT_W) {
+                    const int chunk = (oy * ConfigT::OUT_W + ox) * NB + nb;
+                    aie::store_v(out + chunk * SA,
+                                 aie::shuffle_down(pair, 2 * i).template extract<M * 2>(0)
+                                     .template cast_to<result_t>());
+                  }
+                }
+              } else {
+                result_t* o = out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + oy) * ConfigT::OUT_COLS +
+                                     ConfigT::OUT_ORIGIN_C + z + mm * M) * 8;
+                aie::store_v(o, tile);
+              }
+            };
+            store_tile(j, 0, C00); store_tile(j, 1, C10);
+            store_tile(j + 1, 0, C01); store_tile(j + 1, 1, C11);
+            if constexpr (MB == 4) {
+              store_tile(j, 2, C20); store_tile(j, 3, C30);
+              store_tile(j + 1, 2, C21); store_tile(j + 1, 3, C31);
+            }
           }
         }
-
-        if constexpr (CASC_OUT) {
-          writeincr(outCascade, C00.to_accum());
-          writeincr(outCascade, C01.to_accum());
-          writeincr(outCascade, C10.to_accum());
-          writeincr(outCascade, C11.to_accum());
+        if constexpr (PAIRS && !CASC_OUT) {
+          conv2d_store_pooled<ConfigT>(out, oy0 / 2, z / 2, j, p0);
+          if (j + 1 < NB) conv2d_store_pooled<ConfigT>(out, oy0 / 2, z / 2, j + 1, p1);
           if constexpr (MB == 4) {
-            writeincr(outCascade, C20.to_accum());
-            writeincr(outCascade, C21.to_accum());
-            writeincr(outCascade, C30.to_accum());
-            writeincr(outCascade, C31.to_accum());
-          }
-        } else if constexpr (ConfigT::POOL) {
-          conv2d_store_pooled<ConfigT>(out, oy, z, j, C00, C10);
-          if (j + 1 < NB) conv2d_store_pooled<ConfigT>(out, oy, z, j + 1, C01, C11);
-          if constexpr (MB == 4) {
-            conv2d_store_pooled<ConfigT>(out, oy, z + 2 * M, j, C20, C30);
-            if (j + 1 < NB) conv2d_store_pooled<ConfigT>(out, oy, z + 2 * M, j + 1, C21, C31);
-          }
-        } else {
-          // Inlined: an outlined call would spill every accumulator it takes by reference (MLv2 outlines it).
-          auto store_tile = [&](int nb, int mm, MMUL& acc) __attribute__((always_inline)) {
-            if (nb >= NB) return;
-            aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
-            if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));
-            if constexpr (ConfigT::FLATTEN) {
-              // Dense LHS row: chunk (pixel, nb) sits at row 0 of its M-row slot; the pad rows are
-              // don't-care, so each pixel stores the tile rotated to start at itself.
-              auto pair = aie::concat(tile, tile).template cast_to<int32>();
-              for (int i = 0; i < M; ++i) {
-                const int ox = z + mm * M + i;
-                if (ox < ConfigT::OUT_W) {
-                  const int chunk = (oy * ConfigT::OUT_W + ox) * NB + nb;
-                  aie::store_v(out + chunk * SA,
-                               aie::shuffle_down(pair, 2 * i).template extract<M * 2>(0).template cast_to<result_t>());
-                }
-              }
-            } else {
-              result_t* o = out + ((nb * ConfigT::OUT_ROWS + ConfigT::OUT_ORIGIN_R + oy) * ConfigT::OUT_COLS +
-                                   ConfigT::OUT_ORIGIN_C + z + mm * M) * 8;
-              aie::store_v(o, tile);
-            }
-          };
-          store_tile(j, 0, C00); store_tile(j, 1, C10);
-          store_tile(j + 1, 0, C01); store_tile(j + 1, 1, C11);
-          if constexpr (MB == 4) {
-            store_tile(j, 2, C20); store_tile(j, 3, C30);
-            store_tile(j + 1, 2, C21); store_tile(j + 1, 3, C31);
+            conv2d_store_pooled<ConfigT>(out, oy0 / 2, z / 2 + M, j, p2);
+            if (j + 1 < NB) conv2d_store_pooled<ConfigT>(out, oy0 / 2, z / 2 + M, j + 1, p3);
           }
         }
       }
