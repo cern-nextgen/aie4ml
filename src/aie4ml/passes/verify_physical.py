@@ -9,11 +9,17 @@ DMA access pattern.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 
+from ..errors import ConfigRefused
 from ..ir import get_backend_context
+from ..op_impls.common_types import PORT_KIND_BUFFER
 from .base import AIEPass
 from .shared_buffer import SHARED_MEMORY, location_problem, pinned_locations, static_problem
+from .transport.dma_resources import memtile_port_bds, pool_use, tile_port_bds
 from .utils import sanitize_identifier
+
+KERNEL_BUFFERS = 2  # a kernel's DMA-fed buffer port is double-buffered
 
 _PORT = re.compile(r'^(?P<graph>\w+)\.(?P<group>\w+)\[(?P<port>\d+)\]$')
 
@@ -85,10 +91,69 @@ def verify_physical(ctx) -> None:
                     raise RuntimeError(f'{leg["source"]} -> {leg["target"]}: must be shared memory, but {problem}.')
 
 
+def verify_dma_resources(ctx) -> None:
+    """Every DMA's BDs within its pools: each memory-tile shared buffer on its tile's pools, each compute tile's
+    DMA-fed buffer ports on the tile that holds the buffer."""
+    device, plan = ctx.device, ctx.ir.physical.plan
+    dma = device.memtile_dma
+    for buffer in plan.get('buffers', ()):
+        if dma is None:
+            raise RuntimeError(
+                f"{buffer['name']}: a memory-tile buffer on {device.platform}, which has no memory tile."
+            )
+        count = int(buffer['num_buffers'])
+        writers = [
+            memtile_port_bds(w['descriptor'], count, device.generation, buffer['name']) for w in buffer['writers']
+        ]
+        readers = [
+            memtile_port_bds(r['descriptor'], count, device.generation, buffer['name']) for r in buffer['readers']
+        ]
+        pools = [w + r for w, r in zip(pool_use(writers, dma), pool_use(readers, dma))]
+        if max(pools) > dma.bds // dma.bd_pools:
+            raise ConfigRefused(
+                f"{buffer['name']}: its {len(writers)} writers and {len(readers)} readers need {pools} BDs from a "
+                f'memory tile whose pools hold {dma.bds // dma.bd_pools} each.'
+            )
+
+    if device.tile_dma.dimensions < 3:
+        return  # AIE1's 2-D BDs fold loops by offset and increment in ways not modelled yet
+    graphs = {sanitize_identifier(inst.name): inst for inst in ctx.ir.execution}
+    shared = set()
+    for edge in plan.get('direct_edges', ()):
+        if edge.get('realization') == SHARED_MEMORY:
+            shared |= {edge['source'], edge['target']}
+    accesses = {
+        a['endpoint']: a['descriptor']
+        for key in ('kernel_read_accesses', 'kernel_write_accesses')
+        for a in plan.get(key, ())
+    }
+    used = defaultdict(int)
+    for name, inst in graphs.items():
+        for direction in ('inputs', 'outputs'):
+            for binding in getattr(inst.ports, direction).values():
+                if binding.kind != PORT_KIND_BUFFER:
+                    continue
+                for port, endpoints in enumerate(binding.endpoints):
+                    if f'{name}.{binding.group}[{port}]' in shared:
+                        continue
+                    owners = sorted({(col, row) for col, row, _ in _pinned(ctx, inst, binding.group, port)})
+                    if len(owners) not in (1, len(endpoints)):
+                        raise RuntimeError(f'{name}.{binding.group}[{port}]: its buffers sit on {owners}.')
+                    for index, endpoint in enumerate(endpoints):
+                        where = f'{name}.{endpoint}'
+                        owner = owners[0] if len(owners) == 1 else owners[index]
+                        used[owner] += tile_port_bds(accesses.get(where), KERNEL_BUFFERS, device.tile_dma)
+    for owner, bds in used.items():
+        if bds > device.tile_dma.bds:
+            raise ConfigRefused(f'tile {owner}: its DMA needs {bds} BDs, beyond its {device.tile_dma.bds}.')
+
+
 class VerifyPhysicalPlan(AIEPass):
     def __init__(self):
         self.name = 'verify_physical_plan'
 
     def transform(self, model_or_ctx) -> bool:
-        verify_physical(get_backend_context(model_or_ctx))
+        ctx = get_backend_context(model_or_ctx)
+        verify_physical(ctx)
+        verify_dma_resources(ctx)
         return False

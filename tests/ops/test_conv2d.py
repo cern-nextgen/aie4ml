@@ -1145,3 +1145,23 @@ def test_int16_conv_matches_onnx(tmp_path, part):
         iterations=2,
         per_iteration=True,
     )
+
+
+@pytest.mark.parametrize('contract', ['inner', 'outer'])
+def test_a_memory_tile_serves_only_the_readers_its_buffer_descriptors_cover(tmp_path, contract):
+    """A flattened row read by a Dense cascade crosses a memory tile that zero-fills each reader's padded rows: 8 BDs
+    a reader, from 24-BD pools the even and the odd channels each share. Four readers fit beside the writer; eight
+    would need a relay stage."""
+    nodes, inits = [], []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a1', 'c1', CIN, 8, 3, pad=1, relu=True, seed=1)
+    _head(nodes, inits, 'a1', H * W * 8, seed=3)
+    model = _model('bd_head', nodes, inits)
+    held = {'c1': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}
+    split = {'cas_num': 1, 'contract': contract}
+    ctx = lower(model, tmp_path / 'four', {**held, 'fc': {'parallelism': {**split, 'cas_length': 4}}})
+    assert [
+        len(b['readers']) for b in ctx.ir.physical.plan['buffers'] if b['writers'][0]['source'].startswith('c1')
+    ] == [4]
+    with pytest.raises(ConfigRefused, match=r'1 writers and 8 readers need \[36, 32\] BDs'):
+        lower(model, tmp_path / 'eight', {**held, 'fc': {'parallelism': {**split, 'cas_length': 8}}})

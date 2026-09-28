@@ -18,7 +18,10 @@
       "MaxMemTileOutPorts": 0,
       "CascadeLayout": "alternating_horizontal",
       "PLIOWidthBits": 128,
-      "StoreBytes": 32
+      "StoreBytes": 32,
+      "Dma": {
+        "Tile": {"Bds": 16, "BdPools": 1, "Dimensions": 2, "ZeroPadding": false}
+      }
     },
     "AIE-ML": {
       "VectorBytes": 64,
@@ -38,7 +41,11 @@
       "MaxMemTileOutPorts": 8,
       "CascadeLayout": "uniform_right",
       "PLIOWidthBits": 128,
-      "StoreBytes": 32
+      "StoreBytes": 32,
+      "Dma": {
+        "Tile": {"Bds": 16, "BdPools": 1, "Dimensions": 3, "ZeroPadding": false},
+        "MemTile": {"Bds": 48, "BdPools": 2, "Dimensions": 4, "ZeroPadding": true}
+      }
     },
     "AIE-MLV2": {
       "VectorBytes": 64,
@@ -58,7 +65,11 @@
       "MaxMemTileOutPorts": 8,
       "CascadeLayout": "uniform_right",
       "PLIOWidthBits": 128,
-      "StoreBytes": 64
+      "StoreBytes": 64,
+      "Dma": {
+        "Tile": {"Bds": 16, "BdPools": 1, "Dimensions": 3, "ZeroPadding": false},
+        "MemTile": {"Bds": 48, "BdPools": 2, "Dimensions": 4, "ZeroPadding": true}
+      }
     }
   },
   "parts": {

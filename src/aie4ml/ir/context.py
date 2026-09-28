@@ -36,6 +36,17 @@ class RamPool:
     width_bits: int
 
 
+@dataclass(frozen=True)
+class DmaSpec:
+    """One kind of DMA, as its architecture manual documents it: its buffer descriptors, split into pools by
+    channel parity when `bd_pools` is 2, the axes one BD walks, and whether it fills zeros past the data."""
+
+    bds: int
+    bd_pools: int
+    dimensions: int
+    zero_padding: bool
+
+
 @dataclass
 class DeviceSpec:
     """Model-level device specification published to passes: the facts aie_devices.json gives for a platform
@@ -72,6 +83,8 @@ class DeviceSpec:
     # PLMemory selects.
     uram: Optional[RamPool]
     bram: Optional[RamPool]
+    tile_dma: DmaSpec
+    memtile_dma: Optional[DmaSpec]  # None without memory tiles
 
     @classmethod
     def from_config(cls, platform: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
@@ -89,6 +102,14 @@ class DeviceSpec:
         fifos = [key in cfg for key in ('CascadeOutputFifoDepth', 'CascadeInputFifoDepth')]
         if any(fifos) and not all(fifos):
             raise KeyError(f'Device {platform!r} gives one cascade FIFO depth without the other.')
+
+        def dma(entry: Dict[str, Any]) -> DmaSpec:
+            return DmaSpec(
+                bds=int(require(entry, 'Bds')),
+                bd_pools=int(require(entry, 'BdPools')),
+                dimensions=int(require(entry, 'Dimensions')),
+                zero_padding=bool(require(entry, 'ZeroPadding')),
+            )
 
         def pool(key: str) -> Optional[RamPool]:
             if key not in cfg:
@@ -129,6 +150,8 @@ class DeviceSpec:
             aie_compiler_target=compiler_target,
             uram=pool('UltraRAM'),
             bram=pool('BlockRAM'),
+            tile_dma=dma(require(require(cfg, 'Dma'), 'Tile')),
+            memtile_dma=dma(cfg['Dma']['MemTile']) if 'MemTile' in cfg['Dma'] else None,
         )
 
 

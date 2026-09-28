@@ -62,7 +62,7 @@ def _build_qkeras_mlp(qkeras, input_shape, in_features, hidden1, hidden2, out_fe
     return model
 
 
-def _make_cfg(hls4ml, model, layer_parallelism):
+def _make_cfg(hls4ml, model, layer_parallelism, io_route=None):
     cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
     cfg.setdefault('LayerName', {})
 
@@ -70,6 +70,8 @@ def _make_cfg(hls4ml, model, layer_parallelism):
         cfg['LayerName'].setdefault(lname, {})
         cfg['LayerName'][lname]['cas_num'] = int(params['cas_num'])
         cfg['LayerName'][lname]['cas_length'] = int(params['cas_length'])
+    for lname, route in (io_route or {}).items():
+        cfg['LayerName'][lname]['io_route'] = route
 
     return cfg
 
@@ -87,7 +89,7 @@ def _make_aie_model(tmp_path, cfg_dict, input_shape):
         bits=cfg_dict['bits'],
     )
 
-    cfg = _make_cfg(hls4ml, qmodel, cfg_dict['layers'])
+    cfg = _make_cfg(hls4ml, qmodel, cfg_dict['layers'], cfg_dict.get('io_route'))
 
     tag = '1d' if len(input_shape) == 1 else f'nd{len(input_shape)}'
     outdir = tmp_path / (f"aie_mlp_b{cfg_dict['bits']}_bs{cfg_dict['batch']}_{_par_summary(cfg_dict['layers'])}_{tag}")
@@ -114,12 +116,14 @@ CFG_LIST = [
             'dense1': {'cas_num': 1, 'cas_length': 4},
             'dense2': {'cas_num': 1, 'cas_length': 1},
         },
+        # through a memory tile that zero-fills each reader's padded rows: both BD pools exactly full
+        'io_route': {'dense0': {'inputs': {'layer2_out': 'memtile'}}},
     },
     {
         'bits': 8,
-        'batch': 10,
+        'batch': 10,  # 10 of 16 rows: each memory tile between the layers zero-fills its readers' padded rows
         'layers': {
-            'dense0': {'cas_num': 2, 'cas_length': 4},
+            'dense0': {'cas_num': 1, 'cas_length': 8},
             'dense1': {'cas_num': 2, 'cas_length': 2},
             'dense2': {'cas_num': 1, 'cas_length': 2},
         },
