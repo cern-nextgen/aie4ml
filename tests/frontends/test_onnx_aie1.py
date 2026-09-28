@@ -365,7 +365,10 @@ def test_aie_mlv2_int16_dense_takes_a_dense_acc64_shape(tmp_path):
 )
 def test_a_graph_output_off_a_memory_tile_moves_whole_words(tmp_path, part):
     """10 int8 features end mid-word: the memory tile reads each row as 12 and the host trims."""
-    plan = _run_pipeline(_dense_model(out_features=10), tmp_path, part=part).context.ir.physical.plan
+    directives = {'dense': {'io_route': {'outputs': {'y': 'memtile'}}}}
+    plan = _run_pipeline(
+        _dense_model(out_features=10), tmp_path, part=part, directives=directives
+    ).context.ir.physical.plan
     (out,) = [p for p in plan['io_ports'] if p['direction'] == 'output']
     assert out['descriptor']['io_boundary_dimension'][0] == 10
     assert out['descriptor']['tiling_dimension'][0] == out['descriptor']['boundary_dimension'][0] == 12
@@ -378,8 +381,9 @@ def test_a_graph_output_off_a_memory_tile_moves_whole_words(tmp_path, part):
 def test_every_output_port_reads_its_slice_inside_the_dma_boundary(tmp_path, part):
     """A memory tile's DMA zero-fills past its boundary, a buffer coordinate: the second of two output chains starts
     mid-buffer, and its slice must still lie inside."""
+    directives = {'dense': {'parallelism': {'cas_num': 2}, 'io_route': {'outputs': {'y': 'memtile'}}}}
     plan = _run_pipeline(
-        _dense_model(out_features=64), tmp_path, part=part, directives={'dense': {'parallelism': {'cas_num': 2}}}
+        _dense_model(out_features=64), tmp_path, part=part, directives=directives
     ).context.ir.physical.plan
     outs = [p['descriptor'] for p in plan['io_ports'] if p['direction'] == 'output']
     assert len(outs) == 2
@@ -737,17 +741,17 @@ def test_aie1_staging_mismatch_requires_an_explicit_relayout(tmp_path):
         )
 
 
-def test_memtile_device_keeps_default_boundaries_and_publishes_io_ports(tmp_path):
-    aie_model = _run_pipeline(
-        _dense_model(),
-        tmp_path,
-        part='xilinx_vek280_base_202610_1',
-        project='aieml_dense',
-    )
-    plan = aie_model.context.ir.physical.plan
-
-    assert len(plan['buffers']) == 2
+def test_memtile_device_takes_boundaries_direct_unless_an_input_needs_zero_padding(tmp_path):
+    """The tile's DMA moves only the logical rows; a memory tile would stream the padding rows it zero-fills. An
+    input padded along the axis it is summed over needs real zeros, which only a memory tile writes."""
+    plan = _run_pipeline(_dense_model(), tmp_path / 'rows', part='xilinx_vek280_base_202610_1').context.ir.physical.plan
+    assert plan['buffers'] == []
     assert [(port['direction'], port['port']) for port in plan['io_ports']] == [('input', 0), ('output', 0)]
+
+    plan = _run_pipeline(
+        _dense_model(in_features=12), tmp_path / 'inner', part='xilinx_vek280_base_202610_1'
+    ).context.ir.physical.plan
+    assert [buffer['tensor'] for buffer in plan['buffers']] == ['x_q']
 
 
 def test_direct_padded_output_uses_dma_projection(tmp_path):

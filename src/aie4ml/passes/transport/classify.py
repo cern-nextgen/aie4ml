@@ -3,7 +3,10 @@ from __future__ import annotations
 from ...errors import ConfigRefused
 from ...ir import get_backend_context
 from ...ir.graph import ROUTE_MODES
+from ...op_impls.utils.tensor_view import staging_tile_shape
 from ..base import AIEPass
+from .boundary import direct_boundary_access
+from .descriptors import rebase_descriptor_offset
 from .legality import direct_transport_failure, memtile_staging_failure, uses_stream
 from .model import Connection, TransportDecision
 
@@ -67,7 +70,12 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
     if is_boundary:
         if route == 'memtile' and not has_memtile:
             raise ConfigRefused(f'{tensor}: io_route=memtile requested on a device without memory tiles.')
-        realization = 'direct' if route == 'direct' or (route == 'auto' and not can_memtile) else 'memtile'
+        if route == 'direct' or not can_memtile:
+            realization = 'direct'
+        elif route == 'memtile':
+            realization = 'memtile'
+        else:  # a memory tile adds a stage and streams the padding it zero-fills; take it only where it must
+            realization = 'direct' if _direct_boundary_failure(leg, execution) is None else 'memtile'
         return TransportDecision(realization, True if realization == 'direct' else None)
 
     direct_failure = _direct_failure(leg, execution)
@@ -94,6 +102,34 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
         else:
             realization = 'memtile'
     return TransportDecision(realization, staging_compatible)
+
+
+def _direct_boundary_failure(leg: Connection, execution) -> str | None:
+    """Why a PLIO cannot feed or drain this graph-boundary leg's kernel ports through the tile's own DMA, or None.
+    That DMA writes only the logical elements: padding rows may hold anything, since no row reads another, but an
+    input padded along its inner axis is summed across it, so only a memory tile, which zero-fills, may feed it."""
+    output = leg.consumer is None
+    endpoint = leg.producer if output else leg.consumer
+    inst = execution.get(endpoint.node.name)
+    if output:
+        binding, element = inst.ports.outputs[endpoint.tensor], inst.variant.output_precision(inst.config)
+    else:
+        role = inst.input(endpoint.tensor).role
+        binding, element = inst.ports.inputs[endpoint.tensor], inst.variant.input_precision(inst.config, role)
+    for port in endpoint.selected_ports(binding.count):
+        if output:
+            staging = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, port, None)
+        else:
+            staging = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, port, None, None)
+            rebase_descriptor_offset(staging, endpoint.offset_base)
+            inner = int(staging['inner_dimension'])
+            if int(staging['io_tiling_dimension'][inner]) < staging_tile_shape(staging)[inner]:
+                return f'{endpoint.node.name}.{endpoint.group} pads its inner axis'
+        try:
+            direct_boundary_access(staging, staging['io_tiling_dimension'], element_bits=element.width, output=output)
+        except ConfigRefused as refusal:
+            return str(refusal)
+    return None
 
 
 def _direct_failure(leg: Connection, execution) -> str | None:

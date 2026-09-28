@@ -540,7 +540,8 @@ def test_a_graph_output_off_a_memory_tile_moves_whole_plio_beats(tmp_path, part)
     _start(nodes, inits)
     _conv(nodes, inits, 'x_nchw', 'a1', 'c1', CIN, 8, 3, pad=1, relu=True, seed=1)
     _head(nodes, inits, 'a1', H * W * 8, seed=3)
-    ctx = lower(_model('conv_beats', nodes, inits), tmp_path, {'c1': {'parallelism': {'cas_num': 1}}}, part=part)
+    directives = {'c1': {'parallelism': {'cas_num': 1}}, 'fc': {'io_route': {'outputs': {'y': 'memtile'}}}}
+    ctx = lower(_model('conv_beats', nodes, inits), tmp_path, directives, part=part)
     plan = ctx.ir.physical.plan
     assert [b['tensor'] for b in plan['buffers']] == ['y']
     out = next(p for p in plan['io_ports'] if p['direction'] == 'output')

@@ -113,9 +113,8 @@ def test_layout_conversions_count_toward_max_tiles(tmp_path, part):
 def test_every_leg_is_decided_as_transport_decides_it(tmp_path):
     """Boundary and kernel legs through a memory tile are counted as the built plan routes them, and a split view
     steers its producer to ports whose slices it can read without a directive."""
-    for model in (_dense_model(), _normalization_chain_model()):
-        ctx = lower(model, tmp_path / model.graph.name, part=PART, batch=8, aie_config={'Optimize': 'resource'})
-        assert ctx.ir.optimizer['memtile_legs'] == len(memtiles(ctx)) > 0
+    ctx = lower(_normalization_chain_model(), tmp_path / 'norm', part=MLV2_PART, batch=8)
+    assert ctx.ir.optimizer['memtile_legs'] == len(memtiles(ctx)) == 1  # the sum re-staged between two kernels
     ctx = lower(_split_model(), tmp_path / 'split', part=AIE1_PART, batch=8, aie_config={'Optimize': 'resource'})
     assert _splits(ctx)['root_aie'].contract == 'outer' and _splits(ctx)['root_aie'].cas_num == 2
 

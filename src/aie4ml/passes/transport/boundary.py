@@ -1,11 +1,30 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List
+from math import prod
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ...op_impls.common_types import PORT_KIND_STREAM
-from ...op_impls.utils import STORAGE_LAYOUT_LINEAR
-from .descriptors import rebase_descriptor_offset
+from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, STORAGE_LAYOUT_MICROTILED
+from ...op_impls.utils.tensor_view import staging_tile_shape
+from .descriptors import boundary_access_descriptor, localize_descriptor, rebase_descriptor_offset
+
+
+def direct_boundary_access(
+    port_staging: Dict[str, Any], io_tiling: Sequence[int], *, element_bits: int, output: bool
+) -> Tuple[Dict[str, Any], Optional[List[int]]]:
+    """The kernel-side DMA access of one port of a direct PLIO leg, and the shape the PLIO carries per iteration
+    when it differs from `io_tiling`. The tile DMA moves only the logical elements; ConfigRefused where it cannot
+    walk the port's layout, which then only a memory tile can re-stage."""
+    descriptor = copy.deepcopy(port_staging)
+    localize_descriptor(descriptor, [int(v) for v in descriptor['offset']], staging_tile_shape(descriptor))
+    padded = prod(staging_tile_shape(descriptor)) != prod(int(v) for v in io_tiling)
+    descriptor = boundary_access_descriptor(
+        descriptor,
+        element_bits=int(element_bits),
+        project_to_io_boundary=padded and (output or descriptor.get('storage_layout') == STORAGE_LAYOUT_MICROTILED),
+    )
+    return descriptor, descriptor.pop('transfer_shape', None)
 
 
 def graph_input_port_descs(entry, ctx, port_base: int) -> Dict[int, Dict[str, Any]]:

@@ -5,6 +5,7 @@ from typing import Any, Dict, MutableMapping, Sequence
 
 import numpy as np
 
+from ...errors import ConfigRefused
 from ...op_impls.utils import (
     STORAGE_LAYOUT_INNER_BLOCKED,
     STORAGE_LAYOUT_LINEAR,
@@ -58,23 +59,23 @@ def boundary_access_descriptor(
         return copy.deepcopy(base)
     if storage_layout == STORAGE_LAYOUT_INNER_BLOCKED:
         if project_to_io_boundary:
-            raise NotImplementedError('A blocked frame is transferred whole; the host trims it.')
+            raise ConfigRefused('A blocked frame is transferred whole; the host trims it.')
         return _inner_blocked_access_descriptor(base, int(element_bits))
     if storage_layout != STORAGE_LAYOUT_MICROTILED:
-        raise NotImplementedError(f'No boundary DMA lowering for storage_layout {storage_layout!r}.')
+        raise ConfigRefused(f'No boundary DMA lowering for storage_layout {storage_layout!r}.')
 
     dimensions = [int(value) for value in base['buffer_dimension']]
     tile = [int(value) for value in base['tiling_dimension']]
     if len(dimensions) != 2 or len(tile) != 2:
-        raise NotImplementedError('Microtiled boundary DMA requires a 2-D kernel buffer.')
+        raise ConfigRefused('Microtiled boundary DMA requires a 2-D kernel buffer.')
 
     inner = int(base['inner_dimension'])
     outer = int(base['outer_dimension'])
     microtile_inner = tile[inner]
     microtile_outer = tile[outer]
     if inner != 0 or outer != 1 or any(int(value) != 0 for value in base['offset']):
-        raise NotImplementedError('Microtiled boundary DMA requires a local, inner-contiguous buffer.')
-    if microtile_outer == 1:
+        raise ConfigRefused('Microtiled boundary DMA requires a local, inner-contiguous buffer.')
+    if microtile_outer == 1 and not project_to_io_boundary:
         return copy.deepcopy(base)
 
     inner_extent, outer_extent = dimensions
@@ -91,7 +92,7 @@ def boundary_access_descriptor(
     if project_to_io_boundary:
         io_boundary = [int(value) for value in base['io_boundary_dimension']]
         if len(io_boundary) != 2:
-            raise NotImplementedError('Direct boundary DMA projection requires a 2-D IO boundary.')
+            raise ConfigRefused('Direct boundary DMA projection requires a 2-D IO boundary.')
         io_inner, io_outer = io_boundary
         if io_inner > inner_extent or io_outer > outer_extent:
             raise ValueError(
@@ -99,7 +100,7 @@ def boundary_access_descriptor(
                 f'{(io_outer, io_inner)}.'
             )
         if io_outer > microtile_outer and io_outer % microtile_outer:
-            raise NotImplementedError(
+            raise ConfigRefused(
                 f'Direct boundary DMA cannot project {io_outer} rows from microtile rows of {microtile_outer}; '
                 'rows must fill whole microtiles or fewer than one.'
             )
@@ -139,9 +140,9 @@ def _inner_blocked_access_descriptor(base: Dict[str, Any], element_bits: int) ->
     block = int(base['tiling_dimension'][inner])
     wraps = {int(step['dimension']): int(step['wrap']) for step in base.get('tile_traversal', ())}
     if any(int(value) != 0 for dim, value in enumerate(base['offset']) if dim != inner):
-        raise NotImplementedError('Inner-blocked boundary DMA transfers whole non-inner axes.')
+        raise ConfigRefused('Inner-blocked boundary DMA transfers whole non-inner axes.')
     if block * wraps.get(inner, 1) != block:
-        raise NotImplementedError(
+        raise ConfigRefused(
             f'Inner-blocked boundary staging spans {wraps.get(inner, 1)} blocks of {block}; this boundary '
             'lowering transfers one block per port. Split the axis across ports, or add a boundary '
             'layout that interleaves the blocks.'
@@ -160,7 +161,7 @@ def _inner_blocked_access_descriptor(base: Dict[str, Any], element_bits: int) ->
             traversal.append({'dimension': dim, 'stride': 1, 'wrap': int(dims[dim])})
     over = [step for step in traversal if step['wrap'] > BD_MAX_WRAP]
     if over or int(np.prod(chunk)) * element_bits // BD_WORD_BITS > BD_MAX_WRAP:
-        raise NotImplementedError(
+        raise ConfigRefused(
             f"An inner-blocked boundary transfer of {dims} needs a descriptor beyond a BD's {BD_MAX_WRAP} "
             'steps; split the tensor across ports.'
         )
