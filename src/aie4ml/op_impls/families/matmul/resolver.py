@@ -202,12 +202,17 @@ def _partition_ranges(node, device, microtiling: MatmulMicrotileConfig, contract
     return range(1, max_chains + 1), range(1, max_lengths + 1)
 
 
+def _rows_span_axes(lhs_shape) -> bool:
+    """Whether the rows an 'outer' split divides span more than one axis: a leading axis longer than one."""
+    return any(int(dim) > 1 for dim in lhs_shape[:-2])
+
+
 def matmul_parallelism_candidates(node, device) -> tuple[Dict[str, Any], ...]:
     """Every (contract, cas_num, cas_length) the tiling search would try under any microtile the precision allows;
     whether one fits is the tiling's to decide."""
     precision, _ = resolve_operand_precision(node, device)
-    rank = len(view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs'))
-    contracts = sorted(STAGING_CONTRACTS) if rank <= 2 else ['inner']  # rows of a rank-3 input span its leading axes
+    lhs_shape = view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')
+    contracts = ['inner'] if _rows_span_axes(lhs_shape) else sorted(STAGING_CONTRACTS)
     found = set()
     for m, k, n in _supported_microtile_options(device.generation, precision['lhs'], precision['rhs']):
         microtiling = MatmulMicrotileConfig(microtile_m=m, microtile_k=k, microtile_n=n)
@@ -230,10 +235,10 @@ def _resolve_parallelism(
     in_shape = lhs_shape[-1]
     out_shape = view_shape(node, node.outputs[0], 'outputs')[-1]
     cas_num, cas_length = int(parallel_cfg.get('cas_num', 1)), int(parallel_cfg.get('cas_length', 1))
-    if contract == 'outer' and len(lhs_shape) > 2:
+    if contract == 'outer' and _rows_span_axes(lhs_shape):
         raise ConfigRefused(
-            f"{node.name}: its rank-{len(lhs_shape)} input cannot be split by rows (contract 'outer'): the rows span "
-            'its leading axes.'
+            f"{node.name}: its input {tuple(lhs_shape)} cannot be split by rows (contract 'outer'): the rows span "
+            'more than one axis.'
         )
 
     lhs_bytes = element_bytes(precision['lhs'])
