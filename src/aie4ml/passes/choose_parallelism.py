@@ -64,8 +64,13 @@ class ChooseParallelism(AIEPass):
             raise ValueError(f'AIEConfig MaxTiles={max_tiles} must be positive.')
 
         ctx.ir.optimizer = {}  # a previous run's choice must not steer this one
+        print(
+            f"[aie4ml] Searching for a '{mode}' design within {max_tiles} AIE tiles; this can take a minute...",
+            flush=True,
+        )
         search = _Search(ctx, mode, max_tiles)
         design, built, trials = search.best_buildable()
+        print(f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {search.compared} compared.', flush=True)
         ctx.ir.optimizer = {
             'mode': mode,
             'max_tiles': max_tiles,
@@ -125,6 +130,7 @@ class _Search:
         self.truncated = False  # whether the program has discarded a design since last reset
         self._resolved: Dict[Any, Any] = {}
         self._memtile_legs: Dict[Any, Optional[int]] = {}
+        self.compared = 0  # distinct complete designs within the budget that best_buildable ranked
         self._contracts: Dict[int, Dict[str, Any]] = {}
         self._signatures: Dict[Tuple[int, str], str] = {}
 
@@ -271,8 +277,9 @@ class _Search:
         """The best-ranked design the rest of the pipeline builds, the context it was built in, and how many
         designs were tried."""
         bounds: List[Optional[int]] = [None]
+        complete = self.designs(None)  # resolves every option, so each one's work is known
+        self.compared = len({json.dumps(self.parallelism(design), sort_keys=True) for design in complete})
         if self.mode == 'performance':
-            self.designs(None)  # resolves every option, so each one's work is known
             bounds = sorted({resolved[2] for resolved in self._resolved.values() if resolved is not None})
             low, high = 0, len(bounds)  # designs exist from some bound on
             while low < high:
