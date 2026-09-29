@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -602,6 +604,13 @@ def report(model_or_path) -> 'Report':
     return collect_report(model_or_path)
 
 
+def layout(model_or_path):
+    """Load the emitted physical layout without compiling or profiling the project."""
+    from .report_layout import load_layout
+
+    return load_layout(_project_dir(model_or_path))
+
+
 def collect_report(model_or_path) -> 'Report':
     """Gather every available metric for a built AIE project."""
     project = _project_dir(model_or_path)
@@ -797,8 +806,26 @@ def format_report(report: Dict[str, Any]) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('project', type=Path, help='AIE project directory (the output_dir used to build it)')
-    parser.add_argument('--json', action='store_true', help='emit the raw report as JSON')
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument('--json', action='store_true', help='emit the raw report as JSON')
+    output.add_argument('--layout', action='store_true', help='show the emitted AIE placement and graph connections')
+    output.add_argument('--layout-svg', type=Path, metavar='FILE', help='write the emitted AIE layout as SVG')
     args = parser.parse_args(argv)
+    if args.layout or args.layout_svg is not None:
+        from .report_layout import format_svg_layout, format_terminal_layout, load_layout
+
+        try:
+            physical = load_layout(args.project)
+            if args.layout:
+                color = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
+                print(format_terminal_layout(physical, shutil.get_terminal_size((120, 24)).columns, color=color))
+            else:
+                args.layout_svg.write_text(format_svg_layout(physical))
+                print(args.layout_svg)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        return 0
     try:
         collected = report(args.project)
     except FileNotFoundError as exc:

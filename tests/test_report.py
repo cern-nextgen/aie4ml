@@ -4,6 +4,7 @@ import json
 
 import pytest
 from aie4ml.report import _aie_clock_ghz, _analyze_aie_out_interval
+from aie4ml.report_layout import format_svg_layout, format_terminal_layout, layout_from_pipeline
 
 
 def _pipeline(elements: int) -> dict:
@@ -21,6 +22,131 @@ def _pipeline(elements: int) -> dict:
             }
         }
     }
+
+
+def _layout_pipeline() -> dict:
+    def execution(name, variant, cas_num, cas_length):
+        return {
+            'node': name,
+            'op_type': 'test',
+            'variant_id': variant,
+            'config': {'parallelism': {'contract': 'inner', 'cas_num': cas_num, 'cas_length': cas_length}},
+        }
+
+    return {
+        'device': 'xcve2802-vsvh1760-2mp-e-s',
+        'execution': [
+            execution('conv_aie', 'conv2d.buffer.v1', 2, 2),
+            execution('dense_aie', 'dense.buffer.v1', 1, 2),
+            execution('head_aie', 'dense.buffer.v1', 1, 1),
+        ],
+        'physical': {
+            'placements': {
+                'conv_aie': {'col': 7, 'row': 0, 'width': 2, 'height': 2},
+                'dense_aie': {'col': 12, 'row': 1, 'width': 2, 'height': 1},
+                'head_aie': {'col': 20, 'row': 0, 'width': 1, 'height': 1},
+            },
+            'plan': {
+                'direct_edges': [
+                    {'source': 'ifm[0]', 'target': 'conv_aie.in[0]', 'tensor': 'x'},
+                    {
+                        'source': 'conv_aie.out[0]',
+                        'target': 'dense_aie.in[0]',
+                        'tensor': 'flat',
+                        'realization': 'shared_memory',
+                    },
+                    {
+                        'source': 'conv_aie.out[1]',
+                        'target': 'dense_aie.in[1]',
+                        'tensor': 'flat',
+                        'realization': 'dma',
+                    },
+                    {'source': 'head_aie.out[0]', 'target': 'ofm[0]', 'tensor': 'y'},
+                ],
+                'buffers': [
+                    {
+                        'name': 'buffer_hidden',
+                        'writers': [
+                            {
+                                'source_type': 'op_impl',
+                                'source_endpoint': {'op_impl': 'dense_aie'},
+                            }
+                        ],
+                        'readers': [
+                            {
+                                'target_type': 'op_impl',
+                                'target_endpoint': {'op_impl': 'head_aie'},
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+
+
+def test_layout_reports_splits_placement_and_graph_level_connections():
+    layout = layout_from_pipeline(_layout_pipeline())
+    rendered = format_terminal_layout(layout, terminal_width=44)
+
+    assert 'array columns 0-37, rows 0-7  |  7 of 304 tiles occupied (2.3%)' in rendered
+    assert 'columns 0-9' in rendered and 'columns 30-37' in rendered
+    assert '┌' in rendered and '┘' in rendered and '·' in rendered
+    assert 'conv_aie  conv2d.buffer.v1  inner 2×2  4 tiles at (7,0) 2×2' in rendered
+    assert 'conv_aie -> 02 dense_aie: shared ×1, DMA ×1' in rendered
+    assert 'dense_aie -> 03 head_aie: memtile ×1' in rendered
+    assert 'profile' not in rendered and 'make all' not in rendered
+
+
+def test_layout_svg_contains_the_same_layers_and_connections():
+    rendered = format_svg_layout(layout_from_pipeline(_layout_pipeline()))
+
+    assert rendered.startswith('<svg')
+    assert 'conv_aie' in rendered and 'dense_aie' in rendered and 'head_aie' in rendered
+    assert 'shared ×1, DMA ×1' in rendered or 'DMA ×1, shared ×1' in rendered
+    assert 'memtile ×1' in rendered
+
+
+def test_report_layout_modes_need_no_build_or_profile_artifacts(tmp_path, capsys):
+    from aie4ml.report import layout, main
+
+    (tmp_path / 'aie_pipeline.json').write_text(json.dumps(_layout_pipeline()))
+    rendered = layout(tmp_path)
+    assert 'AIE layout' in repr(rendered)
+    assert rendered['device']['part'] == 'xcve2802-vsvh1760-2mp-e-s'
+    assert rendered._repr_html_().startswith('<div style="max-width:100%; overflow-x:auto"><svg')
+
+    assert main([str(tmp_path), '--layout']) == 0
+    output = capsys.readouterr().out
+    assert 'AIE layout' in output and 'Not collected' not in output and 'make profile' not in output
+
+    svg = tmp_path / 'placement.svg'
+    assert main([str(tmp_path), '--layout-svg', str(svg)]) == 0
+    assert capsys.readouterr().out.strip() == str(svg)
+    assert svg.read_text().startswith('<svg')
+
+
+def test_layout_refuses_overlapping_placements():
+    pipeline = _layout_pipeline()
+    pipeline['physical']['placements']['dense_aie']['col'] = 8
+    with pytest.raises(ValueError, match=r'overlap at tile \(8, 1\)'):
+        layout_from_pipeline(pipeline)
+
+
+def test_layout_explicitly_crops_an_older_pipeline_without_device_geometry():
+    pipeline = _layout_pipeline()
+    del pipeline['device']
+    rendered = format_terminal_layout(layout_from_pipeline(pipeline))
+    assert 'occupied region columns 7-20, rows 0-1; device geometry was not emitted' in rendered
+
+
+def test_layout_paginates_the_full_fifty_column_aie1_array():
+    pipeline = _layout_pipeline()
+    pipeline['device'] = 'xcvc1902-vsva2197-2mp-e-s'
+    rendered = format_terminal_layout(layout_from_pipeline(pipeline), terminal_width=120)
+
+    assert 'array columns 0-49, rows 0-7' in rendered
+    assert 'columns 0-24' in rendered and 'columns 25-49' in rendered
 
 
 @pytest.mark.parametrize(

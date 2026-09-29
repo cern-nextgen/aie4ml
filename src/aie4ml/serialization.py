@@ -18,6 +18,7 @@ def dump_pipeline_ir(ctx, destination: Path) -> None:
     """Serialize logical, execution, and physical IR into a single JSON file."""
 
     data = {
+        'device': str(ctx.device.part),
         'logical': [serialize_logical_node(node) for node in ctx.ir.logical],
         'execution': [serialize_op_impl_instance(inst) for inst in ctx.ir.execution],
         'execution_values': [
