@@ -37,6 +37,9 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
   the whole model (`AIEConfig.Optimize`, see the README).
 - **Microtile**: each generation has a default mmul shape per format. `microtiling: {microtile_m, microtile_k,
   microtile_n}` picks another shape the generation supports; the error lists the allowed ones.
+- **One sample**: a Dense whose rows fit one microtile row block (batch 1) runs a kernel that computes one row
+  block instead of two, on the fewest-row microtile a following Dense reads directly (2 rows on AIE1 and AIE-ML, 4
+  on AIE-MLv2), or on its producer's microtile where the generation offers it.
 - **Ports**: buffers by default; `ports: 'stream'` moves each tile's padded block over core streams, for any split.
 - **Batch**: `BatchSize` rows are padded to whole microtiles; the host pads the input and trims the output.
 

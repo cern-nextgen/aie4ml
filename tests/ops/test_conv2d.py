@@ -261,7 +261,7 @@ def test_conv_chain_lowers_to_blocked_frames(conv_model, tmp_path):
 
     c1, c2, c3, fc = (execution.get(f'{n}_aie') for n in ('c1', 'c2', 'c3', 'fc'))
     assert {inst.variant.variant_id for inst in (c1, c2, c3)} == {'conv2d.b.r.v1'}
-    assert fc.variant.variant_id == 'dense.b.r.v1'
+    assert fc.variant.variant_id == 'dense.b.r.vector.v1'
     assert 'fused_activation' in c1.node.traits and 'bias' in c1.node.roles.values()
     assert c3.node.traits['output_view'].data == {'kind': 'flatten_2d'} and c3.config.flags.emit_flattened
     assert (c2.config.spatial.kernel, c2.config.spatial.pads, c2.config.groups) == ((3, 3), (1, 1, 1, 1), C2)
@@ -1237,21 +1237,27 @@ def test_int16_conv_matches_onnx(tmp_path, part):
     )
 
 
-@pytest.mark.parametrize('contract', ['inner', 'outer'])
-def test_a_memory_tile_serves_only_the_readers_its_buffer_descriptors_cover(tmp_path, contract):
-    """A flattened row read by a Dense cascade crosses a memory tile that zero-fills each reader's padded rows: 8 BDs
-    a reader, from 24-BD pools the even and the odd channels each share. Four readers fit beside the writer; eight
-    would need a relay stage."""
+def test_a_memory_tile_serves_only_the_readers_its_buffer_descriptors_cover(tmp_path):
+    """A flattened row read by a Dense cascade crosses a memory tile that zero-fills each reader's padded rows. A
+    row-wise ('outer') Dense pads its one row to two row blocks, 8 BDs a reader from 24-BD pools the even and the odd
+    channels each share: four readers fit beside the writer, eight would need a relay stage. A one-sample 'inner'
+    Dense reads a single row block, 4 BDs a reader, so eight fit."""
     nodes, inits = [], []
     _start(nodes, inits)
     _conv(nodes, inits, 'x_nchw', 'a1', 'c1', CIN, 8, 3, pad=1, relu=True, seed=1)
     _head(nodes, inits, 'a1', H * W * 8, seed=3)
     model = _model('bd_head', nodes, inits)
     held = {'c1': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}
-    split = {'cas_num': 1, 'contract': contract}
-    ctx = lower(model, tmp_path / 'four', {**held, 'fc': {'parallelism': {**split, 'cas_length': 4}}})
-    assert [
-        len(b['readers']) for b in ctx.ir.physical.plan['buffers'] if b['writers'][0]['source'].startswith('c1')
-    ] == [4]
+
+    def readers(ctx):
+        return [
+            len(b['readers']) for b in ctx.ir.physical.plan['buffers'] if b['writers'][0]['source'].startswith('c1')
+        ]
+
+    def fc(cas_length, **split):
+        return {**held, 'fc': {'parallelism': {'cas_num': 1, 'cas_length': cas_length, **split}}}
+
+    assert readers(lower(model, tmp_path / 'four', fc(4, contract='outer'))) == [4]
     with pytest.raises(ConfigRefused, match=r'1 writers and 8 readers need \[36, 32\] BDs'):
-        lower(model, tmp_path / 'eight', {**held, 'fc': {'parallelism': {**split, 'cas_length': 8}}})
+        lower(model, tmp_path / 'eight', fc(8, contract='outer'))
+    assert readers(lower(model, tmp_path / 'one', fc(8))) == [8]

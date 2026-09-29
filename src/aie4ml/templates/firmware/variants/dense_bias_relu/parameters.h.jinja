@@ -18,6 +18,8 @@ struct {{L.struct_name}} {
 {{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
 {{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
   static constexpr int M = {{P.microtiling.microtile_m}}, K = {{P.microtiling.microtile_k}}, N = {{P.microtiling.microtile_n}};
+  // Row microtiles per kernel step: 2 (dense_bias_relu.cpp) or 1 (dense_vector.cpp, a single sample).
+  static constexpr int ROW_BLOCKS = {{P.row_blocks}};
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};
   static constexpr int padded_independent_extent = {{P.full_outer}};

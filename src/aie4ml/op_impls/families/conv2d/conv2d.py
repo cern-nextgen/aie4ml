@@ -196,14 +196,15 @@ class Conv2dOpImplVariant(OpImplVariant):
                     f'{node.name}: a flattened conv needs output channels in whole {CHANNEL_BLOCK}-blocks, '
                     f'got {int(rhs.shape[-1])}.'
                 )
-            # The Dense LHS the consumer reads: 2*M rows, K in 2*microtile_k blocks, one slice per chain.
+            # The Dense LHS the consumer reads: its one row in a block of M, K in 2*microtile_k blocks, one slice per
+            # chain.
             chains = parallelism.cas_num
             rows, shard = int(out.shape[0]), int(out.shape[-1]) // chains
             slice_k = align_up(shard, 2 * k)
             io_views[out.name] = TensorView(
                 logical=tuple(int(x) for x in out.shape),
-                full=(align_up(rows, 2 * m), chains * slice_k),
-                tile=(align_up(rows, 2 * m), slice_k),
+                full=(align_up(rows, m), chains * slice_k),
+                tile=(align_up(rows, m), slice_k),
                 tile_raw=(rows, shard),
                 microtile=MicrotileShape(outer=m, inner=k),
             )

@@ -6,9 +6,29 @@
 #include <vector>
 #include "dense_bias_relu.h"
 #include "dense_bias_relu_stream.h"
+#include "dense_vector.h"
 #include "parameters.h"
 
 using namespace adf;
+
+// The buffer kernels by row microtiles per step: 2 (dense_bias_relu.cpp) or 1 (dense_vector.cpp).
+template<typename ConfigT, int ROW_BLOCKS>
+struct dense_buffer_kernels {
+  using single = dense_single<ConfigT>;
+  using first = dense_first<ConfigT>;
+  using middle = dense_middle<ConfigT>;
+  using last = dense_last<ConfigT>;
+  static constexpr const char* source = "dense_bias_relu.cpp";
+};
+
+template<typename ConfigT>
+struct dense_buffer_kernels<ConfigT, 1> {
+  using single = dense_vector_single<ConfigT>;
+  using first = dense_vector_first<ConfigT>;
+  using middle = dense_vector_middle<ConfigT>;
+  using last = dense_vector_last<ConfigT>;
+  static constexpr const char* source = "dense_vector.cpp";
+};
 
 template<typename ConfigT>
 class dense_bias_relu_graph : public graph {
@@ -29,6 +49,7 @@ public:
   static constexpr bool PARALLELISM_CONTRACT_OUTER = ConfigT::PARALLELISM_CONTRACT_OUTER;
   static constexpr unsigned LHS_PORTS = PARALLELISM_CONTRACT_OUTER ? CAS_NUM * CAS_LENGTH : CAS_LENGTH;
   static constexpr bool STREAM_IO = ConfigT::STREAM_IO;
+  using BufferKernels = dense_buffer_kernels<ConfigT, ConfigT::ROW_BLOCKS>;
 
   input_port  in1[LHS_PORTS];
   adf::port<adf::direction::in> wts[CAS_NUM * CAS_LENGTH];
@@ -93,7 +114,7 @@ void place_graph(int COL_START, int ROW_START)
             if constexpr (STREAM_IO) {
                 kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_single_stream<ConfigT>>();
             } else {
-                kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_single<ConfigT>>();
+                kk[chain * CAS_LENGTH + 0] = kernel::create_object<typename BufferKernels::single>();
             }
         }
         else if constexpr (STREAM_IO) {
@@ -106,20 +127,20 @@ void place_graph(int COL_START, int ROW_START)
             kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<dense_last_stream<ConfigT>>();
         }
         else {
-            kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_first<ConfigT>>();
+            kk[chain * CAS_LENGTH + 0] = kernel::create_object<typename BufferKernels::first>();
             if constexpr (CAS_LENGTH > 2) {
                 for (int c = 1; c < CAS_LENGTH - 1; ++c) {
-                    kk[chain * CAS_LENGTH + c] = kernel::create_object<dense_middle<ConfigT>>();
+                    kk[chain * CAS_LENGTH + c] = kernel::create_object<typename BufferKernels::middle>();
                 }
             }
-            kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<dense_last<ConfigT>>();
+            kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<typename BufferKernels::last>();
         }
     }
 
     for (int idx = 0; idx < CAS_LENGTH * CAS_NUM; ++idx) {
         int col = idx % CAS_LENGTH;
         int row = idx / CAS_LENGTH;
-        source(kk[idx])        = STREAM_IO ? "dense_bias_relu_stream.cpp" : "dense_bias_relu.cpp";
+        source(kk[idx])        = STREAM_IO ? "dense_bias_relu_stream.cpp" : BufferKernels::source;
         runtime<ratio>(kk[idx]) = 1.0;
         single_buffer(kk[idx].in[1]);
         connect<parameter>(wts[idx], async(kk[idx].in[1]));

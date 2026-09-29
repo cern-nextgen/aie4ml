@@ -12,6 +12,7 @@ from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
+from ...utils.io import view_shape
 from ...utils.precision import (
     aie_rounding_token,
     element_bytes,
@@ -44,6 +45,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
 
     contract: ClassVar[str]
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism', 'microtiling'})
+    row_blocks: ClassVar[int] = 2  # row microtiles the kernel computes per step
 
     def work(self, node, config) -> int:
         lhs = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
@@ -64,6 +66,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             tile_inner_rhs_raw=output_view.tile_raw_inner,
         )
         params['stream_io'] = self.port_kind == PORT_KIND_STREAM
+        params['row_blocks'] = self.row_blocks
         return params
 
     def kernel_outer_extent(self, lhs_view):
@@ -113,12 +116,17 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             parallel_cfg['cas_length'] = required_cas_length
             required_microtile = inherited_microtile(node, input_contracts)
 
+        # A kernel of one row block pays for every row of its microtile, so it takes the fewest rows the part
+        # offers -- unless its producer writes a microtile the part also offers, which keeps the hand-off direct.
+        one_block = self.row_blocks == 1
         microtiling = _resolve_tile_cfg(
             node,
             device,
             precision['lhs'],
             precision['rhs'],
             required_lhs_microtile=required_microtile,
+            preferred_lhs_microtile=inherited_microtile(node, input_contracts) if one_block else None,
+            fewest_rows=one_block,
         )
         tiling = _resolve_parallelism(
             node,
@@ -127,8 +135,9 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             precision,
             self.contract,
             parallel_cfg=parallel_cfg,
+            row_blocks=self.row_blocks,
         )
-        io_views = _build_matmul_io_views(node, microtiling, tiling)
+        io_views = _build_matmul_io_views(node, microtiling, tiling, self.row_blocks)
         # K stored shard by shard is still K: the kernel reduces over it whatever its order, so the weight rows
         # follow it (see pack) and every tiling of it stays legal.
         lhs_inner_shards = producer_contract.inner_shards if producer_contract is not None else None
@@ -345,6 +354,24 @@ class DenseOpImplVariant(_DenseVariantBase):
             else None
         )
         return {'packed_weights': packed_W, 'packed_bias': packed_B}
+
+
+@register_variant
+class DenseVectorOpImplVariant(DenseOpImplVariant):
+    """Dense whose LHS rows fit one row microtile -- a single sample -- computing one row block per step
+    (dense_vector.cpp): the second row block the 2x2 register block pads to is neither computed nor moved."""
+
+    variant_id = 'dense.b.r.vector.v1'
+    row_blocks = 1
+    plevel = 20
+
+    def matches(self, node: OpNode, device, directives) -> bool:
+        if not super().matches(node, device, directives):
+            return False
+        precision, _ = resolve_operand_precision(node, device)
+        block = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], fewest_rows=True)
+        rows = int(np.prod(view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')[:-1]))
+        return rows <= block.microtile_m
 
 
 @register_variant
