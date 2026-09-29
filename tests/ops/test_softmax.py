@@ -54,7 +54,7 @@ def _softmax(nodes: list, out: str, prefix: str) -> None:
 def _compile_and_check(model, directives, feed, tmp_path, project):
     aie_model = from_onnx(
         model,
-        {'Part': PART, 'AIEConfig': {'BatchSize': ROWS, 'Iterations': 1}, 'LayerDirectives': dict(directives)},
+        {'Part': PART, 'AIEConfig': {'Iterations': 1}, 'LayerDirectives': dict(directives)},
         output_dir=Path(tmp_path) / project,
         project_name=project,
     )
@@ -146,12 +146,12 @@ def test_softmax_rejects_noncanonical_uint8_scale(tmp_path):
     )
 
     with pytest.raises(ValueError, match=r'emits uint8 Q8 probabilities, got output frac=4'):
-        lower(model, tmp_path, {'sm': {'layout': 'linear'}}, batch=ROWS)
+        lower(model, tmp_path, {'sm': {'layout': 'linear'}})
 
 
 def test_softmax_existing_ml_accumulator_is_unchanged(boundary_softmax, tmp_path):
     directives = {'lin': {'layout': 'linear'}, 'til': {'layout': 'tiled'}}
-    ctx = lower(boundary_softmax, tmp_path, directives, batch=ROWS)
+    ctx = lower(boundary_softmax, tmp_path, directives)
 
     assert ctx.ir.execution.get('lin_aie').config.accumulator_tag == 'acc32'
     assert ctx.ir.execution.get('til_aie').config.accumulator_tag == 'acc32'
@@ -159,7 +159,7 @@ def test_softmax_existing_ml_accumulator_is_unchanged(boundary_softmax, tmp_path
 
 def test_softmax_prefers_tiled_and_honors_explicit_linear_layout(boundary_softmax, tmp_path):
     directives = {'lin': {'layout': 'linear'}, 'til': {'parallelism': {'cas_num': 1}}}
-    ctx = lower(boundary_softmax, tmp_path, directives, batch=ROWS)
+    ctx = lower(boundary_softmax, tmp_path, directives)
 
     assert ctx.ir.execution.get('lin_aie').variant.variant_id == 'softmax.exp.i8.v1'
     assert ctx.ir.execution.get('til_aie').variant.variant_id == 'softmax.exp.i8.tiled.v1'

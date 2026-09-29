@@ -120,7 +120,6 @@ def test_port_aligned_split_maps_disjoint_producer_ports_directly(tmp_path):
         _split_model(),
         tmp_path,
         part=AIE1_PART,
-        batch=8,
         directives={'root': _parallelism(2), 'left': _parallelism(1), 'right': _parallelism(1)},
     )
     edges = {(edge['source'], edge['target']) for edge in ctx.ir.physical.plan['direct_edges']}
@@ -139,7 +138,6 @@ def test_slice_crossing_producer_port_requires_relay(tmp_path):
             _slice_model(2, 6),
             tmp_path,
             part=AIE1_PART,
-            batch=8,
             directives={'root': _parallelism(2), 'tail': _parallelism(1)},
         )
 
@@ -149,7 +147,6 @@ def test_port_aligned_concat_maps_each_source_to_one_consumer_port(tmp_path):
         _concat_model(4, 4),
         tmp_path,
         part=AIE1_PART,
-        batch=8,
         directives={'first': _parallelism(1), 'second': _parallelism(1), 'tail': _parallelism(2)},
     )
     edges = {(edge['source'], edge['target']) for edge in ctx.ir.physical.plan['direct_edges']}
@@ -168,7 +165,6 @@ def test_concat_port_spanning_two_sources_requires_relay(tmp_path):
             _concat_model(3, 5),
             tmp_path,
             part=AIE1_PART,
-            batch=8,
             directives={'first': _parallelism(1), 'second': _parallelism(1), 'tail': _parallelism(2)},
         )
 
@@ -183,7 +179,7 @@ def test_concat_port_spanning_two_sources_requires_relay(tmp_path):
 )
 def test_view_backed_graph_outputs_fail_explicitly(model, message, tmp_path):
     with pytest.raises(NotImplementedError, match=message):
-        lower(model, tmp_path, part=AIE1_PART, batch=8)
+        lower(model, tmp_path, part=AIE1_PART)
 
 
 def test_view_backed_graph_input_fails_explicitly(tmp_path):
@@ -192,7 +188,6 @@ def test_view_backed_graph_input_fails_explicitly(tmp_path):
             _slice_model(0, 4, source_is_graph_input=True),
             tmp_path,
             part=AIE1_PART,
-            batch=8,
             directives={'tail': _parallelism(1)},
         )
 
@@ -203,7 +198,6 @@ def test_chained_views_fail_explicitly(tmp_path):
             _chained_view_model(),
             tmp_path,
             part=AIE1_PART,
-            batch=8,
             directives={'root': _parallelism(2), 'tail': _parallelism(2)},
         )
 
@@ -299,7 +293,6 @@ def test_slice_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):
         _transposed_slice_model(),
         tmp_path,
         part=AIE1_PART,
-        batch=8,
         directives={'root': _parallelism(2), 'tail': _parallelism(1)},
     )
     assert _view(ctx, 'slice')['axis'] == 0
@@ -313,7 +306,6 @@ def test_split_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):
         _transposed_split_model(),
         tmp_path,
         part=AIE1_PART,
-        batch=8,
         directives={'root': _parallelism(2), 'left': _parallelism(1), 'right': _parallelism(1)},
     )
     assert _view(ctx, 'split')['axis'] == 0
@@ -326,7 +318,6 @@ def test_concat_of_transposed_values_joins_the_canonical_axis(tmp_path):
         _transposed_concat_model(),
         tmp_path,
         part=AIE1_PART,
-        batch=8,
         directives={'first': _parallelism(1), 'second': _parallelism(1), 'tail': _parallelism(2)},
     )
     assert _view(ctx, 'concat')['axis'] == 0
@@ -336,7 +327,7 @@ def test_concat_of_transposed_values_joins_the_canonical_axis(tmp_path):
 
 def test_concat_of_differently_viewed_values_is_refused(tmp_path):
     with pytest.raises(ValueError, match=r'different axis orders .* canonical axis \[0, 1\]'):
-        lower(_transposed_concat_model(second_transposed=False), tmp_path, part=AIE1_PART, batch=8)
+        lower(_transposed_concat_model(second_transposed=False), tmp_path, part=AIE1_PART)
 
 
 def test_a_transpose_never_folds_under_a_view_op():
@@ -380,7 +371,6 @@ def test_split_of_a_transposed_value_matches_onnx(tmp_path):
         feeds,
         {'root': _parallelism(2), 'left': _parallelism(1), 'right': _parallelism(1)},
         tmp_path,
-        batch=8,
         max_code_diff=0,
         part=AIE1_PART,
     )

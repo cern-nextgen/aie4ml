@@ -41,7 +41,8 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
   block instead of two, on the fewest-row microtile a following Dense reads directly (2 rows on AIE1 and AIE-ML, 4
   on AIE-MLv2), or on its producer's microtile where the generation offers it.
 - **Ports**: buffers by default; `ports: 'stream'` moves each tile's padded block over core streams, for any split.
-- **Batch**: `BatchSize` rows are padded to whole microtiles; the host pads the input and trims the output.
+- **Batch**: the leading axis of the model's input (ONNX: its input shape; hls4ml: `batch_size`, default 1). Its
+  rows are padded to whole microtiles; the host pads the input and trims the output.
 
 ## Conv2D
 

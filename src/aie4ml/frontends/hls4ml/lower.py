@@ -39,7 +39,7 @@ class LowerToAieIr(ModelOptimizerPass):
         graph: LogicalIR = ctx.ir.logical
         layers = list(model.get_layers())
         input_var = model.get_input_variables()[0]
-        batch_size = int(model.config.get_config_value('AIEConfig', {})['BatchSize'])
+        batch_size = int(model.config.get_config_value('BatchSize'))
         batch_included = bool(ctx.policies.tensors_have_batch)
 
         def _canon(shape):

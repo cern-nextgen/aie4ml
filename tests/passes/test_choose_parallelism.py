@@ -113,16 +113,16 @@ def test_layout_conversions_count_toward_max_tiles(tmp_path, part):
 def test_every_leg_is_decided_as_transport_decides_it(tmp_path):
     """Boundary and kernel legs through a memory tile are counted as the built plan routes them, and a split view
     steers its producer to ports whose slices it can read without a directive."""
-    ctx = lower(_normalization_chain_model(), tmp_path / 'norm', part=MLV2_PART, batch=8)
+    ctx = lower(_normalization_chain_model(), tmp_path / 'norm', part=MLV2_PART)
     assert ctx.ir.optimizer['memtile_legs'] == len(memtiles(ctx)) == 1  # the sum re-staged between two kernels
-    ctx = lower(_split_model(), tmp_path / 'split', part=AIE1_PART, batch=8, aie_config={'Optimize': 'resource'})
+    ctx = lower(_split_model(), tmp_path / 'split', part=AIE1_PART, aie_config={'Optimize': 'resource'})
     assert _splits(ctx)['root_aie'].contract == 'outer' and _splits(ctx)['root_aie'].cas_num == 2
 
 
 def test_a_rerun_searches_afresh_and_leaves_the_directives_as_given(tmp_path):
     model = from_onnx(
         _wide_model(),
-        {'Part': PART, 'AIEConfig': {'BatchSize': 1, 'Iterations': 1, 'Optimize': 'resource'}},
+        {'Part': PART, 'AIEConfig': {'Iterations': 1, 'Optimize': 'resource'}},
         output_dir=tmp_path,
         project_name='rerun',
     )
@@ -165,10 +165,10 @@ def test_a_search_that_builds_nothing_says_whether_it_hit_a_limit(tmp_path, monk
     monkeypatch.setattr(placement.PlaceKernels, 'transform', refuse)
     pinned = {'dense': {'parallelism': {'cas_num': 1, 'cas_length': 1, 'contract': 'inner'}}}
     with pytest.raises(ConfigRefused, match=r'none of the 1 designs within the tile budget can be built'):
-        lower(_dense_model(), tmp_path / 'one', pinned, part=PART, batch=8)
+        lower(_dense_model(), tmp_path / 'one', pinned, part=PART)
     monkeypatch.setattr(choose_parallelism, 'MAX_PLACEMENT_TRIALS', 2)
     with pytest.raises(RuntimeError, match=r'(?s)search limit.*A design may still exist'):
-        lower(_dense_model(), tmp_path / 'many', part=PART, batch=8)
+        lower(_dense_model(), tmp_path / 'many', part=PART)
 
 
 def test_an_error_that_is_not_a_refusal_stops_the_search(tmp_path, monkeypatch):
@@ -184,7 +184,7 @@ def test_dense_offers_splits_its_tiling_pads(tmp_path):
     """40 output features split three ways pad each chain to 16: a candidate a divisor rule would miss."""
     model = from_onnx(
         _dense_model(out_features=40),
-        {'Part': PART, 'AIEConfig': {'BatchSize': 8, 'Iterations': 1}},
+        {'Part': PART, 'AIEConfig': {'Iterations': 1}},
         output_dir=tmp_path,
         project_name='dense',
     )
@@ -211,7 +211,6 @@ def test_an_optimized_design_runs_on_the_aie(tmp_path, part):
         {'x_q': feeds},
         {},
         tmp_path,
-        batch=1,
         max_code_diff=0,
         part=part,
         iterations=2,

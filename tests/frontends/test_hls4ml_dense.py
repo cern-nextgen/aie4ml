@@ -257,3 +257,24 @@ def test_a_permute_between_dense_layers_converts(tmp_path):
     )
     fc2 = get_backend_context(aie_model).ir.execution.get('fc2_aie')
     assert [view.perm for view in fc2.port_views.values() if view.perm is not None] == [(0, 2, 1)]
+
+
+@pytest.mark.aie_ir
+def test_a_conversion_lowers_one_sample_unless_asked_for_more(tmp_path):
+    """Keras tensors carry no batch axis: the conversion's batch_size (default 1) is the leading axis the AIE sees."""
+    _np, hls4ml, keras, qkeras = _imports()
+    q8 = qkeras.quantized_bits(8, 0, alpha=1)
+    model = keras.Sequential(
+        [
+            keras.layers.Input((32,)),
+            qkeras.QActivation(qkeras.quantized_bits(8, 2), name='in_q'),
+            qkeras.QDense(16, kernel_quantizer=q8, bias_quantizer=q8, name='fc'),
+        ]
+    )
+    cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    for batch, asked in ((1, {}), (4, {'batch_size': 4})):
+        aie_model = hls4ml.converters.convert_from_keras_model(
+            model, hls_config=cfg, output_dir=str(tmp_path / str(batch)), project_name='b', backend='aie', **asked
+        )
+        logical = get_backend_context(aie_model).ir.logical
+        assert logical.tensors[logical.input_tensor_names[0]].shape == (batch, 32)

@@ -106,7 +106,7 @@ def test_layernorm_positions_match_onnx(layernorm_positions, tmp_path):
     edge = {'lin_edge': parallelism(1) | {'layout': 'linear'}, 'til_edge': parallelism(1) | {'layout': 'tiled'}}
     inner = {node: parallelism(1) | {'layout': layout} for node, layout in LAYOUTS.items()}
     denses = {name: parallelism(1, contract='outer') for name in DENSES}
-    assert_x86_matches_onnx(layernorm_positions, _feeds(), {**edge, **inner, **denses}, tmp_path, batch=ROWS)
+    assert_x86_matches_onnx(layernorm_positions, _feeds(), {**edge, **inner, **denses}, tmp_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +135,7 @@ def boundary_layernorms():
 def test_layernorm_row_split_matches_onnx(boundary_layernorms, tmp_path, cas_num):
     """Splitting the rows across tiles -- the path where the batch/statistics-vector sizing lives."""
     directives = {'lin': parallelism(cas_num) | {'layout': 'linear'}, 'til': parallelism(cas_num) | {'layout': 'tiled'}}
-    assert_x86_matches_onnx(boundary_layernorms, _feeds(), directives, tmp_path, batch=ROWS)
+    assert_x86_matches_onnx(boundary_layernorms, _feeds(), directives, tmp_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +178,7 @@ def _after_dense_model():
 
 @pytest.mark.parametrize('cas_num', [1, 4])
 def test_boundary_layernorm_splits_rows_across_tiles(tmp_path, cas_num):
-    ctx = lower(_boundary_model(), tmp_path, {'ln': parallelism(cas_num)}, batch=ROWS)
+    ctx = lower(_boundary_model(), tmp_path, {'ln': parallelism(cas_num)})
     cfg = config_of(ctx, 'ln_aie')
     assert int(cfg.parallelism.cas_num) == cas_num
     assert int(cfg.cols) == COLS  # reduces over features, so every tile owns whole rows
@@ -189,7 +189,7 @@ def test_boundary_layernorm_splits_rows_across_tiles(tmp_path, cas_num):
 def test_dense_to_layernorm_only_reshards_a_partitioned_edge(tmp_path, cas_num):
     """A single tiled producer connects directly; an inner split must still be re-sharded."""
     directives = {'d': parallelism(cas_num), 'ln': parallelism(cas_num)}
-    ctx = lower(_after_dense_model(), tmp_path, directives, batch=ROWS)
+    ctx = lower(_after_dense_model(), tmp_path, directives)
     if cas_num == 1:
         assert ('d_aie', 'ln_aie') in direct_edges(ctx)
         assert not any('d_mm' in str(t) for t in memtiles(ctx))
@@ -199,18 +199,18 @@ def test_dense_to_layernorm_only_reshards_a_partitioned_edge(tmp_path, cas_num):
 
 
 def test_boundary_layernorm_prefers_the_tiled_variant(tmp_path):
-    ctx = lower(_boundary_model(), tmp_path, {'ln': parallelism(1)}, batch=ROWS)
+    ctx = lower(_boundary_model(), tmp_path, {'ln': parallelism(1)})
     inst = ctx.ir.execution.get('ln_aie')
     assert inst.variant.variant_id == 'layer_norm.i8.tiled.v1'
     assert inst.config.accumulator_tag == 'acc32'
 
 
 def test_boundary_layernorm_honors_explicit_linear_layout(tmp_path):
-    ctx = lower(_boundary_model(), tmp_path, {'ln': {**parallelism(1), 'layout': 'linear'}}, batch=ROWS)
+    ctx = lower(_boundary_model(), tmp_path, {'ln': {**parallelism(1), 'layout': 'linear'}})
     assert ctx.ir.execution.get('ln_aie').variant.variant_id == 'layer_norm.i8.v1'
 
 
 def test_layernorm_rejects_unrepresentable_beta(tmp_path):
     beta = np.full((COLS,), 1.25, dtype=np.float32)
     with pytest.raises(ValueError, match="LayerNorm parameter 'beta' cannot be represented"):
-        lower(_boundary_model(beta=beta), tmp_path, {'ln': parallelism(1)}, batch=ROWS)
+        lower(_boundary_model(beta=beta), tmp_path, {'ln': parallelism(1)})

@@ -72,13 +72,12 @@ def lower(
     directives: Optional[Dict[str, Any]] = None,
     *,
     part: str = PART,
-    batch: int = 1,
     project: str = 'proj',
     aie_config: Optional[Dict[str, Any]] = None,
 ):
     config = {
         'Part': part,
-        'AIEConfig': {'BatchSize': batch, 'Iterations': 1, **(aie_config or {})},
+        'AIEConfig': {'Iterations': 1, **(aie_config or {})},
         'LayerDirectives': dict(directives or {}),
     }
     aie_model = from_onnx(model, config, output_dir=Path(tmp_path) / project, project_name=project)
@@ -135,7 +134,6 @@ def assert_aie_matches_onnx(
     tmp_path,
     *,
     project='proj',
-    batch,
     frac=4,
     max_code_diff=5,
     part=PART,
@@ -150,7 +148,6 @@ def assert_aie_matches_onnx(
         directives,
         tmp_path,
         project=project,
-        batch=batch,
         frac=frac,
         max_code_diff=max_code_diff,
         part=part,
@@ -168,7 +165,6 @@ def assert_x86_matches_onnx(
     tmp_path,
     *,
     project='proj',
-    batch,
     frac=4,
     max_code_diff=5,
     part=PART,
@@ -194,7 +190,6 @@ def assert_x86_matches_onnx(
         directives,
         tmp_path,
         project=project,
-        batch=batch,
         frac=frac,
         max_code_diff=max_code_diff,
         part=part,
@@ -212,7 +207,6 @@ def _assert_matches_onnx(
     tmp_path,
     *,
     project,
-    batch,
     frac,
     max_code_diff,
     part,
@@ -227,7 +221,7 @@ def _assert_matches_onnx(
         model,
         {
             'Part': part,
-            'AIEConfig': {'BatchSize': batch, 'Iterations': iterations, **(aie_config or {})},
+            'AIEConfig': {'Iterations': iterations, **(aie_config or {})},
             'LayerDirectives': dict(directives),
         },
         output_dir=Path(tmp_path) / project,
@@ -257,9 +251,10 @@ def _assert_matches_onnx(
     scale = float(2.0**-frac)
     for name, wants in ref.items():
         produced = np.asarray(got[name]).astype(np.int8)
+        rows = np.asarray(wants[0]).shape[0]  # the output's leading axis, one iteration's share of `produced`
         for iteration in range(iterations):
             want = np.clip(np.rint(np.asarray(wants[iteration], np.float32) / scale), -128, 127).astype(np.int8)
-            have = produced[iteration * batch : (iteration + 1) * batch]
+            have = produced[iteration * rows : (iteration + 1) * rows]
             diff = np.abs(have.astype(np.int16) - want.astype(np.int16))
             assert (
                 int(diff.max()) <= max_code_diff

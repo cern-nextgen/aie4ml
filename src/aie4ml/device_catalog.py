@@ -77,6 +77,11 @@ def installed_platforms() -> list[str]:
 
 
 def resolve_device(part_name: Any, aie_cfg: Dict[str, Any]) -> tuple[DeviceSpec, Dict[str, Any]]:
+    if 'BatchSize' in aie_cfg:
+        raise ValueError(
+            "AIEConfig.BatchSize is not read: the batch is the leading axis of the model's input (with hls4ml, "
+            'convert_from_keras_model(batch_size=...)).'
+        )
     entry = lookup_device(part_name)
     if not entry and 'Columns' not in aie_cfg:
         raise ValueError(f'Unknown part "{part_name}". {PART_HELP.format(boards=known_boards())}')

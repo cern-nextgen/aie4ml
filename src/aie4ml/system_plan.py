@@ -333,12 +333,12 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     layout = build_io_layout(ctx)
     n_ifm = int(plan['graph_input_count'])
     n_ofm = int(plan['graph_output_count'])
-    batch = int(ctx.aie_config['BatchSize'])
     if len(layout.inputs) != 1 or len(layout.outputs) != 1:
         raise RuntimeError(
             f'system I/O plan supports a single graph tensor; '
             f'got {len(layout.inputs)} and ({layout.outputs}). Multiple graph are not yet supported.'
         )
+    batch = int(ctx.ir.logical.tensors[next(iter(layout.inputs))].shape[0])  # the input's leading axis
 
     in_feat = _single_io_feat(layout.inputs, 'input', batch)
     out_feat = _single_io_feat(layout.outputs, 'output', batch)

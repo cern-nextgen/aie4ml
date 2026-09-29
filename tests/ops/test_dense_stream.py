@@ -89,7 +89,7 @@ def _feed() -> np.ndarray:
 
 @pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
 def test_stream_dense_plan_has_no_buffers_or_dma(stream_dense_model, tmp_path, part):
-    ctx = lower(stream_dense_model, tmp_path, DIRECTIVES, part=part, batch=ROWS)
+    ctx = lower(stream_dense_model, tmp_path, DIRECTIVES, part=part)
     execution = ctx.ir.execution
     plan = ctx.ir.physical.plan
 
@@ -121,7 +121,7 @@ def test_stream_dense_plan_has_no_buffers_or_dma(stream_dense_model, tmp_path, p
 
 
 def test_stream_dense_io_ports_carry_padded_tiles(stream_dense_model, tmp_path):
-    ctx = lower(stream_dense_model, tmp_path, DIRECTIVES, part=AIE1_PART, batch=ROWS)
+    ctx = lower(stream_dense_model, tmp_path, DIRECTIVES, part=AIE1_PART)
     ports = {(item['direction'], item['port']): item['staging'] for item in ctx.ir.physical.plan['io_ports']}
 
     whole_input = ports[('input', 0)]
@@ -150,7 +150,7 @@ def test_stream_dense_io_ports_carry_padded_tiles(stream_dense_model, tmp_path):
 
 
 def test_stream_dense_emits_stream_graph(stream_dense_model, tmp_path):
-    ctx = lower(stream_dense_model, tmp_path, DIRECTIVES, part=AIE1_PART, batch=ROWS)
+    ctx = lower(stream_dense_model, tmp_path, DIRECTIVES, part=AIE1_PART)
     AIEProjectEmitter().emit(ctx)
     out = ctx.project_config.output_dir / 'src'
 
@@ -172,13 +172,13 @@ def test_stream_dense_emits_stream_graph(stream_dense_model, tmp_path):
 def test_stream_dense_refuses_buffer_consumer(stream_dense_model, tmp_path):
     directives = dict(DIRECTIVES, l2={'parallelism': {'cas_num': 1}})
     with pytest.raises(ConfigRefused, match=r'l1_aie\.out1 is a stream port but consumer l2_aie\.in1 is a buffer port'):
-        lower(stream_dense_model, tmp_path, directives, part=AIE1_PART, batch=ROWS)
+        lower(stream_dense_model, tmp_path, directives, part=AIE1_PART)
 
 
 def test_stream_dense_refuses_memtile_route(stream_dense_model, tmp_path):
     directives = dict(DIRECTIVES, l2=dict(_stream(1), io_route={'inputs': {'l1_relu': 'memtile'}}))
     with pytest.raises(ConfigRefused, match=r'io_route=memtile requested on a stream port'):
-        lower(stream_dense_model, tmp_path, directives, part=PART, batch=ROWS)
+        lower(stream_dense_model, tmp_path, directives, part=PART)
 
 
 def test_stream_dense_refuses_unstageable_microtile(stream_dense_model, tmp_path):
@@ -186,7 +186,7 @@ def test_stream_dense_refuses_unstageable_microtile(stream_dense_model, tmp_path
         DIRECTIVES, l1=dict(_stream(2), microtiling={'microtile_m': 1, 'microtile_k': 16, 'microtile_n': 8})
     )
     with pytest.raises(ValueError, match=r'microtile N=8 .* cannot be staged from a stream'):
-        lower(stream_dense_model, tmp_path, directives, part=AIE1_PART, batch=ROWS)
+        lower(stream_dense_model, tmp_path, directives, part=AIE1_PART)
 
 
 # --------------------------------------------------------------------------- #
@@ -204,7 +204,6 @@ def test_stream_dense_matches_onnx(stream_dense_model, tmp_path, part):
         DIRECTIVES,
         tmp_path,
         project='stream_dense',
-        batch=ROWS,
         part=part,
         max_code_diff=1,
     )

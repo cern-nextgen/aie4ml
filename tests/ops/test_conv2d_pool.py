@@ -224,7 +224,6 @@ def test_fused_pool_matches_onnx(tmp_path, part, model, directives):
         {'x_q': feeds},
         directives,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=part,

@@ -586,7 +586,6 @@ def test_stream_conv_matches_onnx(tmp_path, part):
         {'x_q': feeds},
         STREAM_DIRECTIVES,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=part,
@@ -634,7 +633,6 @@ def test_stream_conv_moves_partial_channel_blocks(tmp_path):
         {'x_q': feed},
         STREAM_DIRECTIVES,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=1,
         part=AIE1_PART,
@@ -655,7 +653,6 @@ def test_stream_conv_sends_partial_channel_blocks(tmp_path):
         {'x_q': feed},
         STREAM_DIRECTIVES,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=1,
         part=AIE1_PART,
@@ -760,7 +757,6 @@ def test_strided_conv_matches_onnx(tmp_path, stride, k, cin, size):
         {'x_q': feeds},
         {},
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=AIE1_PART,
@@ -784,7 +780,6 @@ def test_vertical_only_stride_takes_the_plain_boundary(tmp_path):
         {'x_q': feeds},
         {},
         tmp_path / 'numeric',
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=AIE1_PART,
@@ -901,7 +896,7 @@ def test_generated_graph_pins_the_frame(tmp_path):
     build needs no check of its own afterwards."""
     from aie4ml import from_onnx
 
-    config = {'Part': AIE1_PART, 'AIEConfig': {'BatchSize': 1, 'Iterations': 1}, 'LayerDirectives': {}}
+    config = {'Part': AIE1_PART, 'AIEConfig': {'Iterations': 1}, 'LayerDirectives': {}}
     from_onnx(_strided_chain_model(), config, output_dir=tmp_path, project_name='strided').write()
     params = (tmp_path / 'src' / 'parameters.h').read_text()
     assert '{ 0, 0, 2, 0, 3 }' in params  # the retiler's frame: its own tile
@@ -963,7 +958,6 @@ def test_strided_conv_matches_onnx_on_the_core(tmp_path):
         {'x_q': feeds},
         {},
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=AIE1_PART,
@@ -992,7 +986,6 @@ def test_wide_pixel_retiler_matches_onnx_on_the_core(tmp_path):
         {'x_q': feeds},
         {'b': {'parallelism': {'cas_num': 2}}},
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=AIE1_PART,
@@ -1019,7 +1012,6 @@ def test_row_split_strided_conv_matches_onnx_on_the_core(tmp_path):
         {'x_q': feeds},
         ROW_SPLIT_X_CASCADE,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=AIE1_PART,
@@ -1044,7 +1036,6 @@ def test_stream_conv_matches_onnx_on_the_core(tmp_path):
         {'x_q': feeds},
         STREAM_DIRECTIVES,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=AIE1_PART,
@@ -1056,7 +1047,7 @@ def test_stream_conv_matches_onnx_on_the_core(tmp_path):
 @pytest.mark.requires_vitis
 def test_padded_conv_pair_matches_onnx_on_aie_mlv2(tmp_path):
     assert_x86_matches_onnx(
-        _padded_pair_model(), {'x_q': _feed()}, {}, tmp_path, batch=1, frac=FRAC, max_code_diff=0, part=MLV2_PART
+        _padded_pair_model(), {'x_q': _feed()}, {}, tmp_path, frac=FRAC, max_code_diff=0, part=MLV2_PART
     )
 
 
@@ -1066,7 +1057,7 @@ def test_outer_split_matches_onnx(tmp_path, part):
     """Same-padded conv split by rows into two slices: the halo rows and the delivered top/bottom border
     are what this checks, so any mistake in the slice windows shows up as wrong pixels."""
     assert_x86_matches_onnx(
-        _row_split_model(), {'x_q': _feed()}, ROW_SPLIT, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
+        _row_split_model(), {'x_q': _feed()}, ROW_SPLIT, tmp_path, frac=FRAC, max_code_diff=1, part=part
     )
 
 
@@ -1118,7 +1109,6 @@ def test_depthwise_core_matches_onnx(tmp_path, part):
         {'x_q': feeds},
         DEPTHWISE_ROWS,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=part,
@@ -1141,7 +1131,6 @@ def test_conv_chain_matches_onnx(conv_model, tmp_path, part):
         {'x_q': feeds},
         directives,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=part,
@@ -1162,7 +1151,6 @@ def test_channel_chains_of_a_flattened_conv_match_onnx(tmp_path, part):
         {'x_q': feeds},
         directives,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=part,
@@ -1228,7 +1216,6 @@ def test_int16_conv_matches_onnx(tmp_path, part):
         {'x_q': feeds},
         INT16_DIRECTIVES,
         tmp_path,
-        batch=1,
         frac=FRAC,
         max_code_diff=0,
         part=part,

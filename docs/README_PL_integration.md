@@ -98,7 +98,7 @@ and per-layer weight/bias info from the resolved execution entries.
 | `graph_name` (`"dut"`) | constant (matches the emitted ADF graph) | host |
 | `pl_freq_hz` | `AIEConfig.PLClockFreqMHz` | system.cfg, host |
 | `n_ifm` / `n_ofm` | `plan['graph_input_count']` / `['graph_output_count']` | data mover, system.cfg, host |
-| `batch`, `in_feat`, `out_feat` | `AIEConfig.BatchSize` + IO layout | data mover, host |
+| `batch`, `in_feat`, `out_feat` | the graph input's leading axis + IO layout | data mover, host |
 | `in_feat_slice` / `out_feat_slice` | `in_feat // n_ifm` / `out_feat // cas_num` | host |
 | `cas_num` / `cas_length` | resolved dense parallelism | host RTP loops |
 | `max_512_per_stream` | per-stream 64-byte word count | data mover PL memory sizing |

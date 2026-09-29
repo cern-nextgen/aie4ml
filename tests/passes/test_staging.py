@@ -61,7 +61,7 @@ def dense_then_layernorm():
 
 
 def _lower(model, tmp_path, ln, fc=None):
-    return lower(model, tmp_path, {'fc': fc or parallelism(4, contract='outer'), 'ln': ln}, part=PART, batch=ROWS)
+    return lower(model, tmp_path, {'fc': fc or parallelism(4, contract='outer'), 'ln': ln}, part=PART)
 
 
 def test_matmul_publishes_the_microtile_it_declares(dense_then_layernorm, tmp_path):
@@ -108,7 +108,6 @@ def test_aie1_staging_mismatch_identifies_the_ports_and_descriptor_fields(dense_
             tmp_path,
             {'fc': parallelism(4, contract='outer'), 'ln': parallelism(4) | {'layout': 'linear'}},
             part=AIE1_PART,
-            batch=ROWS,
         )
 
 
@@ -175,7 +174,7 @@ def two_denses_into_add():
 
 def _lower_add(model, tmp_path, fc_a, fc_b, add=None):
     directives = {'fc_a': fc_a, 'fc_b': fc_b, 'add': add or parallelism(4)}
-    return lower(model, tmp_path, directives, part=PART, batch=ROWS)
+    return lower(model, tmp_path, directives, part=PART)
 
 
 def test_a_two_input_op_takes_both_inputs_directly_when_they_agree(two_denses_into_add, tmp_path):

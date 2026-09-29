@@ -85,13 +85,20 @@ def _dense_model(
     )
 
 
+def test_the_batch_is_the_model_inputs_leading_axis(tmp_path):
+    with pytest.raises(ValueError, match='AIEConfig.BatchSize is not read'):
+        from_onnx(
+            _dense_model(), {'Part': AIE1_PART, 'AIEConfig': {'BatchSize': 8}}, output_dir=tmp_path, project_name='p'
+        )
+
+
 def _resolve_dense(model, tmp_path, *, part=AIE1_PART, directives=None):
     layer_directives = {'dense': dict(directives)} if directives else {}
     ctx = lower_onnx_model(
         model,
         {
             'Part': part,
-            'AIEConfig': {'BatchSize': 8, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': layer_directives,
         },
         output_dir=tmp_path,
@@ -106,7 +113,7 @@ def _run_pipeline(model, tmp_path, *, part=AIE1_PART, directives=None, project='
         model,
         {
             'Part': part,
-            'AIEConfig': {'BatchSize': 8, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': dict(directives or {}),
         },
         output_dir=tmp_path / project,
@@ -438,7 +445,7 @@ def test_a_directive_the_variant_does_not_read_is_refused(tmp_path):
 def test_an_output_view_the_family_cannot_write_is_refused(tmp_path, view, match):
     ctx = lower_onnx_model(
         _dense_model(),
-        {'Part': AIE1_PART, 'AIEConfig': {'BatchSize': 8, 'Iterations': 1}},
+        {'Part': AIE1_PART, 'AIEConfig': {'Iterations': 1}},
         output_dir=tmp_path,
         project_name='aie1_dense',
     )
@@ -801,7 +808,7 @@ def test_a_batch_below_the_padded_tile_moves_only_its_rows(tmp_path):
     walks only the rows the host moves; walking the whole tile, the input would wait for rows never sent."""
     aie_model = from_onnx(
         _small_batch_dense_model(4),
-        {'Part': AIE1_PART, 'AIEConfig': {'BatchSize': 4, 'Iterations': 2}},
+        {'Part': AIE1_PART, 'AIEConfig': {'Iterations': 2}},
         output_dir=tmp_path,
         project_name='small_batch',
     )
@@ -821,7 +828,6 @@ def test_a_batch_below_the_padded_tile_matches_onnx(tmp_path):
         feeds,
         {},
         tmp_path,
-        batch=4,
         max_code_diff=0,
         part=AIE1_PART,
         iterations=2,

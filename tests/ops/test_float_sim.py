@@ -595,7 +595,7 @@ def test_bf16_combined_mlp_pipeline(tmp_path):
         model,
         {
             'Part': 'xilinx_vek280_base_202610_1',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
         },
         output_dir=tmp_path / 'proj_bf16_mlp',
         project_name='proj_bf16_mlp',
@@ -630,7 +630,7 @@ def test_fp8_combined_mlp_pipeline(tmp_path):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
         },
         output_dir=tmp_path / 'proj_fp8_mlp',
         project_name='proj_fp8_mlp',
@@ -664,7 +664,7 @@ def test_bf16_combined_mlp_x86_bit_exact(tmp_path):
         model,
         {
             'Part': 'xilinx_vek280_base_202610_1',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
         },
         output_dir=tmp_path / 'proj_bf16_mlp_x86',
         project_name='proj_bf16_mlp_x86',
@@ -710,7 +710,7 @@ def test_fp8_combined_mlp_x86_bit_exact(tmp_path):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
         },
         output_dir=tmp_path / 'proj_fp8_mlp_x86',
         project_name='proj_fp8_mlp_x86',
@@ -757,7 +757,7 @@ def test_fp8_large_matmul_x86_code_diff(tmp_path):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {'matmul0': {'parallelism': {'cas_num': 2, 'cas_length': 2}}},
         },
         output_dir=tmp_path / 'proj_fp8_large_matmul_x86',
@@ -796,7 +796,7 @@ def test_bf16_large_matmul_x86_code_diff(tmp_path):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {'matmul0': {'parallelism': {'cas_num': 2, 'cas_length': 2}}},
         },
         output_dir=tmp_path / 'proj_bf16_large_matmul_x86',
@@ -840,7 +840,7 @@ def test_fp8_large_chained_matmul_x86_code_diff(tmp_path):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {
                 'matmul_scores': {'parallelism': {'cas_num': 2, 'cas_length': 2}},
                 'matmul_ctx': {'parallelism': {'cas_num': 2, 'cas_length': 2}},
@@ -885,7 +885,7 @@ def test_bf16_large_chained_matmul_x86_close(tmp_path):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {
                 'matmul_scores': {'parallelism': {'cas_num': 2, 'cas_length': 2}},
                 'matmul_ctx': {'parallelism': {'cas_num': 2, 'cas_length': 2}},
@@ -935,7 +935,7 @@ def test_float_like_single_dense_x86_code_diff(tmp_path, mode):
         model,
         {
             'Part': part,
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
         },
         output_dir=tmp_path / f'proj_{mode}_single_dense_x86',
         project_name=f'proj_{mode}_single_dense_x86',
@@ -983,7 +983,7 @@ def test_float_like_attention_dense_chain_x86_code_diff(tmp_path, mode):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {
                 'dense0': {'parallelism': {'cas_num': 2, 'cas_length': 4}},
                 'dense1': {'parallelism': {'cas_num': 2, 'cas_length': 4}},
@@ -1033,7 +1033,7 @@ def test_bf16_dense_chain_probe_x86_code_diff(tmp_path):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {
                 'dense0': {'parallelism': {'cas_num': 2, 'cas_length': 4}},
                 'dense1': {'parallelism': {'cas_num': 2, 'cas_length': 4}},
@@ -1091,7 +1091,7 @@ def test_float_like_attention_core_x86_code_diff(tmp_path, mode):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {
                 'dense_q': {'parallelism': {'cas_num': 2, 'cas_length': 4}},
                 'dense_k': {'parallelism': {'cas_num': 2, 'cas_length': 4}},
@@ -1145,7 +1145,7 @@ def test_float_like_attention_tail_x86_code_diff(tmp_path, mode):
         model,
         {
             'Part': 'vek385_base',
-            'AIEConfig': {'BatchSize': batch, 'Iterations': 1},
+            'AIEConfig': {'Iterations': 1},
             'LayerDirectives': {
                 'add_residual': {'parallelism': {'cas_num': 2}},
                 'dense_out': {'parallelism': {'cas_num': 2, 'cas_length': 2}},

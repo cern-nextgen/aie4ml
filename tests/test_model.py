@@ -13,7 +13,7 @@ from helpers import PART
 
 def test_a_model_builds_its_own_project_over_another_in_the_same_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(aie_model.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''))
-    config = {'Part': PART, 'AIEConfig': {'BatchSize': 8, 'Iterations': 1}}
+    config = {'Part': PART, 'AIEConfig': {'Iterations': 1}}
 
     first = from_onnx(_dense_model(out_features=8), config, output_dir=tmp_path, project_name='proj')
     first.build()
@@ -30,7 +30,7 @@ def test_a_model_builds_its_own_project_over_another_in_the_same_directory(tmp_p
 
 def test_a_configuration_changed_after_building_is_built_again(tmp_path, monkeypatch):
     monkeypatch.setattr(aie_model.subprocess, 'run', lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''))
-    config = {'Part': PART, 'AIEConfig': {'BatchSize': 8, 'Iterations': 1, 'Optimize': 'resource'}}
+    config = {'Part': PART, 'AIEConfig': {'Iterations': 1, 'Optimize': 'resource'}}
     model = from_onnx(_dense_model(in_features=64, out_features=64), config, output_dir=tmp_path, project_name='proj')
     model.build()
 

@@ -85,7 +85,7 @@ def test_one_sample_takes_one_row_block(tmp_path, part, rows):
         assert inst.port_views[inst.inputs[0].tensor].full[0] == rows
     assert {('d0_aie', 'd1_aie'), ('d1_aie', 'd2_aie')} <= direct_edges(ctx) and ctx.ir.physical.plan['buffers'] == []
 
-    batch = lower(_mlp(rows=8), tmp_path / 'eight', SPLIT, part=part, batch=8)
+    batch = lower(_mlp(rows=8), tmp_path / 'eight', SPLIT, part=part)
     assert {inst.variant.variant_id for inst in batch.ir.execution} == {'dense.b.r.v1'}
 
 
@@ -98,7 +98,6 @@ def test_one_sample_matches_onnx(tmp_path, part):
         {'x_q': feeds},
         SPLIT,
         tmp_path,
-        batch=1,
         frac=3,
         max_code_diff=0,
         part=part,
