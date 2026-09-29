@@ -47,6 +47,11 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
     """How one transport leg is realised; `leg.consumer` is None for a graph output. Reads only the resolved
     instances and contracts in `execution`, so the parallelism search decides every leg by this rule too."""
     tensor, producer, consumer = leg.logical_tensor, leg.producer, leg.consumer
+    shards_failure = _inner_shards_failure(leg, execution)
+    if shards_failure is not None:
+        raise ConfigRefused(
+            f'{tensor}: {producer.node.name} stores its inner axis shard by shard, but {shards_failure}.'
+        )
     route = _route_policy(leg, execution)
     is_boundary = producer.node is None or consumer is None
     has_memtile = bool(has_memtile)
@@ -129,6 +134,23 @@ def _direct_boundary_failure(leg: Connection, execution) -> str | None:
             direct_boundary_access(staging, staging['io_tiling_dimension'], element_bits=element.width, output=output)
         except ConfigRefused as refusal:
             return str(refusal)
+    return None
+
+
+def _inner_shards_failure(leg: Connection, execution) -> str | None:
+    """Why this leg would read a tensor stored shard by shard (TensorContract.inner_shards) as if it were in logical
+    order, or None: only a consumer that adopted that order may read it, and only whole."""
+    contract = execution.tensor_contracts.get(leg.producer.tensor)
+    shards = contract.inner_shards if contract is not None else None
+    if shards is None:
+        return None
+    if leg.consumer is None:
+        return 'a graph output leaves in logical order'
+    if leg.consumer.tensor != leg.producer.tensor:
+        return f'{leg.consumer.node.name} reads it through the view {leg.consumer.tensor!r}'
+    inst = execution.get(leg.consumer.node.name)
+    if inst.variant.input_inner_shards(inst.node, inst.config, leg.consumer.tensor) != shards:
+        return f'{leg.consumer.node.name} reads it in logical order'
     return None
 
 

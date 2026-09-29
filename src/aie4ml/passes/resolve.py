@@ -29,6 +29,7 @@ def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
                 normalized_staging(inst.variant.describe_output_staging(inst.node, inst.config, tensor, port, None))
                 for port in ports
             ),
+            inner_shards=inst.variant.output_inner_shards(inst.node, inst.config, tensor),
         )
     return contracts
 

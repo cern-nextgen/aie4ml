@@ -196,14 +196,15 @@ class Conv2dOpImplVariant(OpImplVariant):
                     f'{node.name}: a flattened conv needs output channels in whole {CHANNEL_BLOCK}-blocks, '
                     f'got {int(rhs.shape[-1])}.'
                 )
-            # The Dense LHS the consumer reads: 2*M rows, K in 2*microtile_k blocks.
-            flat_k = int(out.shape[-1])
-            padded = (align_up(int(out.shape[0]), 2 * m), align_up(flat_k, 2 * k))
+            # The Dense LHS the consumer reads: 2*M rows, K in 2*microtile_k blocks, one slice per chain.
+            chains = parallelism.cas_num
+            rows, shard = int(out.shape[0]), int(out.shape[-1]) // chains
+            slice_k = align_up(shard, 2 * k)
             io_views[out.name] = TensorView(
                 logical=tuple(int(x) for x in out.shape),
-                full=padded,
-                tile=padded,
-                tile_raw=tuple(int(x) for x in out.shape),
+                full=(align_up(rows, 2 * m), chains * slice_k),
+                tile=(align_up(rows, 2 * m), slice_k),
+                tile_raw=(rows, shard),
                 microtile=MicrotileShape(outer=m, inner=k),
             )
         else:
@@ -312,11 +313,6 @@ class Conv2dOpImplVariant(OpImplVariant):
                     f'{CHANNEL_BLOCK}-channel blocks evenly.'
                 )
             return ParallelismConfig(cas_num=cas_num, cas_length=cas_length, contract=contract)
-        if flatten and cas_num != 1:
-            raise ConfigRefused(
-                f'{node.name}: a flattened output interleaves the channel blocks of every pixel, so it cannot '
-                f'be split across {cas_num} chains.'
-            )
         for name, value, blocks in (('cas_length', cas_length, in_blocks), ('cas_num', cas_num, out_blocks)):
             if value < 1 or blocks % value:
                 raise ConfigRefused(
@@ -594,7 +590,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             )
             return params
         if config.flags.emit_flattened:
-            params.update(out_rows=1, out_cols=1, out_origin_r=0, out_origin_c=0, flat_k_padded=int(out_view.full[-1]))
+            params.update(out_rows=1, out_cols=1, out_origin_r=0, out_origin_c=0, flat_k_padded=int(out_view.tile[-1]))
         else:
             params.update(
                 out_rows=int(out_view.tile[1]),
@@ -620,6 +616,14 @@ class Conv2dOpImplVariant(OpImplVariant):
 
     def output_port_count(self, _node, config):
         return int(config.parallelism.cas_num)
+
+    def output_inner_shards(self, node, config, _tensor_name):
+        """A chain flattens its own output channels pixel by pixel, so the flattened row holds each pixel's channels
+        dealt to the chains in turn, stored chain by chain."""
+        chains = int(config.parallelism.cas_num)
+        if not config.flags.emit_flattened or chains == 1:
+            return None
+        return chains, int(input_tensor_for_role(node, 'rhs').shape[-1]) // chains
 
     def _rows_per_chain(self, node, config) -> int:
         """Output rows one chain owns, or 0 when the chains split channels instead."""

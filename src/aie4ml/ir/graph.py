@@ -328,10 +328,23 @@ class TensorContract:
 
     `contract` is the one scalar a consumer inherits directly -- the partition axis is not
     recoverable from a single descriptor. Everything else it reads out of `port_staging`.
+
+    `inner_shards` is (shards, width) when the producer stores the inner axis shard by shard (see
+    `shard_major_order`), and the descriptors address that stored order; None when they address the
+    logical order. Only a consumer that adopts it may read the tensor.
     """
 
     contract: str  # one of STAGING_CONTRACTS: which axis cas_num partitions
     port_staging: Tuple[Dict[str, Any], ...] = ()
+    inner_shards: Optional[Tuple[int, int]] = None
+
+
+def shard_major_order(extent: int, shards: int, width: int) -> np.ndarray:
+    """The logical index of each stored element of an inner axis stored shard by shard: logically runs of `width`
+    elements dealt to `shards` shards in turn, stored with every run of shard 0 first, then shard 1, and so on."""
+    if int(extent) % (int(shards) * int(width)):
+        raise ValueError(f'An inner axis of {extent} elements does not hold whole rounds of {shards} x {width}.')
+    return np.arange(int(extent)).reshape(-1, int(shards), int(width)).transpose(1, 0, 2).reshape(-1)
 
 
 @dataclass(frozen=True)

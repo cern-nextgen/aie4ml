@@ -151,7 +151,7 @@ class _Search:
                     repr(binding),
                     inst.io_route.get('outputs', {}).get(tensor),
                     repr(inst.port_views[tensor]),
-                    None if contract is None else (contract.contract, contract.port_staging),
+                    None if contract is None else (contract.contract, contract.port_staging, contract.inner_shards),
                     stagings,
                 ],
                 sort_keys=True,

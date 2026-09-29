@@ -6,7 +6,7 @@ import numpy as np
 
 from ....aie_types import FloatIntent
 from ....errors import ConfigRefused
-from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role
+from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role, shard_major_order
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_STREAM, PortBinding, PortMap
@@ -129,6 +129,14 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             parallel_cfg=parallel_cfg,
         )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
+        # K stored shard by shard is still K: the kernel reduces over it whatever its order, so the weight rows
+        # follow it (see pack) and every tiling of it stays legal.
+        lhs_inner_shards = producer_contract.inner_shards if producer_contract is not None else None
+        if lhs_inner_shards is not None and io_views[lhs_tensor.name].is_transposed:
+            raise ConfigRefused(
+                f'{node.name}: a transposed view of {lhs_tensor.name!r} reduces over another axis than the one its '
+                'producer stores shard by shard.'
+            )
 
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
@@ -161,7 +169,11 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
                 use_bias=has_input_role(node, 'bias'),
             ),
+            lhs_inner_shards=lhs_inner_shards,
         )
+
+    def input_inner_shards(self, node, config, tensor_name):
+        return config.lhs_inner_shards if tensor_name == input_tensor_for_role(node, 'lhs').name else None
 
     def _quantize_weight_bias(self, inst: ExecutionInstance):
         """Quantize the weight matrix and bias vector; shared by every dense contract."""
@@ -199,6 +211,9 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         W = np.asarray(W)
         if W.ndim < 2:
             raise ValueError(f'{inst.name}: weight matrix must have at least 2 dimensions, got {W.ndim}.')
+        shards = inst.config.lhs_inner_shards
+        if shards is not None:
+            W = np.take(W, shard_major_order(W.shape[-2], *shards), axis=-2)
         return W, b, int(W.shape[-2]), int(W.shape[-1])
 
     def footprint(self, _node, config) -> OpImplFootprint:

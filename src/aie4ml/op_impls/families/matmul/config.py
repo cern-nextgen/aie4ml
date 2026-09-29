@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from ...utils import ParallelismConfig, TensorView
 
@@ -45,6 +45,7 @@ class DenseConfig:
     bank_mem_bytes: int
     alternating_horizontal: bool
     flags: DenseFlags
+    lhs_inner_shards: Optional[Tuple[int, int]] = None  # the producer's shard-by-shard K order, adopted
 
 
 @dataclass(frozen=True)

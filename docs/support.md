@@ -47,7 +47,10 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
 - **Window**: any kernel shape (validated up to 7×7), asymmetric zero padding smaller than the kernel, `groups`
   including depthwise, any stride, batch 1. Dilation is refused. An int16 input needs a horizontal stride of 1.
 - **Fused into the conv**: bias, ReLU, a following 2×2 stride-2 MaxPool (ReLU on either side of it), and a Flatten
-  into a Dense, which reads the conv's output directly (one chain only).
+  into a Dense, which reads the conv's output directly. Split over output-channel chains, each chain flattens its
+  own channels and the Dense orders its weight rows to match: a Dense with one cascade stage per chain reads each
+  chain's slice directly, and any other split goes through a memory tile. Such a flattened output cannot be a graph
+  output.
 - **Layout**: channels-last, in blocks of 8 channels. A channel count that is not a multiple of 8 is padded with zeros.
 - **Parallelism**: `cas_length` splits the input channels over a cascade and `cas_num` splits the output channels
   (`'inner'`) or the output rows (`'outer'`); every split must be whole 8-channel blocks or equal row bands. A row

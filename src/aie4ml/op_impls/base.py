@@ -137,6 +137,16 @@ class OpImplVariant:
     def output_port_count(self, _node: OpNode, config: Any) -> Optional[int]:
         return int(config.parallelism.cas_num)
 
+    def output_inner_shards(self, _node: OpNode, _config: Any, _tensor_name: str) -> Optional[Tuple[int, int]]:
+        """(shards, width) when the ports store the output's inner axis shard by shard (TensorContract), else
+        None."""
+        return None
+
+    def input_inner_shards(self, _node: OpNode, _config: Any, _tensor_name: str) -> Optional[Tuple[int, int]]:
+        """The shard-by-shard order this instance reads an input in: its producer's, adopted at resolution, or None
+        where it reads the logical order."""
+        return None
+
     def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         raise NotImplementedError
 

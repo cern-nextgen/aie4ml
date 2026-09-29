@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from aie4ml.errors import ConfigRefused
+from aie4ml.ir.graph import shard_major_order
 from helpers import (
     PART,
     TensorProto,
@@ -76,14 +77,17 @@ def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed
     qdq(nodes, pre_q, out, f'{name}o')
 
 
-def _head(nodes, inits, src, rows, seed):
+def _head(nodes, inits, src, rows, seed, *, name='fc', out='y'):
     """Flatten the ONNX NCHW view and classify it, so the Gemm rows follow the canonical order."""
-    nodes.append(helper.make_node('Flatten', [src], ['flat'], axis=1, name='flat'))
+    nodes.append(helper.make_node('Flatten', [src], [f'{name}_flat'], axis=1, name=f'{name}_flat'))
     w = np.random.default_rng(seed).integers(-4, 4, size=(rows, CLASSES), dtype=np.int8)
-    inits += [numpy_helper.from_array(w, 'fc_w_q'), *_qparams('fc_w', frac=FRAC), *_qparams('fco', frac=FRAC)]
-    nodes.append(helper.make_node('DequantizeLinear', ['fc_w_q', 'fc_w_scale', 'fc_w_zp'], ['fc_w']))
-    nodes.append(helper.make_node('Gemm', ['flat', 'fc_w'], ['fc_mm'], name='fc'))
-    qdq(nodes, 'fc_mm', 'y', 'fco')
+    inits += [numpy_helper.from_array(w, f'{name}_w_q'), *_qparams(f'{name}_w', frac=FRAC)]
+    inits += _qparams(f'{name}o', frac=FRAC)
+    nodes.append(
+        helper.make_node('DequantizeLinear', [f'{name}_w_q', f'{name}_w_scale', f'{name}_w_zp'], [f'{name}_w'])
+    )
+    nodes.append(helper.make_node('Gemm', [f'{name}_flat', f'{name}_w'], [f'{name}_mm'], name=name))
+    qdq(nodes, f'{name}_mm', out, f'{name}o')
 
 
 def _start(nodes, inits):
@@ -364,6 +368,71 @@ def test_conv_partitions_channel_blocks_across_tiles(conv_model, tmp_path):
     plan = ctx.ir.physical.plan
     edges = {(e['source'], e['target']) for e in plan['direct_edges']}
     assert {('c1_aie.out1[2]', 'c2_aie.in1[2]'), ('c1_aie.out1[0]', 'c2_aie.in1[0]')} <= edges
+
+
+def _sharded_heads_model():
+    """Two heads whose conv chains each flatten their own output channels: `ca` (4 blocks, 2 per chain, with a fused
+    2x2 max pool) into `fa`, and `cb` (2 blocks, 1 per chain) into `fb`."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'ca', CIN, 32, 3, pad=1, relu=True, seed=31)
+    inits += _qparams('pao', frac=FRAC)
+    nodes.append(helper.make_node('MaxPool', ['a'], ['pa_pool'], name='pa', kernel_shape=[2, 2], strides=[2, 2]))
+    qdq(nodes, 'pa_pool', 'pa', 'pao')
+    _head(nodes, inits, 'pa', H // 2 * W // 2 * 32, seed=32, name='fa', out='ya')
+    _conv(nodes, inits, 'x_nchw', 'b', 'cb', CIN, 16, 3, pad=1, relu=True, seed=33)
+    _head(nodes, inits, 'b', H * W * 16, seed=34, name='fb', out='yb')
+    return make_model(
+        'conv_sharded_heads',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('ya', TensorProto.FLOAT, [1, CLASSES]), ('yb', TensorProto.FLOAT, [1, CLASSES])],
+        initializers=inits,
+    )
+
+
+# One cascade stage per chain for `fa`, which takes each chain's slice directly; four for `fb`, which cuts the same
+# row differently, so a memory tile re-slices it.
+SHARDED = {
+    'ca': {'parallelism': {'cas_num': 2}},
+    'fa': {'parallelism': {'cas_num': 1, 'cas_length': 2}},
+    'cb': {'parallelism': {'cas_num': 2}},
+    'fb': {'parallelism': {'cas_num': 1, 'cas_length': 4}},
+}
+
+
+def test_channel_chains_of_a_flattened_conv_feed_the_dense_reduction(tmp_path):
+    """Each chain flattens its own output channels, so the row is stored chain by chain and the Dense adopts that
+    order into its weight rows: a cascade stage per chain takes its slice directly, and any other cut of the row
+    goes through a memory tile."""
+    assert shard_major_order(8, 2, 2).tolist() == [0, 1, 4, 5, 2, 3, 6, 7]
+    ctx = lower(_sharded_heads_model(), tmp_path, SHARDED)
+    execution = ctx.ir.execution
+    assert execution.tensor_contracts['fa_flat'].inner_shards == (2, 16)
+    assert execution.tensor_contracts['fb_flat'].inner_shards == (2, 8)
+    assert [execution.get(name).config.lhs_inner_shards for name in ('fa_aie', 'fb_aie')] == [(2, 16), (2, 8)]
+    assert {('ca_aie', 'fa_aie')} <= direct_edges(ctx) and ('cb_aie', 'fb_aie') not in direct_edges(ctx)
+    assert [(b['name'], len(b['writers']), len(b['readers'])) for b in ctx.ir.physical.plan['buffers']] == [
+        ('buffer_fb_flat', 2, 4)
+    ]
+
+
+def test_a_row_stored_chain_by_chain_is_no_graph_output(tmp_path):
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'c', CIN, 16, 3, pad=1, relu=True, seed=1)
+    nodes.append(helper.make_node('Flatten', ['a'], ['y'], axis=1, name='flat'))
+    model = make_model(
+        'conv_flat_out',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, H * W * 16])],
+        initializers=inits,
+    )
+    with pytest.raises(ConfigRefused, match='stores its inner axis shard by shard, but a graph output leaves'):
+        lower(model, tmp_path, {'c': {'parallelism': {'cas_num': 2}}})
 
 
 def test_conv_rejects_partitions_it_cannot_cut(conv_model, tmp_path):
@@ -1077,6 +1146,27 @@ def test_conv_chain_matches_onnx(conv_model, tmp_path, part):
         max_code_diff=0,
         part=part,
         iterations=6,
+        per_iteration=True,
+    )
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [AIE1_PART, PART, MLV2_PART], ids=['aie1', 'aie-ml', 'aie-mlv2'])
+def test_channel_chains_of_a_flattened_conv_match_onnx(tmp_path, part):
+    """Both heads of the sharded model through the DMAs that realize them, direct and through a memory tile; AIE1
+    has no memory tile, so there `fb` takes a stage per chain too."""
+    directives = SHARDED if part != AIE1_PART else {**SHARDED, 'fb': {'parallelism': {'cas_num': 1, 'cas_length': 2}}}
+    feeds = np.random.default_rng(5).integers(-40, 40, size=(2, 1, H, W, CIN), dtype=np.int8)
+    assert_aie_matches_onnx(
+        _sharded_heads_model(),
+        {'x_q': feeds},
+        directives,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=2,
         per_iteration=True,
     )
 
