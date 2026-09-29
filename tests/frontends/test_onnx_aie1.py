@@ -85,6 +85,15 @@ def _dense_model(
     )
 
 
+def test_a_platform_named_without_its_release_is_the_installed_one(monkeypatch):
+    from aie4ml import device_catalog
+
+    monkeypatch.setattr(device_catalog, 'installed_platforms', lambda: ['vek280_base', 'xilinx_vek280_base_202610_1'])
+    assert resolve_device('xilinx_vek280_base', {})[0].platform == 'xilinx_vek280_base_202610_1'
+    with pytest.raises(ValueError, match='"xilinx_vek280_base_202520_1" is not in this Vitis install'):
+        resolve_device('xilinx_vek280_base_202520_1', {})
+
+
 def test_the_batch_is_the_model_inputs_leading_axis(tmp_path):
     with pytest.raises(ValueError, match='AIEConfig.BatchSize is not read'):
         from_onnx(

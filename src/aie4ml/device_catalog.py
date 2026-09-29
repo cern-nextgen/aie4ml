@@ -9,7 +9,6 @@ import json
 import os
 import re
 import shutil
-import warnings
 from pathlib import Path
 from typing import Any, Dict
 
@@ -90,10 +89,19 @@ def resolve_device(part_name: Any, aie_cfg: Dict[str, Any]) -> tuple[DeviceSpec,
 
     installed = installed_platforms()
     if merged.get('AIECompilerTarget') == 'platform' and installed and str(part_name) not in installed:
-        warnings.warn(
-            f'Part "{part_name}" is not in this Vitis install, so the generated Makefile will '
-            f'point at a missing .xpfm. Installed: {", ".join(installed)}.',
-            stacklevel=2,
+        # A platform named without its release suffix is the one release of it this Vitis installs.
+        base = str(part_name).lower()
+        releases = (
+            []
+            if _RELEASE_SUFFIX.search(base)
+            else [name for name in installed if _RELEASE_SUFFIX.sub('', name.lower()) == base]
         )
+        if len(releases) != 1:
+            raise ValueError(
+                f'Platform "{part_name}" is not in this Vitis install'
+                + (f' and matches several releases ({", ".join(releases)}); name one.' if releases else '.')
+                + f' Installed: {", ".join(installed)}.'
+            )
+        part_name = releases[0]
 
     return DeviceSpec.from_config(str(part_name), merged), merged
