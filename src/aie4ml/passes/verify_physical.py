@@ -115,13 +115,15 @@ def verify_dma_resources(ctx) -> None:
                 f'memory tile whose pools hold {dma.bds // dma.bd_pools} each.'
             )
 
-    if device.tile_dma.dimensions < 3:
-        return  # AIE1's 2-D BDs fold loops by offset and increment in ways not modelled yet
     graphs = {sanitize_identifier(inst.name): inst for inst in ctx.ir.execution}
     shared = set()
     for edge in plan.get('direct_edges', ()):
         if edge.get('realization') == SHARED_MEMORY:
             shared |= {edge['source'], edge['target']}
+    verify_tile_dma_channels(ctx, graphs, shared)
+
+    if device.tile_dma.dimensions < 3:
+        return  # AIE1's 2-D BDs fold loops by offset and increment in ways not modelled yet
     accesses = {
         a['endpoint']: a['descriptor']
         for key in ('kernel_read_accesses', 'kernel_write_accesses')
@@ -137,8 +139,6 @@ def verify_dma_resources(ctx) -> None:
                     if f'{name}.{binding.group}[{port}]' in shared:
                         continue
                     owners = sorted({(col, row) for col, row, _ in _pinned(ctx, inst, binding.group, port)})
-                    if len(owners) not in (1, len(endpoints)):
-                        raise RuntimeError(f'{name}.{binding.group}[{port}]: its buffers sit on {owners}.')
                     for index, endpoint in enumerate(endpoints):
                         where = f'{name}.{endpoint}'
                         owner = owners[0] if len(owners) == 1 else owners[index]
@@ -146,6 +146,35 @@ def verify_dma_resources(ctx) -> None:
     for owner, bds in used.items():
         if bds > device.tile_dma.bds:
             raise ConfigRefused(f'tile {owner}: its DMA needs {bds} BDs, beyond its {device.tile_dma.bds}.')
+
+
+def verify_tile_dma_channels(ctx, graphs, shared) -> None:
+    """Every compute tile's DMA within its channels: each kernel buffer that is not shared memory takes an S2MM
+    channel (input) or an MM2S channel (output) on the tile that holds it. The placer only reports an
+    oversubscribed tile as a failed placement."""
+    limit = int(ctx.device.tile_dma.channels)
+    used = defaultdict(lambda: defaultdict(list))  # tile -> direction -> kernel ports
+    for name, inst in graphs.items():
+        for direction, channel in (('inputs', 'S2MM'), ('outputs', 'MM2S')):
+            for binding in getattr(inst.ports, direction).values():
+                if binding.kind != PORT_KIND_BUFFER:
+                    continue
+                for port, endpoints in enumerate(binding.endpoints):
+                    if f'{name}.{binding.group}[{port}]' in shared:
+                        continue
+                    owners = sorted({(col, row) for col, row, _ in _pinned(ctx, inst, binding.group, port)})
+                    if len(owners) not in (1, len(endpoints)):
+                        raise RuntimeError(f'{name}.{binding.group}[{port}]: its buffers sit on {owners}.')
+                    for index, endpoint in enumerate(endpoints):
+                        owner = owners[0] if len(owners) == 1 else owners[index]
+                        used[owner][channel].append(f'{name}.{endpoint}')
+    for owner, channels in sorted(used.items()):
+        for channel, ports in channels.items():
+            if len(ports) > limit:
+                raise ConfigRefused(
+                    f'tile {owner}: {len(ports)} buffers need its {channel} DMA ({", ".join(sorted(ports))}), '
+                    f'which has {limit} channels.'
+                )
 
 
 class VerifyPhysicalPlan(AIEPass):

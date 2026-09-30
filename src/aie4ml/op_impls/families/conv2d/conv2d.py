@@ -45,6 +45,7 @@ from .common import (
     describe_logical_staging,
     frame_view,
     fused_pool_of,
+    reads_neighbour_rows,
     spatial_access_of,
 )
 from .config import Conv2dConfig, Conv2dFlags, FrameRetileConfig
@@ -209,21 +210,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 microtile=MicrotileShape(outer=m, inner=k),
             )
         else:
-            io_views[out.name] = frame_view(
-                out,
-                column_block=block,
-                column_align=column_align,
-                channel_slices=1 if outer else parallelism.cas_num,
-                row_slices=row_slices,
-            )
-            # Each row slice writes its own rows once: no zero border, and no rows another slice also holds.
-            view = io_views[out.name]
-            if outer and (any(view.origin) or int(view.tile[1]) * row_slices > int(view.full[1])):
-                raise ConfigRefused(
-                    f"{node.name}: an output split by rows (contract 'outer') cannot feed a consumer whose window "
-                    'reads a zero border or rows past its slice; partition the channels instead, or let the row '
-                    'slices end at a 1x1 conv or the graph output.'
-                )
+            io_views[out.name] = self._output_frame(node, parallelism, column_block=block, column_align=column_align)
 
         shift = resolve_accumulator_output_shift(lhs.precision, out.precision, rhs.precision)
         shift += resolve_output_scale_shift(node, is_float=False)
@@ -248,6 +235,27 @@ class Conv2dOpImplVariant(OpImplVariant):
             pool=pool,
         )
 
+    def _output_frame(
+        self, node, parallelism: ParallelismConfig, *, column_block: int, column_align: int
+    ) -> TensorView:
+        """The output frame, cut into the chains' shares."""
+        outer = parallelism.contract == 'outer'
+        view = frame_view(
+            node.outputs[0],
+            column_block=column_block,
+            column_align=column_align,
+            channel_slices=1 if outer else parallelism.cas_num,
+            row_slices=parallelism.cas_num if outer else 1,
+        )
+        # Each row slice writes its own rows once: no zero border, and no rows another slice also holds.
+        if outer and (any(view.origin) or int(view.tile[1]) * int(parallelism.cas_num) > int(view.full[1])):
+            raise ConfigRefused(
+                f"{node.name}: an output split by rows (contract 'outer') cannot feed a consumer whose window "
+                'reads a zero border or rows past its slice; partition the channels instead, or let the row '
+                'slices end at a 1x1 conv or the graph output.'
+            )
+        return view
+
     def _resolve_parallelism(self, node, parallel_cfg, input_contracts, *, flatten: bool) -> ParallelismConfig:
         """Tiles over the channel-block axis, in the Dense contract vocabulary."""
         contract = str(parallel_cfg.get('contract', 'inner'))
@@ -257,17 +265,18 @@ class Conv2dOpImplVariant(OpImplVariant):
         spatial = spatial_access_of(node)
         in_blocks = align_up(int(lhs.shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
         out_blocks = align_up(int(input_tensor_for_role(node, 'rhs').shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
-        reads_neighbour_rows = spatial.window[0] > 1 or spatial.pads[0] or spatial.pads[2]
+        neighbour_rows = reads_neighbour_rows(spatial)
 
         cas_length = int(parallel_cfg.get('cas_length', 1))
         producer = input_contracts.get(lhs.name)
         if producer is not None and producer.contract == 'outer':
             # The rows arrive already split ('outer'); a window that reaches past its own row slice
             # would need rows another chain owns.
-            if reads_neighbour_rows:
+            if neighbour_rows:
                 raise ConfigRefused(
                     f"{node.name}: its input arrives split by rows (contract 'outer'), but its {spatial.kernel} "
-                    f'window with pads {spatial.pads} reads rows a neighbouring chain owns.'
+                    f'window with pads {spatial.pads} reads rows a neighbouring chain owns; split it into the same '
+                    "row bands (parallelism contract 'outer') to read them from its neighbours."
                 )
             if contract == 'inner' and 'contract' in parallel_cfg:
                 raise ConfigRefused(
@@ -295,7 +304,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             # Row slices overlap by the window span, so a chain reads rows its neighbours also read.
             # Only the graph boundary can serve that: the host clips each port's window against
             # the tensor and zero-fills the rest, while a producing kernel writes each row once.
-            if lhs.producer is not None and reads_neighbour_rows:
+            if lhs.producer is not None and neighbour_rows:
                 raise ConfigRefused(
                     f"{node.name}: an input split by rows (contract 'outer') whose window reads neighbouring rows "
                     'must come from the graph boundary, because the row slices overlap and a kernel writes every '

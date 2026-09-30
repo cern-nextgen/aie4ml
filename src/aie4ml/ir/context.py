@@ -39,10 +39,12 @@ class RamPool:
 @dataclass(frozen=True)
 class DmaSpec:
     """One kind of DMA, as its architecture manual documents it: its buffer descriptors, split into pools by
-    channel parity when `bd_pools` is 2, the axes one BD walks, and whether it fills zeros past the data."""
+    channel parity when `bd_pools` is 2, its channels each way (S2MM in, MM2S out), the axes one BD walks, and
+    whether it fills zeros past the data."""
 
     bds: int
     bd_pools: int
+    channels: int
     dimensions: int
     zero_padding: bool
 
@@ -107,6 +109,7 @@ class DeviceSpec:
             return DmaSpec(
                 bds=int(require(entry, 'Bds')),
                 bd_pools=int(require(entry, 'BdPools')),
+                channels=int(require(entry, 'Channels')),
                 dimensions=int(require(entry, 'Dimensions')),
                 zero_padding=bool(require(entry, 'ZeroPadding')),
             )

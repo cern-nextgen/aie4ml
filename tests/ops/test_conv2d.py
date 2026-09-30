@@ -225,16 +225,16 @@ ROW_SPLIT = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
 STREAM_DIRECTIVES = {'b': {'ports': 'stream'}}
 
 
-def _padded_pair_model(size=H, pad=1):
-    """conv(3x3, same) -> conv(3x3, `pad`) -> NHWC output: the first conv stores into the second's frame, bordered
-    when the second is same-padded."""
+def _padded_pair_model(size=H, pad=1, k=3, stride=1):
+    """conv(3x3, same) -> conv(`k`x`k`, `pad`, `stride`) -> NHWC output: the first conv stores into the second's
+    frame, bordered when the second is padded."""
     nodes: list = []
     inits: list = []
     _start(nodes, inits)
     _conv(nodes, inits, 'x_nchw', 'a', 'b', CIN, C1, 3, pad=1, relu=True, seed=41)
-    _conv(nodes, inits, 'a', 'c', 'd', C1, 8, 3, pad=pad, relu=True, seed=42)
+    _conv(nodes, inits, 'a', 'c', 'd', C1, 8, k, pad=pad, relu=True, seed=42, stride=stride)
     nodes.append(helper.make_node('Transpose', ['c'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
-    out = size - 2 + 2 * pad
+    out = (size + 2 * pad - k) // stride + 1
     return make_model(
         'conv_padded_pair',
         nodes=nodes,
@@ -438,9 +438,10 @@ def test_a_row_stored_chain_by_chain_is_no_graph_output(tmp_path):
 def test_conv_rejects_partitions_it_cannot_cut(conv_model, tmp_path):
     with pytest.raises(ConfigRefused, match='cas_num=5 does not split'):
         lower(conv_model, tmp_path, {'c1': {'parallelism': {'cas_num': 5}}}, part=AIE1_PART)
-    # c1 feeds a 3x3 conv, so its output frame carries a border no row slice can own.
-    with pytest.raises(ConfigRefused, match='output split by rows'):
-        lower(conv_model, tmp_path, {'c1': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}, part=AIE1_PART)
+    # c1's row bands feed a 3x3 depthwise conv, which reads its neighbours' rows only split into the same bands.
+    with pytest.raises(ConfigRefused, match='split it into the same row bands'):
+        split = {'c1': {'parallelism': {'contract': 'outer', 'cas_num': 2}}, 'c2': {'parallelism': {'cas_num': 1}}}
+        lower(conv_model, tmp_path, split, part=AIE1_PART)
 
 
 def test_frame_refuses_consumers_that_read_different_windows(tmp_path):
@@ -503,12 +504,117 @@ def test_outer_splits_rows_into_overlapping_slices(tmp_path):
     assert {('b_aie.out1[0]', 'ofm[0]'), ('b_aie.out1[1]', 'ofm[1]')} <= edges
 
 
-@pytest.mark.parametrize('pad', [1, 0], ids=['bordered', 'overlapping'])
-def test_row_slices_feed_no_window_past_their_rows(tmp_path, pad):
-    """A row slice writes its own rows once, so it cannot fill the consumer's zero border (same) nor the rows its
-    neighbour's window also reads (valid)."""
-    with pytest.raises(ConfigRefused, match='rows past its slice'):
-        lower(_padded_pair_model(pad=pad), tmp_path, ROW_SPLIT, part=AIE1_PART)
+# Both convs of the padded pair split into the same two row bands: the second reads its halo from its neighbours.
+HALO_SPLIT = {**ROW_SPLIT, 'd': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
+
+
+@pytest.mark.parametrize(
+    'part, shared',
+    [(PART, [True] * 4), (MLV2_PART, [True] * 4), (AIE1_PART, [True, True, True, False])],
+    ids=['aie-ml', 'aie-mlv2', 'aie1'],
+)
+def test_row_bands_hand_their_neighbours_their_halo(tmp_path, part, shared):
+    """The same-padded 3x3 conv reads, beside each producer band's own rows, band 0's last row (band 1's top halo)
+    and band 1's first row (band 0's bottom halo): each a buffer of its own with one reader, so every hand-over is
+    shared memory where both ends reach it. On AIE1 a band on an odd row writes its rows in its own tile, which the
+    neighbouring bands' readers do not reach: band 1's first row is a planned DMA copy."""
+    ctx = lower(_padded_pair_model(), tmp_path, HALO_SPLIT, part=part)
+    b, d = ctx.ir.execution.get('b_aie'), ctx.ir.execution.get('d_aie')
+    assert b.variant.variant_id == d.variant.variant_id == 'conv2d.b.r.halo.v1'
+    tensor = b.node.outputs[0].name
+    assert b.config.io_views[tensor] == d.config.io_views[tensor] and d.config.io_views[tensor].tile[1] == H // 2
+    sent = b.variant.kernel_params(b.node, b.config)
+    assert (sent['halo_top'], sent['halo_bottom'], sent['send_first'], sent['send_last']) == (0, 0, 1, 1)
+    params = d.variant.kernel_params(d.node, d.config)
+    assert (params['halo_top'], params['own_rows'], params['halo_bottom'], params['in_rows']) == (1, 4, 1, 6)
+    assert (params['send_first'], params['send_last']) == (0, 0)
+    assert b.ports.outputs[tensor].endpoints == (
+        ('kk[0].out[0]',),
+        ('kk[1].out[0]',),
+        ('kk[0].out[1]',),
+        ('kk[1].out[1]',),
+    )
+    assert d.ports.inputs[tensor].endpoints == (('kk[0].in[0]',), ('kk[1].in[0]',), ('kk[1].in[1]',), ('kk[0].in[1]',))
+    realized = {e['target']: e.get('realization') for e in ctx.ir.physical.plan['direct_edges']}
+    assert [realized[f'd_aie.in1[{port}]'] == 'shared_memory' for port in range(4)] == shared
+    assert ctx.ir.physical.plan['buffers'] == []
+
+
+def _halo_chain_model(size=12):
+    """A boundary conv, then two same-padded 3x3 convs, the last with a fused 2x2 max pool, flattened into a Dense:
+    split into three row bands, the first conv only sends its edge rows, the second reads its halo and sends its own
+    edge rows, and the last reads its halo; each of its bands' pooled pixels is one contiguous slice of the Dense's
+    K."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'b', CIN, 16, 3, pad=1, relu=True, seed=51)
+    _conv(nodes, inits, 'a', 'c', 'd', 16, 16, 3, pad=1, relu=True, seed=52)
+    _conv(nodes, inits, 'c', 'e_out', 'e', 16, 16, 3, pad=1, relu=True, seed=54)
+    inits += _qparams('po', frac=FRAC)
+    nodes.append(helper.make_node('MaxPool', ['e_out'], ['p_pool'], name='p', kernel_shape=[2, 2], strides=[2, 2]))
+    qdq(nodes, 'p_pool', 'p', 'po')
+    _head(nodes, inits, 'p', (size // 2) ** 2 * 16, seed=53)
+    return make_model(
+        'conv_halo_chain',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, size, size, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, CLASSES])],
+        initializers=inits,
+    )
+
+
+HALO_CHAIN = {
+    'b': {'parallelism': {'contract': 'outer', 'cas_num': 3}},
+    'd': {'parallelism': {'contract': 'outer', 'cas_num': 3}},
+    'e': {'parallelism': {'contract': 'outer', 'cas_num': 3}},
+    'fc': {'parallelism': {'cas_num': 1, 'cas_length': 3}},
+}
+
+
+@pytest.mark.parametrize('bands', [4, 8])
+def test_row_bands_down_to_one_row_share_every_halo(tmp_path, bands):
+    """Any band count that splits the rows, down to bands of one row -- the halo of a 3x3 window: every band but
+    the edge ones reads both neighbours, and every hand-over is one shared buffer."""
+    split = {name: {'parallelism': {'contract': 'outer', 'cas_num': bands}} for name in ('b', 'd')}
+    ctx = lower(_padded_pair_model(), tmp_path, split)
+    d = ctx.ir.execution.get('d_aie')
+    assert d.ports.inputs[d.node.inputs[0].name].count == bands + 2 * (bands - 1)
+    legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['target'].startswith('d_aie.')]
+    assert len(legs) == bands + 2 * (bands - 1) and {e['realization'] for e in legs} == {'shared_memory'}
+    assert ctx.ir.physical.plan['buffers'] == []
+
+
+def test_row_bands_placed_apart_plan_their_halo_as_dma(tmp_path):
+    """Placed where no tile's memory reaches both ends, every hand-over is a planned DMA copy, and none is taken
+    for shared memory."""
+    directives = {
+        'b': {**HALO_SPLIT['b'], 'placement': {'col': 9, 'row': 0}},
+        'd': {**HALO_SPLIT['d'], 'placement': {'col': 5, 'row': 0}},
+    }
+    ctx = lower(_padded_pair_model(), tmp_path, directives)
+    legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['target'].startswith('d_aie.')]
+    assert len(legs) == 4 and {e['realization'] for e in legs} == {'dma'}
+
+
+def test_row_bands_refuse_a_halo_they_cannot_exchange(tmp_path):
+    with pytest.raises(ConfigRefused, match='cannot feed a consumer whose window reads'):
+        lower(_padded_pair_model(pad=0), tmp_path / 'valid', HALO_SPLIT)
+    with pytest.raises(ConfigRefused, match='changes the image height'):
+        lower(_padded_pair_model(k=5, pad=1), tmp_path / 'height', HALO_SPLIT)
+    with pytest.raises(ConfigRefused, match='exchange their halo at stride 1'):
+        lower(_padded_pair_model(stride=2), tmp_path / 'strided', HALO_SPLIT)
+    with pytest.raises(ConfigRefused, match='does not split 8 output rows'):
+        odd = {name: {'parallelism': {'contract': 'outer', 'cas_num': 3}} for name in ('b', 'd')}
+        lower(_padded_pair_model(), tmp_path / 'odd', odd)
+    with pytest.raises(ConfigRefused, match='reads 2 rows past each of its bands of 1 rows'):
+        ones = {name: {'parallelism': {'contract': 'outer', 'cas_num': 8}} for name in ('b', 'd')}
+        lower(_padded_pair_model(k=5, pad=2), tmp_path / 'deep', ones)
+    with pytest.raises(ConfigRefused, match='producer must be split into the same row bands'):
+        lower(_padded_pair_model(), tmp_path / 'whole', {**HALO_SPLIT, 'b': {'parallelism': {'cas_num': 1}}})
+    with pytest.raises(ConfigRefused, match='a halo band is one tile'):
+        cascade = {'parallelism': {'contract': 'outer', 'cas_num': 2, 'cas_length': 2}}
+        lower(_padded_pair_model(), tmp_path / 'cascade', {**HALO_SPLIT, 'd': cascade})
 
 
 def test_stream_conv_carries_the_logical_tensor(tmp_path):
@@ -1155,6 +1261,33 @@ def test_channel_chains_of_a_flattened_conv_match_onnx(tmp_path, part):
         max_code_diff=0,
         part=part,
         iterations=2,
+        per_iteration=True,
+    )
+
+
+def test_row_bands_on_aie1_refuse_a_tile_short_of_dma_channels(tmp_path):
+    """On AIE1 the halo rows of an odd-row band travel by DMA, and the middle conv's odd row sends two of them beside
+    its output to the Dense: three MM2S buffers on one tile, which has two channels. Refused before Vitis, whose
+    placer would only report a failed placement."""
+    with pytest.raises(ConfigRefused, match=r'3 buffers need its MM2S DMA .* which has 2 channels'):
+        lower(_halo_chain_model(), tmp_path, HALO_CHAIN, part=AIE1_PART)
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [PART, MLV2_PART], ids=['aie-ml', 'aie-mlv2'])
+def test_row_bands_exchanging_their_halo_match_onnx(tmp_path, part):
+    """Six iterations of distinct inputs through the three-band chain: every band reads rows its neighbours write
+    in buffers of their own, so a lock released early would show as another iteration's rows."""
+    feeds = np.random.default_rng(13).integers(-40, 40, size=(6, 1, 12, 12, CIN), dtype=np.int8)
+    assert_aie_matches_onnx(
+        _halo_chain_model(),
+        {'x_q': feeds},
+        HALO_CHAIN,
+        tmp_path,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=6,
         per_iteration=True,
     )
 

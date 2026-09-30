@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
-from typing import Optional
+from typing import NamedTuple, Optional, Tuple
 
 from ....ir.graph import OpNode
 from ...utils import (
@@ -37,6 +38,11 @@ def spatial_access_of(node: OpNode) -> SpatialAccess2D:
     )
 
 
+def reads_neighbour_rows(spatial: SpatialAccess2D) -> bool:
+    """Whether a window's output row reads input rows besides its own: a split by rows then overlaps."""
+    return spatial.window[0] > 1 or bool(spatial.pads[0]) or bool(spatial.pads[2])
+
+
 def fused_pool_of(node: OpNode) -> Optional[Pool2DConfig]:
     """The pool a conv2d node fuses into its epilogue, if any, from the trait FusePool left."""
     fused = node.traits.get('fused_pool')
@@ -68,6 +74,49 @@ def frame_view(
         # A producer stores whole register tiles of `column_align` pixels, so every row starts on one.
         row_bytes_align=math.lcm(ROW_ALIGN_PIXELS, column_align),
     )
+
+
+def row_band_view(frame: TensorView, bands: int) -> TensorView:
+    """`frame` cut into `bands` row bands that each own their rows of the image and no border: what one band of
+    a row-split producer writes, and what the band that reads it with its neighbours' rows receives."""
+    return _rows_view(frame, int(frame.logical[1]) // int(bands))
+
+
+def _rows_view(frame: TensorView, rows: int) -> TensorView:
+    tile = (int(frame.tile[0]), int(rows), *(int(x) for x in frame.tile[2:]))
+    return dataclasses.replace(frame, tile=tile, tile_raw=tile)
+
+
+class HaloPort(NamedTuple):
+    """Rows one band writes for a neighbour's window: `rows` rows of band `band`, from its row `first`, which band
+    `reader` reads."""
+
+    band: int
+    first: int
+    rows: int
+    reader: int
+
+
+def halo_ports(bands: int, band_rows: int, top: int, bottom: int) -> Tuple[HaloPort, ...]:
+    """The ports a row-banded frame carries after its `bands` own bands, whose windows read `top` rows of the band
+    above and `bottom` rows of the band below: for each pair of neighbouring bands b and b + 1, band b's last `top`
+    rows, then band b + 1's first `bottom` rows. Every one has a single reader, so it is shared memory wherever both
+    ends reach it."""
+    ports = []
+    for band in range(int(bands) - 1):
+        if top:
+            ports.append(HaloPort(band, int(band_rows) - int(top), int(top), band + 1))
+        if bottom:
+            ports.append(HaloPort(band + 1, 0, int(bottom), band))
+    return tuple(ports)
+
+
+def describe_band_staging(frame: TensorView, access: str, band_rows: int, port: int, halo: Tuple[HaloPort, ...]):
+    """Staging of port `port` of a row-banded frame: a band's own rows, or a halo port's rows (see `halo_ports`)."""
+    bands = int(frame.logical[1]) // int(band_rows)
+    band, first, rows = (port, 0, band_rows) if port < bands else halo[port - bands][:3]
+    row = int(frame.origin[1]) + int(band) * int(band_rows) + int(first)
+    return describe_frame_staging(_rows_view(frame, rows), access, 0, row_step=int(rows), row_base=row)
 
 
 def describe_logical_staging(view: TensorView, access: str, *, transfer_bytes: int = 0, rows=None, channels=None):
@@ -117,15 +166,22 @@ def describe_logical_staging(view: TensorView, access: str, *, transfer_bytes: i
 
 
 def describe_frame_staging(
-    view: TensorView, access: str, port: int, *, row_slice: int = 0, row_step: int = 0, column_phases: int = 1
+    view: TensorView,
+    access: str,
+    port: int,
+    *,
+    row_slice: int = 0,
+    row_step: int = 0,
+    row_base: int = 0,
+    column_phases: int = 1,
 ):
     """Staging of one port's window on a spatial frame.
 
     The frame holds `CHANNEL_BLOCK` channels per chunk with the chunk index outermost, so a port's
     share of the channels is a contiguous region -- which is what makes the channel axis the
     partition axis for both the cascade split and the 'inner' chain split. A row slice -- the
-    'outer' chain split -- is the other partition: it starts `row_slice * row_step` into the frame
-    and runs for the tile's rows, which overlap the neighbouring slices by the window span.
+    'outer' chain split -- is the other partition: it starts `row_base + row_slice * row_step` into the frame
+    and runs for the tile's rows: a window's slices overlap by the window span, a row band owns its rows.
 
     `column_phases` > 1 marks a frame whose columns are grouped by their residue modulo it, as a
     strided window reads them. Only a retiler writes one, and the marker keeps any frame in plain
@@ -139,7 +195,7 @@ def describe_frame_staging(
     blocks = int(view.tile[-1]) // CHANNEL_BLOCK
     origin = ordered_view_shape(view, 'origin')
     tile = ordered_view_shape(view, 'tile')
-    row_offset = int(row_slice) * int(row_step)
+    row_offset = int(row_base) + int(row_slice) * int(row_step)
     plans = {inner_dim: AxisPlan(CHANNEL_BLOCK, CHANNEL_BLOCK, blocks, int(port) * blocks * CHANNEL_BLOCK)}
     if row_step:
         plans[row_dim] = AxisPlan(int(tile[row_dim]), int(tile[row_dim]), 1, row_offset)
