@@ -87,13 +87,15 @@ class Layout:
             return False
         return any(any(not lo <= c < hi for c in coords) for coords, (lo, hi) in zip(inside, self.data))
 
-    def walk(self, box_start: Sequence[int], box_shape: Sequence[int], *, zero_padding: bool = False) -> Dict[str, Any]:
+    def walk(
+        self, box_start: Sequence[int], box_shape: Sequence[int], *, zero_padding: bool = False, word: int = 1
+    ) -> Dict[str, Any]:
         """The DMA walk, as ADF tiling fields, that visits this buffer's elements in its memory order within a plain
         buffer holding the tensor coordinates [box_start, box_start + box_shape). The fastest loops over ascending
         axes, each stepping one element, make the contiguous tile; the rest traverse it.
 
-        A read that wants its padding as zeros gets them wherever the walk leaves its data, inside the buffer or
-        past it; any other walk stays within the buffer.
+        A read that wants its padding as zeros gets them wherever the walk leaves its data; the DMA fills zeros from
+        a whole `word` of elements on, along the contiguous axis.
         """
         rank = len(box_shape)
         tile = [1] * rank
@@ -110,24 +112,25 @@ class Layout:
                 f'A buffer walked in the order {self.loops} steps along one axis at two strides, which one DMA '
                 'descriptor does not express.'
             )
+        span = [(first - int(base), end - int(base)) for (first, end), base in zip(self.span(), box_start)]
+        if any(first < 0 or end > int(extent) for (first, end), extent in zip(span, box_shape)):
+            raise RuntimeError(f'A walk spanning {span} leaves its buffer {list(box_shape)}.')
         walk = {
             'buffer_dimension': [int(extent) for extent in box_shape],
             'tiling_dimension': tile,
-            'offset': [int(start) - int(base) for start, base in zip(self.start, box_start)],
+            'offset': [first for first, _ in span],
             'tile_traversal': traversal,
         }
         if not zero_padding:
-            span = _span(walk)
-            if any(lo < 0 or hi > int(extent) for (lo, hi), extent in zip(span, box_shape)):
-                raise RuntimeError(f'A walk spanning {span} leaves its buffer {list(box_shape)}.')
             return walk
         # The data bounds the zeros only where the walk leaves it; elsewhere the tensor does.
         low, high = [], []
-        for (first, last), (lo, hi), (tensor_lo, tensor_hi), base, extent in zip(
+        for (first, end), (lo, hi), (tensor_lo, tensor_hi), base, extent in zip(
             self.span(), self.data, self.tensor, box_start, box_shape
         ):
             low.append(max(0, (lo if first < lo else tensor_lo) - int(base)))
-            high.append(min(int(extent), (hi if last > hi else tensor_hi) - int(base)))
+            high.append(min(int(extent), (hi if end > hi else tensor_hi) - int(base)))
+        high[0] = min(int(box_shape[0]), -(-high[0] // int(word)) * int(word))
         walk['boundary_dimension'] = [max(0, hi - lo) for lo, hi in zip(low, high)]
         if any(low):
             walk['boundary_offset'] = low
@@ -170,9 +173,10 @@ def port_layout(descriptor: Dict[str, Any]) -> Layout:
     return Layout(tuple(loops), start, data, tensor)
 
 
-def _span(walk: Dict[str, Any]):
-    """Per axis, the [first, last + 1) buffer index a walk visits."""
-    ends = [int(offset) + int(tile) for offset, tile in zip(walk['offset'], walk['tiling_dimension'])]
-    for step in walk['tile_traversal']:
-        ends[int(step['dimension'])] += int(step['stride']) * (int(step['wrap']) - 1)
-    return [(int(offset), end) for offset, end in zip(walk['offset'], ends)]
+def host_layout(descriptor: Dict[str, Any], extent: Sequence[int] | None = None) -> Layout:
+    """A host port's share of a kernel port's tensor, as a PLIO carries it: `extent` elements per axis from the kernel
+    port's origin, in the tensor's own order -- its data extent (`io_tiling_dimension`) unless the host moves more."""
+    kernel = port_layout(descriptor)
+    extent = [int(value) for value in (extent if extent is not None else descriptor['io_tiling_dimension'])]
+    loops = tuple(Loop(axis, extent[axis], 1) for axis in reversed(range(len(extent))))
+    return Layout(loops, kernel.start, kernel.data, kernel.tensor)

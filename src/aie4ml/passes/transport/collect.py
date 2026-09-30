@@ -83,7 +83,7 @@ class TransportCollector:
             source_name,
             view_kind='slice',
         )
-        ports, offset_base, buffer_dimension = self._slice_producer_ports(
+        ports, offset_base = self._slice_producer_ports(
             producer,
             source_name,
             view.axis,
@@ -98,14 +98,13 @@ class TransportCollector:
                 producer_group,
                 ports=ports,
                 offset_base=offset_base,
-                buffer_dimension=buffer_dimension,
             ),
             Endpoint(consumer, slice_tensor, consumer_group),
         )
 
     def _slice_producer_ports(
         self, producer: OpNode, source_tensor: str, axis: int, start: int, extent: int
-    ) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
         inst = self._kernel_inst(producer)
         view = inst.port_views[source_tensor]
         axis_dim = self._view_axis_to_buffer_dim(view, axis)
@@ -134,10 +133,8 @@ class TransportCollector:
                 f'{source_tensor}: slice range [{start}, {end}) does not align exactly with producer ports.'
             )
 
-        dims = list(first_desc['buffer_dimension'])
-        dims[axis_dim] = int(extent)
-        base = tuple(int(start) if dim == axis_dim else 0 for dim in range(len(dims)))
-        return tuple(selected), base, tuple(dims)
+        base = tuple(int(start) if dim == axis_dim else 0 for dim in range(len(first_desc['buffer_dimension'])))
+        return tuple(selected), base
 
     def _concat_connections(
         self,
@@ -281,7 +278,7 @@ class TransportCollector:
             )
         if value.producer is not None:
             raise RuntimeError(
-                f'{logical_tensor}: {view_kind} source producer {value.producer!r} has no resolved ' 'execution output.'
+                f'{logical_tensor}: {view_kind} source producer {value.producer!r} has no resolved execution output.'
             )
         if source_name not in self.execution.graph_inputs:
             raise RuntimeError(

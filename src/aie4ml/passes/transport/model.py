@@ -14,8 +14,7 @@ class Endpoint:
     tensor: str
     group: str
     ports: Optional[Tuple[int, ...]] = None
-    offset_base: Tuple[int, ...] = ()
-    buffer_dimension: Tuple[int, ...] = ()
+    offset_base: Tuple[int, ...] = ()  # where the endpoint's part of the tensor starts, for a view's part
 
     def __post_init__(self) -> None:
         if self.ports is not None:
@@ -24,12 +23,7 @@ class Endpoint:
                 raise ValueError(f'{self.tensor}: endpoint ports must be unique non-negative indices.')
             object.__setattr__(self, 'ports', ports)
 
-        base = tuple(int(value) for value in self.offset_base)
-        dims = tuple(int(value) for value in self.buffer_dimension)
-        if dims and (not base or len(base) != len(dims)):
-            raise ValueError(f'{self.tensor}: endpoint buffer dimensions require an equal-rank offset.')
-        object.__setattr__(self, 'offset_base', base)
-        object.__setattr__(self, 'buffer_dimension', dims)
+        object.__setattr__(self, 'offset_base', tuple(int(value) for value in self.offset_base))
 
     def selected_ports(self, total: int) -> Tuple[int, ...]:
         total = int(total)
@@ -71,15 +65,10 @@ class TransportDecision:
 
 @dataclass(frozen=True)
 class TransportUnit:
+    """The ports one realization of a leg joins: the whole leg when direct, or one memory-tile buffer of `count`."""
+
     producer_ports: Tuple[int, ...]
     consumer_ports: Tuple[int, ...]
-    producer_tensor_port_base: int = 0
-    dimension: Optional[int] = None
-    port_stride: Optional[int] = None
-    dimension_base: int = 0
-    dimension_size: Optional[int] = None
-    offset_base: Tuple[int, ...] = ()
-    buffer_dimension: Tuple[int, ...] = ()
     index: int = 0
     count: int = 1
 
@@ -88,8 +77,6 @@ class TransportUnit:
             raise ValueError('Transport unit requires at least one producer port.')
         if self.count <= 0 or self.index < 0 or self.index >= self.count:
             raise ValueError(f'Invalid transport unit index/count ({self.index}/{self.count}).')
-        if bool(self.offset_base) != bool(self.buffer_dimension):
-            raise ValueError('Transport unit localization requires both offset and buffer dimensions.')
 
 
 @dataclass(frozen=True)

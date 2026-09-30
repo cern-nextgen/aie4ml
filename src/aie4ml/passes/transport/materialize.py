@@ -17,16 +17,11 @@ from .boundary import (
     direct_boundary_access,
     graph_input_port_descriptor,
     graph_input_writer_port_descriptor,
-    host_visible_input_staging,
     require_linear_stream_staging,
 )
 from .collect import TransportCollector
-from .descriptors import (
-    describes_natural_order,
-    localize_descriptor,
-    localized_graph_io_descriptor,
-)
-from .layout import port_layout
+from .descriptors import describes_natural_order
+from .layout import host_layout, port_layout
 from .model import EdgeEntry
 
 
@@ -150,11 +145,6 @@ class _MemoryPlanMaterializer:
             return
         if realization != 'memtile':
             raise RuntimeError(f'{entry.logical_tensor}: unsupported transport realization {realization!r}.')
-        graph_input_generic = entry.producer.node is None and entry.graph_input is not None
-        if not graph_input_generic and (
-            entry.unit.dimension is None or entry.unit.port_stride is None or entry.unit.dimension_size is None
-        ):
-            raise RuntimeError(f'{entry.logical_tensor}: missing shard metadata; run port-limit legalization first.')
         self._emit_memtile(entry, p_ports, c_ports)
 
     def _route(self, entry: EdgeEntry) -> str:
@@ -311,222 +301,126 @@ class _MemoryPlanMaterializer:
     # ------------------------------------------------------------------
 
     def _emit_memtile(self, entry, p_ports, c_ports):
-        unit = entry.unit
-        if entry.producer.node:
-            inst = self._kernel_inst(entry.producer.node)
-            first_port = int(unit.producer_ports[0])
-            base = inst.variant.describe_output_staging(
-                entry.producer.node, inst.config, entry.producer.tensor, first_port
-            )
-            localize_descriptor(base, entry.producer.offset_base, entry.producer.buffer_dimension)
-            shard_dim = int(unit.dimension)
-            port_stride = int(unit.port_stride)
-            unit_base_dim0 = int(unit.dimension_base)
-            full_dims = list(base['buffer_dimension'])
-            buf_dims = list(full_dims)
-            buf_dims[shard_dim] = int(unit.dimension_size)
-        else:
-            if entry.graph_input is not None:
-                base = graph_input_port_descriptor(entry, p_ports[0])
-                buf_dims = list(unit.buffer_dimension)
+        """One memory-tile buffer: it holds, plainly, the part of the tensor its unit's walks visit, and every port --
+        a kernel's or the host's -- walks it in the order of its own layout."""
+        producer = entry.producer
+        writers = []  # (port, staging, layout)
+        for port in p_ports:
+            if producer.node is None:
+                staging = graph_input_writer_port_descriptor(entry, port)
+                writers.append((port, staging, host_layout(graph_input_port_descriptor(entry, port))))
             else:
-                base = self._graph_input_writer_descriptor(entry)
-                shard_dim = int(unit.dimension)
-                port_stride = int(unit.port_stride)
-                unit_base_dim0 = int(unit.dimension_base)
-                full_dims = list(base['buffer_dimension'])
-                buf_dims = list(full_dims)
-                buf_dims[shard_dim] = int(unit.dimension_size)
+                inst = self._kernel_inst(producer.node)
+                staging = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
+                writers.append((port, staging, port_layout(staging).shifted(producer.offset_base)))
+        readers = []  # (port, staging, layout, zero padding)
+        if entry.consumers:
+            consumer = entry.single_consumer()
+            inst = self._kernel_inst(consumer.node)
+            for port in c_ports:
+                staging = inst.variant.describe_input_staging(
+                    consumer.node, inst.config, consumer.tensor, port, producer.node
+                )
+                # A reader that fills its own border takes its padding as it finds it.
+                layout = port_layout(staging).shifted(consumer.offset_base)
+                readers.append((port, staging, layout, 'boundary_dimension' in staging))
+        if entry.graph_output:
+            inst = self._kernel_inst(producer.node)
+            for port in p_ports:
+                base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
+                staging = {**self._graph_output_staging(entry, port), 'access': 'read'}
+                readers.append((port, staging, host_layout(base, staging['tiling_dimension']), True))
 
-        readers = {}
-        if entry.producer.node is not None or entry.graph_input is None:
-            # The memory tile holds its tensor plainly: its box starts where the first port's staging puts the
-            # tensor's first element (past a producer frame's border), at the unit's share of the shard axis.
-            box_start = [int(logical) - int(offset) for offset, logical in zip(base['offset'], base['logical_origin'])]
-            box_start[shard_dim] += int(unit_base_dim0)
-            if entry.consumers:
-                consumer = entry.single_consumer()
-                inst = self._kernel_inst(consumer.node)
-                for i in c_ports:
-                    staging = inst.variant.describe_input_staging(
-                        consumer.node, inst.config, consumer.tensor, i, entry.producer.node
-                    )
-                    readers[i] = (staging, port_layout(staging).shifted(consumer.offset_base))
-            # A reader that fills its own border reads it as it finds it, so the buffer holds whatever its window
-            # covers past the tensor: the box grows to every such walk.
-            box_end = [int(start) + int(extent) for start, extent in zip(box_start, buf_dims)]
-            for staging, layout in readers.values():
-                if 'boundary_dimension' in staging:
-                    continue
-                for axis, (low, high) in enumerate(layout.span()):
-                    box_start[axis], box_end[axis] = min(box_start[axis], low), max(box_end[axis], high)
-            buf_dims = [end - start for start, end in zip(box_start, box_end)]
-
+        # The buffer holds every coordinate its walks visit: none reads or writes past it.
+        spans = [layout.span() for _, _, layout in writers] + [layout.span() for _, _, layout, _ in readers]
+        box_start = [min(span[axis][0] for span in spans) for axis in range(len(spans[0]))]
+        box_shape = [max(span[axis][1] for span in spans) - start for axis, start in enumerate(box_start)]
+        element = self._buffer_dtype(entry)
         name = self._next_buffer_name(entry)
         buffer = {
             'name': name,
-            'dimension': buf_dims,
+            'dimension': box_shape,
             'num_buffers': 2,
-            'ctype': self._buffer_ctype(entry),
+            'ctype': element.c_type,
             'writers': [],
             'readers': [],
             'tensor': entry.logical_tensor,
         }
 
-        base_p = p_ports[0]
-        for slot, p in enumerate(p_ports):
-            if entry.producer.node is None:
-                if entry.graph_input is not None:
-                    desc = localized_graph_io_descriptor(
-                        graph_input_writer_port_descriptor(entry, int(p)),
-                        list(unit.offset_base),
-                        list(buf_dims),
-                    )
-                else:
-                    desc = self._graph_input_writer_descriptor(entry)
-                    desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][shard_dim] = (int(p) - int(base_p)) * int(port_stride)
-                self._max_graph_input_port = max(self._max_graph_input_port, int(p))
-            else:
-                producer = entry.producer
-                inst = self._kernel_inst(producer.node)
-                staging = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, p)
-                layout = port_layout(staging).shifted(producer.offset_base)
-                desc = {**staging, **layout.walk(box_start, buf_dims)}
-
-            source_type, source_endpoint = self._producer_endpoint_meta(entry.producer.node, entry.producer.group, p)
+        for slot, (port, staging, layout) in enumerate(writers):
+            desc = {**staging, **layout.walk(box_start, box_shape)}
+            source_type, source_endpoint = self._producer_endpoint_meta(producer.node, producer.group, port)
             buffer['writers'].append(
                 {
-                    'source': self._producer_endpoint(entry.producer.node, entry.producer.group, p),
+                    'source': self._producer_endpoint(producer.node, producer.group, port),
                     'source_type': source_type,
                     'source_endpoint': source_endpoint,
                     'target': f'{name}.in[{slot}]',
                     'descriptor': desc,
-                    'staging': self._graph_input_staging(entry, int(p)) if entry.producer.node is None else None,
-                    'dtype': self._graph_input_dtype(entry).to_dict() if entry.producer.node is None else None,
+                    'staging': staging if producer.node is None else None,
+                    'dtype': element.to_dict() if producer.node is None else None,
                 }
             )
-            if entry.producer.node is None:
+            if producer.node is None:
+                self._max_graph_input_port = max(self._max_graph_input_port, int(port))
                 self.io_ports.append(
                     {
                         'direction': 'input',
-                        'port': int(p),
+                        'port': int(port),
                         'tensor': entry.logical_tensor,
                         'endpoint': f'{name}.in[{slot}]',
                         'descriptor': desc,
-                        'staging': buffer['writers'][-1]['staging'],
-                        'dtype': buffer['writers'][-1]['dtype'],
+                        'staging': staging,
+                        'dtype': element.to_dict(),
                     }
                 )
 
-        if entry.consumers:
-            consumer = entry.single_consumer()
-            for local_out, i in enumerate(c_ports):
-                if entry.producer.node is None and entry.graph_input is not None:
-                    desc = localized_graph_io_descriptor(
-                        graph_input_port_descriptor(entry, int(base_p + local_out)),
-                        list(unit.offset_base),
-                        list(buf_dims),
-                    )
-                else:
-                    staging, layout = readers[i]
-                    # A reader that fills its own border takes its padding as it finds it.
-                    zeros = 'boundary_dimension' in staging
-                    desc = {**staging, **layout.walk(box_start, buf_dims, zero_padding=zeros)}
-
+        word = 32 // int(element.width)
+        for slot, (port, staging, layout, zeros) in enumerate(readers):
+            desc = {**staging, **layout.walk(box_start, box_shape, zero_padding=zeros, word=word)}
+            if entry.consumers:
+                consumer = entry.single_consumer()
                 buffer['readers'].append(
                     {
-                        'source': f'{name}.out[{local_out}]',
-                        'target': (f'{sanitize_identifier(consumer.node.name)}.{consumer.group}[{i}]'),
+                        'source': f'{name}.out[{slot}]',
+                        'target': f'{sanitize_identifier(consumer.node.name)}.{consumer.group}[{port}]',
                         'target_type': 'op_impl',
                         'target_endpoint': {
                             'op_impl': consumer.node.name,
                             'op_impl_id': sanitize_identifier(consumer.node.name),
                             'group': consumer.group,
-                            'port': int(i),
+                            'port': int(port),
                         },
                         'descriptor': desc,
                     }
                 )
-
-        if entry.graph_output:
-            reader_base = len(buffer['readers'])
-            for slot, local_port in enumerate(p_ports):
-                graph_port = self._next_graph_output_port
-                self._next_graph_output_port += 1
-                desc = self._graph_output_reader_descriptor(entry, local_port, buf_dims, unit_base_dim0=unit_base_dim0)
-                buffer['readers'].append(
-                    {
-                        'source': f'{name}.out[{reader_base + slot}]',
-                        'target': f'ofm[{graph_port}]',
-                        'target_type': 'plio',
-                        'target_endpoint': {'name': 'ofm', 'port': int(graph_port), 'op_impl_port': int(local_port)},
-                        'descriptor': desc,
-                        'staging': self._graph_output_staging(entry, int(local_port)),
-                        'dtype': self._graph_output_dtype(entry).to_dict(),
-                    }
-                )
-                self.io_ports.append(
-                    {
-                        'direction': 'output',
-                        'port': int(graph_port),
-                        'tensor': entry.logical_tensor,
-                        'endpoint': f'{name}.out[{reader_base + slot}]',
-                        'descriptor': desc,
-                        'staging': buffer['readers'][-1]['staging'],
-                        'dtype': buffer['readers'][-1]['dtype'],
-                    }
-                )
+                continue
+            graph_port = self._next_graph_output_port
+            self._next_graph_output_port += 1
+            buffer['readers'].append(
+                {
+                    'source': f'{name}.out[{slot}]',
+                    'target': f'ofm[{graph_port}]',
+                    'target_type': 'plio',
+                    'target_endpoint': {'name': 'ofm', 'port': int(graph_port), 'op_impl_port': int(port)},
+                    'descriptor': desc,
+                    'staging': self._graph_output_staging(entry, int(port)),
+                    'dtype': element.to_dict(),
+                }
+            )
+            self.io_ports.append(
+                {
+                    'direction': 'output',
+                    'port': int(graph_port),
+                    'tensor': entry.logical_tensor,
+                    'endpoint': f'{name}.out[{slot}]',
+                    'descriptor': desc,
+                    'staging': buffer['readers'][-1]['staging'],
+                    'dtype': element.to_dict(),
+                }
+            )
 
         self.buffers.append(buffer)
-
-    # -------------------------------------------------------------------------
-    # Graph IO descriptors
-    # -------------------------------------------------------------------------
-
-    def _graph_input_writer_descriptor(self, entry: EdgeEntry) -> Dict[str, Any]:
-        consumer = entry.single_consumer()
-        inst = self._kernel_inst(consumer.node)
-        port = int(consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)[0])
-        base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None)
-        return host_visible_input_staging(base, offset=[0 for _ in base['io_tiling_dimension']])
-
-    def _graph_output_reader_descriptor(
-        self,
-        entry: EdgeEntry,
-        port: int,
-        buf_dims: List[int],
-        unit_base_dim0: int,
-    ) -> Dict[str, Any]:
-        producer = entry.producer
-        inst = self._kernel_inst(producer.node)
-        base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
-        shard_dim = int(base['slice_dimension'])
-        io_tile = list(base['io_tiling_dimension'])
-        io_boundary = list(base['io_boundary_dimension'])
-
-        offset = list(base['offset'])
-        offset[shard_dim] -= int(unit_base_dim0)
-        boundary = list(io_boundary)
-        boundary[shard_dim] = min(int(buf_dims[shard_dim]), max(0, int(io_boundary[shard_dim]) - int(unit_base_dim0)))
-        inner = int(base['inner_dimension'])
-        tile = self._whole_beats(entry, io_tile, inner)
-        # The boundary is a buffer coordinate the DMA zero-fills past; it too ends on a whole word.
-        word = 32 // int(self._graph_output_dtype(entry).width)
-        boundary[inner] = min(int(buf_dims[inner]), -(-int(boundary[inner]) // word) * word)
-        return {
-            'access': 'read',
-            'storage_layout': STORAGE_LAYOUT_LINEAR,
-            'buffer_dimension': list(buf_dims),
-            'tiling_dimension': tile,
-            'io_tiling_dimension': list(io_tile),
-            'io_boundary_dimension': list(io_boundary),
-            'offset': offset,
-            'boundary_dimension': boundary,
-            'slice_dimension': int(base['slice_dimension']),
-            'inner_dimension': int(base['inner_dimension']),
-            'outer_dimension': int(base['outer_dimension']),
-        }
 
     # ------------------------------------------------------------------
     # Utilities
@@ -564,28 +458,14 @@ class _MemoryPlanMaterializer:
             )
         return role
 
-    def _buffer_ctype(self, entry):
-        if entry.producer.node is None:
-            dtype = self._graph_input_dtype(entry)
-        else:
-            dtype = self._graph_output_dtype(entry)
-        return dtype.c_type
+    def _buffer_dtype(self, entry) -> AIEDataType:
+        return self._graph_input_dtype(entry) if entry.producer.node is None else self._graph_output_dtype(entry)
 
     def _graph_input_dtype(self, entry: EdgeEntry) -> AIEDataType:
         consumer = entry.single_consumer()
         inst = self._kernel_inst(consumer.node)
         role = self._graph_input_role(entry)
         return inst.variant.input_precision(inst.config, role)
-
-    def _graph_input_staging(self, entry: EdgeEntry, port: int) -> Dict[str, Any]:
-        if entry.graph_input is not None:
-            return graph_input_writer_port_descriptor(entry, int(port))
-        desc = self._graph_input_writer_descriptor(entry)
-        shard_dim = int(entry.unit.dimension)
-        port_stride = int(entry.unit.port_stride)
-        tensor_local_port = int(port) - int(entry.unit.producer_tensor_port_base)
-        desc['offset'][shard_dim] = int(tensor_local_port) * int(port_stride)
-        return desc
 
     def _graph_output_dtype(self, entry: EdgeEntry) -> AIEDataType:
         producer = entry.producer

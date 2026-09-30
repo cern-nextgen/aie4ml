@@ -2,22 +2,20 @@ from __future__ import annotations
 
 import copy
 
+import numpy as np
+
 from ...errors import ConfigRefused
 from ...ir import get_backend_context
 from ..base import AIEPass
-from .boundary import (
-    graph_input_full_descriptor,
-    graph_input_port_descs,
-    graph_input_unit_box,
-    graph_input_writer_port_descs,
-)
-from .descriptors import localize_descriptor, rebase_descriptor_offset
+from .boundary import graph_input_port_descs, graph_input_writer_port_descs
+from .layout import port_layout
 from .legality import uses_stream
 from .model import GraphInputSpec, TransportUnit
 
 
 class LegalizeMemtilePortLimits(AIEPass):
-    """Assign physical ports and split memtile transports into legal one-stage shards."""
+    """Number the graph-input ports, and split each memory-tile leg into units within a memory tile's port limits:
+    its writers in port order, each reader in the unit whose writers hold all the data it reads."""
 
     def __init__(self):
         self.name = 'legalize_memtile_port_limits'
@@ -35,98 +33,35 @@ class LegalizeMemtilePortLimits(AIEPass):
             self._validate_classified_entry(entry)
             producer_ports = self._producer_port_ids(entry, ctx)
             consumer_ports = self._consumer_port_ids(entry, ctx)
+            if entry.producer.node is None:
+                descriptors = graph_input_port_descs(entry, ctx, next_graph_input_port)
+                next_graph_input_port += len(descriptors)
+                stream = uses_stream(ctx.ir.execution, entry.endpoints())
+                entry.graph_input = GraphInputSpec(
+                    descriptors, graph_input_writer_port_descs(descriptors, stream=stream)
+                )
+                producer_ports = tuple(descriptors)
 
             if entry.decision.realization == 'direct':
-                if entry.producer.node is None:
-                    port_base = next_graph_input_port
-                    next_graph_input_port += len(producer_ports)
-                    descriptors = graph_input_port_descs(entry, ctx, port_base)
-                    entry.graph_input = GraphInputSpec(
-                        descriptors,
-                        graph_input_writer_port_descs(
-                            descriptors, stream=uses_stream(ctx.ir.execution, entry.endpoints())
-                        ),
-                    )
-                    producer_ports = tuple(port_base + index for index in range(len(producer_ports)))
                 entry.unit = TransportUnit(producer_ports, consumer_ports)
                 rewritten.append(entry)
                 continue
-
             if max_in <= 0 or max_out <= 0:
                 raise RuntimeError(
                     f'{entry.logical_tensor}: memory-tile transport selected on a device without usable '
                     'memory-tile ports.'
                 )
 
-            p = len(producer_ports)
-            c = len(consumer_ports) if entry.consumers else p
-            units = max((p + max_in - 1) // max_in, (c + max_out - 1) // max_out)
-            port_base = next_graph_input_port if entry.producer.node is None else 0
-            if entry.producer.node is None:
-                next_graph_input_port += p
-
-            if entry.producer.node is None:
-                descriptors = graph_input_port_descs(entry, ctx, port_base)
-                graph_input = GraphInputSpec(descriptors, graph_input_writer_port_descs(descriptors))
-            else:
-                graph_input = None
-
-            if units == 1:
-                entry.graph_input = graph_input
-                entry.unit = self._single_unit(entry, ctx, producer_ports, consumer_ports, port_base)
-                self._validate_limits(entry, max_in, max_out)
-                rewritten.append(entry)
-                continue
-
-            changed = True
-            if entry.producer.ports is not None:
-                raise ConfigRefused(f'{entry.logical_tensor}: sharded slice transport is not implemented.')
-            self._validate_one_stage_ratio(entry, p, c)
-
-            p_chunks = self._split_ports_serial(p, units)
-            if entry.producer.node is None:
-                p_chunks = [[port_base + port for port in chunk] for chunk in p_chunks]
-            else:
-                p_chunks = [[producer_ports[port] for port in chunk] for chunk in p_chunks]
-
-            c_chunks = self._consumer_chunks(entry, ctx, p, c, p_chunks, consumer_ports, max_out)
-            if graph_input is None:
-                shard_dim, port_stride, _ = self._shard_params(entry, ctx)
-                unit_sizes = [len(chunk) * int(port_stride) for chunk in p_chunks]
-                unit_bases = []
-                base = 0
-                for size in unit_sizes:
-                    unit_bases.append(base)
-                    base += int(size)
-                unit_boxes = None
-            else:
-                unit_boxes = [graph_input_unit_box(graph_input.port_descriptors, chunk) for chunk in p_chunks]
-
-            for index, (p_ports, c_ports) in enumerate(zip(p_chunks, c_chunks)):
-                legal = copy.copy(entry)
-                legal.graph_input = graph_input
-                if graph_input is not None:
-                    offset_base, buffer_dimension = unit_boxes[index]
-                    legal.unit = TransportUnit(
-                        tuple(p_ports),
-                        tuple(c_ports),
-                        producer_tensor_port_base=port_base,
-                        offset_base=tuple(offset_base),
-                        buffer_dimension=tuple(buffer_dimension),
-                        index=index,
-                        count=units,
-                    )
-                else:
-                    legal.unit = TransportUnit(
-                        tuple(p_ports),
-                        tuple(c_ports),
-                        dimension=shard_dim,
-                        port_stride=port_stride,
-                        dimension_base=unit_bases[index],
-                        dimension_size=unit_sizes[index],
-                        index=index,
-                        count=units,
-                    )
+            reader_count = len(consumer_ports) if entry.consumers else len(producer_ports)
+            units = max(-(-len(producer_ports) // max_in), -(-reader_count // max_out))
+            size = -(-len(producer_ports) // units)
+            writer_chunks = [producer_ports[start : start + size] for start in range(0, len(producer_ports), size)]
+            reader_chunks = self._reader_chunks(entry, ctx, writer_chunks, consumer_ports)
+            count = len(writer_chunks)
+            changed = changed or count > 1
+            for index, (writers, readers) in enumerate(zip(writer_chunks, reader_chunks)):
+                legal = copy.copy(entry) if count > 1 else entry
+                legal.unit = TransportUnit(tuple(writers), tuple(readers), index=index, count=count)
                 self._validate_limits(legal, max_in, max_out)
                 rewritten.append(legal)
 
@@ -140,110 +75,40 @@ class LegalizeMemtilePortLimits(AIEPass):
         if len(entry.consumers) > 1 or (entry.consumers and entry.graph_output):
             raise RuntimeError(f'{entry.logical_tensor}: memtile legalization requires one independent transport leg.')
 
-    def _single_unit(self, entry, ctx, producer_ports, consumer_ports, port_base: int) -> TransportUnit:
-        if entry.producer.node is None:
-            full = graph_input_full_descriptor(entry, ctx)
-            return TransportUnit(
-                tuple(port_base + index for index in range(len(producer_ports))),
-                tuple(consumer_ports),
-                producer_tensor_port_base=port_base,
-                offset_base=tuple(0 for _ in full['offset']),
-                buffer_dimension=tuple(full['buffer_dimension']),
-            )
-        shard_dim, port_stride, full_dim = self._shard_params(entry, ctx)
-        return TransportUnit(
-            tuple(producer_ports),
-            tuple(consumer_ports),
-            dimension=shard_dim,
-            port_stride=port_stride,
-            dimension_size=full_dim,
-        )
-
-    @staticmethod
-    def _validate_one_stage_ratio(entry, producer_count: int, consumer_count: int) -> None:
-        if entry.consumers and consumer_count < producer_count:
-            raise ConfigRefused(
-                f'{entry.logical_tensor}: shard transport requires relay; one-stage sharding cannot contract '
-                f'producer_ports={producer_count} to consumer_ports={consumer_count}.'
-            )
-        if entry.consumers and consumer_count % producer_count != 0:
-            raise ConfigRefused(
-                f'{entry.logical_tensor}: shard transport requires relay; one-stage sharding cannot regroup '
-                f'producer_ports={producer_count} to consumer_ports={consumer_count}.'
-            )
-
-    def _consumer_chunks(self, entry, ctx, p, c, p_chunks, consumer_ports, max_out):
+    def _reader_chunks(self, entry, ctx, writer_chunks, consumer_ports):
+        """The consumer ports each unit serves: a reader goes to the first unit whose writers hold all its data. A
+        graph output's host readers follow their producer ports, so they need no assignment."""
         if not entry.consumers:
-            return [[] for _ in p_chunks]
-        c_per_p = c // p
-        per_shard_out = max((len(chunk) * c_per_p for chunk in p_chunks), default=0)
-        if entry.producer.node is not None and per_shard_out > max_out:
-            raise ConfigRefused(
-                f'{entry.logical_tensor}: shard transport requires relay; one-stage sharding cannot realize '
-                f'producer_ports={p} -> consumer_ports={c} under memtile out-port limit {max_out}.'
-            )
-        if entry.producer.node is not None:
-            return self._consumer_chunks_for_internal_shard(entry, ctx, p_chunks, consumer_ports, c_per_p)
-
-        chunks = []
-        start = 0
-        for p_ports in p_chunks:
-            size = len(p_ports) * c_per_p
-            chunks.append(list(consumer_ports[start : start + size]))
-            start += size
-        if start != c:
-            raise RuntimeError(f'{entry.logical_tensor}: consumer shard assignment mismatch ({start} != {c}).')
-        return chunks
-
-    @staticmethod
-    def _split_ports_serial(count: int, units: int):
-        chunk_size = (count + units - 1) // units
-        return [list(range(start, min(start + chunk_size, count))) for start in range(0, count, chunk_size)]
-
-    def _consumer_chunks_for_internal_shard(self, entry, ctx, p_chunks, consumer_ports, c_per_p: int):
+            return [() for _ in writer_chunks]
+        if len(writer_chunks) == 1:
+            return [tuple(consumer_ports)]
+        written = [[self._writer_data(entry, ctx, port) for port in chunk] for chunk in writer_chunks]
         consumer = entry.single_consumer()
         inst = ctx.ir.execution.get(consumer.node.name)
-        shard_dim, port_stride, full_dim = self._shard_params(entry, ctx)
-        producer_ports = self._producer_port_ids(entry, ctx)
-        producer_groups = {port: index for index, port in enumerate(producer_ports)}
-        port_groups = {}
-
-        for c_port in consumer_ports:
-            desc = inst.variant.describe_input_staging(
-                consumer.node, inst.config, consumer.tensor, c_port, entry.producer.node
+        chunks = [[] for _ in writer_chunks]
+        for port in consumer_ports:
+            staging = inst.variant.describe_input_staging(
+                consumer.node, inst.config, consumer.tensor, port, entry.producer.node
             )
-            rebase_descriptor_offset(desc, consumer.offset_base)
-            offset = int(desc['offset'][shard_dim])
-            extent = int(desc['io_tiling_dimension'][shard_dim])
-            if offset < 0 or extent <= 0 or offset + extent > full_dim:
+            read = port_layout(staging).shifted(consumer.offset_base).data
+            unit = next((index for index, windows in enumerate(written) if _covers(windows, read)), None)
+            if unit is None:
                 raise ConfigRefused(
-                    f'{entry.logical_tensor}: shard transport requires relay; consumer port {c_port} range '
-                    f'[{offset}, {offset + extent}) is invalid for producer shard dim{shard_dim} extent {full_dim}.'
+                    f'{entry.logical_tensor}: {consumer.node.name} port {port} reads data its producer writes into '
+                    'different memory-tile units; a relay is not implemented.'
                 )
-            group = offset // port_stride
-            if group < 0 or group >= len(producer_ports) or offset + extent > (group + 1) * port_stride:
-                raise ConfigRefused(
-                    f'{entry.logical_tensor}: shard transport requires relay; consumer port {c_port} range '
-                    f'[{offset}, {offset + extent}) crosses producer shard boundary for slice {group}.'
-                )
-            port_groups.setdefault(group, []).append(c_port)
+            chunks[unit].append(port)
+        return [tuple(chunk) for chunk in chunks]
 
-        chunks = []
-        for p_ports in p_chunks:
-            chunk = []
-            for p_port in p_ports:
-                chunk.extend(port_groups.get(producer_groups[p_port], []))
-            chunk.sort()
-            expected = len(p_ports) * c_per_p
-            if len(chunk) != expected:
-                raise ConfigRefused(
-                    f'{entry.logical_tensor}: shard transport requires relay; expected {expected} consumer ports '
-                    f'for producer slice set {p_ports}, got {len(chunk)}.'
-                )
-            chunks.append(chunk)
-        if sorted(port for chunk in chunks for port in chunk) != sorted(consumer_ports):
-            raise RuntimeError(f'{entry.logical_tensor}: consumer shard assignment is incomplete.')
-        return chunks
+    @staticmethod
+    def _writer_data(entry, ctx, port):
+        """The tensor coordinates one writer holds as data: a graph-input port's, the part its consumer port reads."""
+        if entry.producer.node is None:
+            return port_layout(entry.graph_input.port_descriptors[int(port)]).data
+        producer = entry.producer
+        inst = ctx.ir.execution.get(producer.node.name)
+        staging = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
+        return port_layout(staging).shifted(producer.offset_base).data
 
     @staticmethod
     def _validate_limits(entry, max_in: int, max_out: int) -> None:
@@ -268,40 +133,14 @@ class LegalizeMemtilePortLimits(AIEPass):
         inst = ctx.ir.execution.get(consumer.node.name)
         return consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)
 
-    def _shard_params(self, entry, ctx):
-        if entry.producer.node is not None:
-            inst = ctx.ir.execution.get(entry.producer.node.name)
-            ports = self._producer_port_ids(entry, ctx)
-            d0 = inst.variant.describe_output_staging(entry.producer.node, inst.config, entry.producer.tensor, ports[0])
-            d1 = (
-                inst.variant.describe_output_staging(entry.producer.node, inst.config, entry.producer.tensor, ports[1])
-                if len(ports) > 1
-                else None
-            )
-            localize_descriptor(d0, entry.producer.offset_base, entry.producer.buffer_dimension)
-            if d1 is not None:
-                localize_descriptor(d1, entry.producer.offset_base, entry.producer.buffer_dimension)
-        else:
-            consumer = entry.single_consumer()
-            inst = ctx.ir.execution.get(consumer.node.name)
-            ports = self._consumer_port_ids(entry, ctx)
-            d0 = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, ports[0], None)
-            d1 = (
-                inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, ports[1], None)
-                if len(ports) > 1
-                else None
-            )
 
-        shard_dim = int(d0['slice_dimension'])
-        port_stride = (
-            int(d1['offset'][shard_dim] - d0['offset'][shard_dim])
-            if d1 is not None
-            else int(d0['buffer_dimension'][shard_dim])
-        )
-        full_dim = int(d0['buffer_dimension'][shard_dim])
-        if full_dim != port_stride * len(ports):
-            raise ConfigRefused(
-                f'{entry.logical_tensor}: shard transport is not legal on dim{shard_dim}; expected '
-                f'buffer_dimension[{shard_dim}] == port_stride * ports ({full_dim} != {port_stride} * {len(ports)}).'
-            )
-        return shard_dim, port_stride, full_dim
+def _covers(windows, window) -> bool:
+    """Whether the boxes `windows` together hold every coordinate of the box `window`."""
+    held = np.zeros([max(0, hi - lo) for lo, hi in window], dtype=bool)
+    for box in windows:
+        cut = []
+        for (lo, hi), (first, end) in zip(box, window):
+            start = min(max(lo, first), end) - first
+            cut.append(slice(start, max(start, min(hi, end) - first)))
+        held[tuple(cut)] = True
+    return bool(held.all())

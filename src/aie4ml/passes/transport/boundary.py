@@ -59,16 +59,7 @@ def require_linear_stream_staging(tensor: str, desc: Dict[str, Any]) -> None:
         )
 
 
-def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
-    consumer = entry.single_consumer()
-    inst = ctx.ir.execution.get(consumer.node.name)
-    port = int(consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)[0])
-    base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None)
-    rebase_descriptor_offset(base, consumer.offset_base)
-    return host_visible_input_staging(base, offset=[0 for _ in base['io_tiling_dimension']])
-
-
-def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False, offset=None) -> Dict[str, Any]:
+def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False) -> Dict[str, Any]:
     """Host-visible descriptor of one graph-input port.
 
     A DMA-fed buffer receives only the logical elements (`io_tiling_dimension`) and the DMA
@@ -85,7 +76,7 @@ def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False, of
         'tiling_dimension': list(base['tiling_dimension']) if stream else list(io_tile),
         'io_tiling_dimension': list(io_tile),
         'io_boundary_dimension': list(base['io_boundary_dimension']),
-        'offset': list(base['offset'] if offset is None else offset),
+        'offset': list(base['offset']),
         'logical_origin': list(base['logical_origin']),
         'slice_dimension': int(base['slice_dimension']),
         'inner_dimension': int(base['inner_dimension']),
@@ -100,27 +91,6 @@ def graph_input_writer_port_descs(
     read_descs: Dict[int, Dict[str, Any]], *, stream: bool = False
 ) -> Dict[int, Dict[str, Any]]:
     return {int(port): host_visible_input_staging(base, stream=stream) for port, base in read_descs.items()}
-
-
-def graph_input_unit_box(descs: Dict[int, Dict[str, Any]], ports: List[int]):
-    if not ports:
-        raise ValueError('graph-input shard unit cannot be empty.')
-    first = descs[int(ports[0])]
-    rank = len(first['offset'])
-    base = [None for _ in range(rank)]
-    limit = [None for _ in range(rank)]
-    for port in ports:
-        desc = descs[int(port)]
-        if len(desc['offset']) != rank:
-            raise ValueError('graph-input port descriptors have inconsistent rank.')
-        tile = list(desc['io_tiling_dimension'])
-        offset = list(desc['offset'])
-        for dim in range(rank):
-            start = int(offset[dim])
-            end = start + int(tile[dim])
-            base[dim] = start if base[dim] is None else min(int(base[dim]), start)
-            limit[dim] = end if limit[dim] is None else max(int(limit[dim]), end)
-    return [int(v) for v in base], [int(limit[d] - base[d]) for d in range(rank)]
 
 
 def graph_input_port_descriptor(entry, port: int) -> Dict[str, Any]:

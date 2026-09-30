@@ -209,26 +209,3 @@ def localize_descriptor(
         if len(boundary) != len(dims):
             raise RuntimeError(f'descriptor {key} rank mismatch during localization.')
         descriptor[key] = [min(dims[dim], max(0, boundary[dim] - base[dim])) for dim in range(len(dims))]
-
-
-def localized_graph_io_descriptor(
-    descriptor: Dict[str, Any],
-    offset_base: Sequence[int],
-    buffer_dimension: Sequence[int],
-) -> Dict[str, Any]:
-    """Return a graph-IO descriptor localized to one memory-tile shard."""
-    localized = copy.deepcopy(descriptor)
-    dims = [int(value) for value in buffer_dimension]
-    boundary = list(localized['io_boundary_dimension'])
-    base = [int(value) for value in offset_base]
-    if len(base) != len(dims) or len(boundary) != len(dims):
-        raise RuntimeError('graph-IO descriptor rank mismatch during localization.')
-    rebase_descriptor_offset(localized, base)
-    localized['buffer_dimension'] = list(dims)
-    if localized.get('access') == 'read':
-        localized['boundary_dimension'] = [
-            min(dims[dim], max(0, int(boundary[dim]) - base[dim])) for dim in range(len(dims))
-        ]
-    else:
-        localized.pop('boundary_dimension', None)
-    return localized
