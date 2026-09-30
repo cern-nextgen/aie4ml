@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from aie4ml.errors import ConfigRefused
 from aie4ml.ir.graph import shard_major_order
+from aie4ml.op_impls.utils.tensor_view import staging_tile_shape
 from helpers import (
     PART,
     TensorProto,
@@ -562,7 +563,7 @@ def test_outer_splits_rows_into_overlapping_slices(tmp_path):
     ports = [conv.variant.describe_input_staging(conv.node, conv.config, conv.node.inputs[0].name, p) for p in (0, 1)]
     assert [d['offset'][2] for d in ports] == [0, 4]  # the second slice starts 4 frame rows in
     assert [d['logical_origin'][2] for d in ports] == [-1, 3]  # slice 0 opens on the top border
-    assert all(d['tiling_dimension'][2] == H // 2 + 2 for d in ports)
+    assert all(staging_tile_shape(d)[2] == H // 2 + 2 for d in ports)
 
     params = conv.variant.build_template_params(conv.node, conv.config, {'row': 0, 'col': 0})
     assert (params['out_h'], params['in_rows']) == (H // 2, H // 2 + 2)
@@ -573,7 +574,7 @@ def test_outer_splits_rows_into_overlapping_slices(tmp_path):
         conv.variant.describe_output_staging(conv.node, conv.config, conv.node.outputs[0].name, p) for p in (0, 1)
     ]
     assert [d['logical_origin'][2] for d in out_ports] == [0, H // 2]
-    assert all(d['tiling_dimension'][2] == H // 2 for d in out_ports)
+    assert all(staging_tile_shape(d)[2] == H // 2 for d in out_ports)
 
     plan = ctx.ir.physical.plan
     edges = {(e['source'], e['target']) for e in plan['direct_edges']}

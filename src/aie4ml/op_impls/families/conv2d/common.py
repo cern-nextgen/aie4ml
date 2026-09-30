@@ -203,10 +203,9 @@ def describe_frame_staging(
     tile = ordered_view_shape(view, 'tile')
     row_offset = int(row_base) + int(row_slice) * int(row_step)
     plans = {inner_dim: AxisPlan(CHANNEL_BLOCK, CHANNEL_BLOCK, blocks, int(port) * blocks * CHANNEL_BLOCK)}
-    if row_step:
-        plans[row_dim] = AxisPlan(int(tile[row_dim]), int(tile[row_dim]), 1, row_offset)
-    else:  # the port holds the tile's rows; a strided window may end before the frame's border does
-        plans[row_dim] = AxisPlan(1, 1, int(tile[row_dim]))
+    # The port holds the tile's rows, row after row, from its slice's first; a strided window may end before the
+    # frame's border does.
+    plans[row_dim] = AxisPlan(1, 1, int(tile[row_dim]), row_offset)
     # The frame is the image inside its zero border, so a window starts `origin` before the image.
     starts = {dim: 0 for dim in range(view.rank)}
     starts[inner_dim] = int(port) * blocks * CHANNEL_BLOCK
