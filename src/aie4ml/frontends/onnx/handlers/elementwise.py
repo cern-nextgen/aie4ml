@@ -39,16 +39,16 @@ def _mul_div(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> 
 
     source = ctx.source_for(source_name, node_name)
     out_name = node.output[0]
+    ctx.propagate_order(source_name, out_name)  # a scalar scale is order-agnostic
     ctx.emit(
         'scale',
         node_name,
         inputs=[source],
-        outputs=[(out_name, ctx.output_shape(out_name, node_name), source.precision)],
+        outputs=[(out_name, ctx.canonical_shape(out_name, node_name), source.precision)],
         roles=['lhs'],
         metadata={'scale': scale, 'layer_class': op_type, 'source_class': op_type, 'source_layer': node_name},
         directives=directives,
     )
-    ctx.propagate_order(source_name, out_name)  # a scalar scale is order-agnostic
 
 
 @onnx_handler('Add')
@@ -72,13 +72,13 @@ def _add(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None
                 f'{node_name}: generic Add only supports exact-shape elementwise inputs; '
                 f'got {lhs_shape} and {rhs_shape}.'
             )
+    ctx.set_order(out_name, order, node_name)  # the sum is the canonical tensor its inputs view alike
     ctx.emit(
         'add',
         node_name,
         inputs=[lhs, rhs],
-        outputs=[(out_name, ctx.output_shape(out_name, node_name), out_precision)],
+        outputs=[(out_name, ctx.canonical_shape(out_name, node_name), out_precision)],
         roles=['lhs', 'rhs'],
         metadata={'layer_class': 'Add', 'source_class': 'Add', 'source_layer': node_name},
         directives=directives,
     )
-    ctx.set_order(out_name, order, node_name)

@@ -1403,3 +1403,48 @@ def test_a_memory_tile_serves_only_the_readers_its_buffer_descriptors_cover(tmp_
     with pytest.raises(ConfigRefused, match=r'1 writers and 8 readers need \[36, 32\] BDs'):
         lower(model, tmp_path / 'eight', fc(8, contract='outer'))
     assert readers(lower(model, tmp_path / 'one', fc(8))) == [8]
+
+
+# --------------------------------------------------------------------------- #
+# convs meeting in an elementwise Add
+# --------------------------------------------------------------------------- #
+
+
+def _residual_model():
+    """Two strided 3x3 convs of the input whose 32-channel 4x4 outputs meet in an Add, then a 1x1 conv: the NCHW
+    Add's shape differs from its NHWC tensor's."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'main', 'main_c', CIN, 32, 3, pad=1, stride=2, relu=False, seed=32)
+    _conv(nodes, inits, 'x_nchw', 'skip', 'skip_c', CIN, 32, 3, pad=1, stride=2, relu=False, seed=33)
+    nodes.append(helper.make_node('Add', ['main', 'skip'], ['sum_raw'], name='sum'))
+    inits += _qparams('sumo', frac=FRAC)
+    qdq(nodes, 'sum_raw', 'sum', 'sumo')
+    _conv(nodes, inits, 'sum', 'proj', 'proj_c', 32, 8, 1, pad=0, relu=False, seed=34)
+    nodes.append(helper.make_node('Transpose', ['proj'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    return make_model(
+        'conv_residual',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, H // 2, W // 2, 8])],
+        initializers=inits,
+    )
+
+
+def test_an_add_of_nchw_activations_is_their_nhwc_tensor(tmp_path):
+    """ONNX adds the NCHW views of two conv outputs; the sum is the canonical NHWC tensor they view, which the next
+    conv reads as 32 channels."""
+    from aie4ml import from_onnx
+
+    model = from_onnx(_residual_model(), {'Part': PART}, output_dir=tmp_path / 'proj', project_name='proj')
+    add = next(node for node in model.context.ir.logical if node.name == 'sum_aie')
+    assert tuple(add.outputs[0].shape) == (1, H // 2, W // 2, 32)
+
+
+def test_an_add_refuses_a_conv_frame_it_cannot_walk(tmp_path):
+    """A conv's frame is stored channel block by channel block, which the add kernel does not walk: the add takes
+    its operands through a memory tile, which does not re-stage such a frame, so the design is refused -- never
+    lowered with a geometry decoded from the frame."""
+    with pytest.raises(ConfigRefused, match='inner-blocked'):
+        lower(_residual_model(), tmp_path, part=PART)

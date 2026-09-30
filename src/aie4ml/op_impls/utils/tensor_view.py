@@ -536,6 +536,8 @@ def build_tensor_view_from_staging(node, tensor, direction: str, desc: Mapping[s
 
     from .io import view_layout
 
+    if desc['storage_layout'] == STORAGE_LAYOUT_INNER_BLOCKED:
+        raise ValueError(f'{node.name}: a channel-blocked frame does not decode to a view of {tensor.name!r}.')
     logical = tuple(int(x) for x in tensor.shape)
     buffer_logical = tuple(reversed(desc['buffer_dimension']))
     if len(buffer_logical) != len(logical) or any(b < s for b, s in zip(buffer_logical, logical)):

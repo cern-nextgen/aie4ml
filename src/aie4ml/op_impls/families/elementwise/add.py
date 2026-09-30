@@ -9,6 +9,7 @@ from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
 from ...utils import (
+    STORAGE_LAYOUT_INNER_BLOCKED,
     ParallelismConfig,
     align_up,
     build_io_views,
@@ -32,16 +33,20 @@ from .config import AddConfig, AddFlags
 
 
 def _select_preserved_staging(tensor_names, input_contracts):
-    """Pick the producer staging this add inherits its geometry from, and the name it came from."""
+    """Pick the producer staging this add inherits its geometry from, and the name it came from. A channel-blocked
+    frame (a conv's output) is not a layout the add walks, so it is never inherited; like any staging the add does
+    not share, it crosses a memtile."""
 
-    primary_name = next((n for n in tensor_names if n in input_contracts), None)
-    if primary_name is None:
-        return None, None, {}
-    primary = input_contracts[primary_name].port_staging
+    inheritable = [
+        n
+        for n in tensor_names
+        if n in input_contracts and input_contracts[n].port_staging[0]['storage_layout'] != STORAGE_LAYOUT_INNER_BLOCKED
+    ]
+    primary = input_contracts[inheritable[0]].port_staging if inheritable else None
     patches = {
         n: 'memtile' for n in tensor_names if n in input_contracts and input_contracts[n].port_staging != primary
     }
-    return primary, primary_name, patches
+    return primary, (inheritable[0] if inheritable else None), patches
 
 
 @register_variant
