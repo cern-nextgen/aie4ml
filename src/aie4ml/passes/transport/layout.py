@@ -4,7 +4,8 @@ A memory tile holds its tensor plainly: row-major over the tensor's padded axes,
 its part of the tensor in the order its kernel reads it -- a conv frame channel block by channel block, a matmul operand
 microtile by microtile. A port's `Layout` states that order once, from the staging its op publishes, and `Layout.walk`
 turns it into the access pattern that moves the port's elements to or from the plain buffer. So the two ends of a
-memory tile agree on the tensor alone, never on each other's layout.
+memory tile agree on the tensor alone, never on each other's layout; and two ports share one buffer, with no memory
+tile, exactly when their layouts are equal.
 
 Coordinates are tensor coordinates in buffer order (the tensor's axes reversed): 0 is the tensor's first element and a
 negative coordinate lies in a border before it.
@@ -12,8 +13,8 @@ negative coordinate lies in a border before it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Sequence, Tuple
 
 from ...errors import ConfigRefused
 from ...op_impls.utils import STORAGE_LAYOUT_INNER_BLOCKED
@@ -31,16 +32,40 @@ class Loop:
 @dataclass(frozen=True)
 class Layout:
     """A kernel buffer: its elements in memory order, as loops from the slowest to the fastest, from the element at
-    tensor coordinate `start`."""
+    tensor coordinate `start`. Per axis, `data` bounds [first, last + 1) the coordinates it holds of the tensor, whose
+    own bounds are `tensor`: the rest is padding -- a border, an alignment, or a slice rounded up past its share --
+    which the kernel ignores or needs as zeros, and which no other port may take for data."""
 
     loops: Tuple[Loop, ...]
     start: Tuple[int, ...]
+    data: Tuple[Tuple[int, int], ...]
+    tensor: Tuple[Tuple[int, int], ...] = field(compare=False)
 
     def shifted(self, base: Sequence[int]) -> 'Layout':
         """The same buffer in the coordinates of a window of the tensor that begins at `base` (a view's part)."""
         if not base:
             return self
-        return Layout(self.loops, tuple(int(start) - int(b) for start, b in zip(self.start, base)))
+
+        def shift(bounds):
+            return tuple((int(lo) - int(b), int(hi) - int(b)) for (lo, hi), b in zip(bounds, base))
+
+        return Layout(
+            self.loops,
+            tuple(int(start) - int(b) for start, b in zip(self.start, base)),
+            *map(shift, (self.data, self.tensor)),
+        )
+
+    def canonical(self) -> 'Layout':
+        """The same buffer with no single-count loop, and each loop that walks whole runs of the next one merged with
+        it: two layouts hold the same elements in the same order exactly when their canonical forms are equal."""
+        loops = []
+        for loop in self.loops:
+            if loop.count == 1:
+                continue
+            if loops and loops[-1].axis == loop.axis and loops[-1].step == loop.step * loop.count:
+                loop = Loop(loop.axis, loops.pop().count * loop.count, loop.step)
+            loops.append(loop)
+        return Layout(tuple(loops), self.start, self.data, self.tensor)
 
     def span(self) -> Tuple[Tuple[int, int], ...]:
         """Per axis, the tensor coordinates [first, last + 1) the buffer holds."""
@@ -49,15 +74,26 @@ class Layout:
             ends[loop.axis] += loop.step * (loop.count - 1)
         return tuple((int(start), end) for start, end in zip(self.start, ends))
 
-    def walk(
-        self, box_start: Sequence[int], box_shape: Sequence[int], *, data: Optional[Sequence[int]] = None
-    ) -> Dict[str, Any]:
+    def pads_within(self) -> bool:
+        """Whether some of its padding lies inside the tensor, where another port holds data."""
+        inside = []
+        for axis, (first, last) in enumerate(self.tensor):
+            coords = {int(self.start[axis])}
+            for loop in self.loops:
+                if loop.axis == axis:
+                    coords = {c + i * loop.step for c in coords for i in range(loop.count)}
+            inside.append({c for c in coords if first <= c < last})
+        if not all(inside):
+            return False
+        return any(any(not lo <= c < hi for c in coords) for coords, (lo, hi) in zip(inside, self.data))
+
+    def walk(self, box_start: Sequence[int], box_shape: Sequence[int], *, zero_padding: bool = False) -> Dict[str, Any]:
         """The DMA walk, as ADF tiling fields, that visits this buffer's elements in its memory order within a plain
         buffer holding the tensor coordinates [box_start, box_start + box_shape). The fastest loops over ascending
         axes, each stepping one element, make the contiguous tile; the rest traverse it.
 
-        A read passes `data`, the tensor's extent: it bounds the real elements, and whatever the walk visits outside
-        them -- a border or padding the buffer holds or not -- reads as zeros.
+        A read that wants its padding as zeros gets them wherever the walk leaves its data, inside the buffer or
+        past it; any other walk stays within the buffer.
         """
         rank = len(box_shape)
         tile = [1] * rank
@@ -80,14 +116,19 @@ class Layout:
             'offset': [int(start) - int(base) for start, base in zip(self.start, box_start)],
             'tile_traversal': traversal,
         }
-        if data is None:
+        if not zero_padding:
             span = _span(walk)
             if any(lo < 0 or hi > int(extent) for (lo, hi), extent in zip(span, box_shape)):
-                raise RuntimeError(f'A write walk spanning {span} leaves its buffer {list(box_shape)}.')
+                raise RuntimeError(f'A walk spanning {span} leaves its buffer {list(box_shape)}.')
             return walk
-        low = [max(0, -int(base)) for base in box_start]
-        high = [min(int(extent), int(end) - int(base)) for extent, end, base in zip(box_shape, data, box_start)]
-        walk['boundary_dimension'] = [hi - lo for lo, hi in zip(low, high)]
+        # The data bounds the zeros only where the walk leaves it; elsewhere the tensor does.
+        low, high = [], []
+        for (first, last), (lo, hi), (tensor_lo, tensor_hi), base, extent in zip(
+            self.span(), self.data, self.tensor, box_start, box_shape
+        ):
+            low.append(max(0, (lo if first < lo else tensor_lo) - int(base)))
+            high.append(min(int(extent), (hi if last > hi else tensor_hi) - int(base)))
+        walk['boundary_dimension'] = [max(0, hi - lo) for lo, hi in zip(low, high)]
         if any(low):
             walk['boundary_offset'] = low
         return walk
@@ -119,7 +160,14 @@ def port_layout(descriptor: Dict[str, Any]) -> Layout:
             if width % phases:
                 raise ValueError(f'A row of {width} columns does not split into {phases} column phases.')
             loops[row : row + 1] = [Loop(columns, phases, 1), Loop(columns, width // phases, phases)]
-    return Layout(tuple(loops), tuple(int(start) for start in descriptor['logical_origin']))
+    start = tuple(int(origin) for origin in descriptor['logical_origin'])
+    tensor = tuple((0, int(extent)) for extent in descriptor['io_boundary_dimension'])
+    # The port holds the tensor's elements from its origin for its data extent (`io_tiling_dimension`).
+    data = tuple(
+        (max(0, origin), max(0, min(last, origin + int(held))))
+        for origin, held, (_, last) in zip(start, descriptor['io_tiling_dimension'], tensor)
+    )
+    return Layout(tuple(loops), start, data, tensor)
 
 
 def _span(walk: Dict[str, Any]):

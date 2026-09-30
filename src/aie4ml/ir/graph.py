@@ -322,9 +322,8 @@ staging descriptor, not a name."""
 class TensorContract:
     """Resolved execution contract for a single tensor edge.
 
-    `port_staging` is the layout: the DMA access pattern the producer wrote, and the sole
-    thing legality compares to decide direct-vs-memtile. A layout *name* could never be that
-    gate -- two 'tiled' descriptors still differ on microtile, tile height or transpose.
+    `port_staging` is the layout: the staging each producer port writes, which a consumer may adopt
+    port for port. `view` is the producer's view of the tensor, the geometry those stagings lay out.
 
     `contract` is the one scalar a consumer inherits directly -- the partition axis is not
     recoverable from a single descriptor. Everything else it reads out of `port_staging`.
@@ -337,6 +336,7 @@ class TensorContract:
     contract: str  # one of STAGING_CONTRACTS: which axis cas_num partitions
     port_staging: Tuple[Dict[str, Any], ...] = ()
     inner_shards: Optional[Tuple[int, int]] = None
+    view: Any = None  # TensorView
 
 
 def shard_major_order(extent: int, shards: int, width: int) -> np.ndarray:

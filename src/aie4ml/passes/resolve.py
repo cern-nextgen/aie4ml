@@ -12,7 +12,7 @@ from ..ir.graph import (
     input_role,
 )
 from ..op_impls import get_family_resolver_registry
-from ..op_impls.utils.io import check_io_view, normalized_staging, resolve_io_route
+from ..op_impls.utils.io import check_io_view, resolve_io_route
 from .base import AIEPass
 
 
@@ -27,10 +27,10 @@ def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
         contracts[tensor] = TensorContract(
             contract=contract,
             port_staging=tuple(
-                normalized_staging(inst.variant.describe_output_staging(inst.node, inst.config, tensor, port))
-                for port in ports
+                inst.variant.describe_output_staging(inst.node, inst.config, tensor, port) for port in ports
             ),
             inner_shards=inst.variant.output_inner_shards(inst.node, inst.config, tensor),
+            view=inst.port_views[tensor],
         )
     return contracts
 

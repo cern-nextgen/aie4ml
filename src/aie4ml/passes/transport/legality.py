@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import copy
-
 from ...op_impls.common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM
-from ...op_impls.utils.io import normalized_staging
-from .descriptors import localize_descriptor
+from .layout import port_layout
 from .model import Endpoint
 
 
@@ -28,21 +25,34 @@ def memtile_staging_failure(execution, endpoints) -> str | None:
     """Why a memory tile cannot re-stage this entry, or None when it can.
 
     Storage encoding and routing are separate concerns: this answers only whether the memtile
-    pass knows how to shard the layout the endpoints use.
+    pass knows how to shard the layout the endpoints use. A memory tile holds the tensor itself and a
+    producer's DMA writes all its buffer holds, so padding a producer holds inside the tensor would land
+    on another port's data.
     """
     for endpoint in endpoints:
         if endpoint.node is None:
             continue
         inst = execution.get(endpoint.node.name)
         if endpoint.tensor in inst.ports.outputs:
-            desc = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, 0)
+            ports = range(int(inst.ports.outputs[endpoint.tensor].count))
+            stagings = [
+                inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, port)
+                for port in ports
+            ]
         else:
-            desc = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0, None)
-        if 'transfer_bytes' in desc:
+            stagings = [inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0, None)]
+        if 'transfer_bytes' in stagings[0]:
             return (
                 f'{endpoint.node.name}.{endpoint.group} frames each inference as a padded transfer, which '
                 'memtile staging does not implement'
             )
+        if endpoint.tensor in inst.ports.outputs:
+            for port, staging in enumerate(stagings):
+                if port_layout(staging).pads_within():
+                    return (
+                        f'{endpoint.node.name}.{endpoint.group}[{port}] holds padding inside the tensor, which '
+                        "its DMA would write over another port's data"
+                    )
     return None
 
 
@@ -78,30 +88,21 @@ def direct_transport_failure(
         if any(int(port) < 0 or int(port) >= len(tc.port_staging) for port in producer_ports):
             return f'producer ports {producer_ports} exceed the published staging contract'
 
+    # One buffer serves both kernels when every position holds the same element, as data or as padding, for both.
     for p_port, c_port in zip(producer_ports, consumer_ports):
-        src_desc = producer_inst.variant.describe_output_staging(
+        written = producer_inst.variant.describe_output_staging(
             producer.node, producer_inst.config, producer.tensor, int(p_port)
         )
-        if producer.offset_base:
-            src_desc = copy.deepcopy(src_desc)
-            localize_descriptor(src_desc, producer.offset_base, producer.buffer_dimension)
-        dst_desc = consumer_inst.variant.describe_input_staging(
-            consumer.node,
-            consumer_inst.config,
-            consumer.tensor,
-            int(c_port),
-            producer.node,
+        read = consumer_inst.variant.describe_input_staging(
+            consumer.node, consumer_inst.config, consumer.tensor, int(c_port), producer.node
         )
-        dst_desc = copy.deepcopy(dst_desc)
-        localize_descriptor(dst_desc, consumer.offset_base, src_desc['buffer_dimension'])
-        src_staging = normalized_staging(src_desc)
-        dst_staging = normalized_staging(dst_desc)
-        if src_staging != dst_staging:
-            keys = sorted(
-                key for key in set(src_staging) | set(dst_staging) if src_staging.get(key) != dst_staging.get(key)
-            )
-            return (
-                f'staging mismatch at {producer.node.name}.{producer.group}[{p_port}] -> '
-                f'{consumer.node.name}.{consumer.group}[{c_port}] ({", ".join(keys)})'
-            )
+        where = f'{producer.node.name}.{producer.group}[{p_port}] -> {consumer.node.name}.{consumer.group}[{c_port}]'
+        if written.get('transfer_bytes') != read.get('transfer_bytes'):
+            return f'staging mismatch at {where}: the ports frame each inference as different transfers'
+        source = port_layout(written).shifted(producer.offset_base).canonical()
+        target = port_layout(read).shifted(consumer.offset_base).canonical()
+        if source.data != target.data:
+            return f'staging mismatch at {where}: the ports hold different parts of the tensor as data'
+        if source != target:
+            return f'staging mismatch at {where}: the buffers hold the tensor in different orders'
     return None

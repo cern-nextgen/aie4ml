@@ -1,4 +1,4 @@
-"""Layout reaches transport as a staging descriptor, and descriptor equality makes an edge direct."""
+"""Layout reaches transport as a staging descriptor, and layout equality makes an edge direct."""
 
 from __future__ import annotations
 
@@ -98,10 +98,10 @@ def test_a_linear_consumer_of_tiled_data_needs_a_memtile(dense_then_layernorm, t
     assert 'fc_out' in memtiles(ctx)
 
 
-def test_aie1_staging_mismatch_identifies_the_ports_and_descriptor_fields(dense_then_layernorm, tmp_path):
+def test_aie1_staging_mismatch_identifies_the_ports_and_what_differs(dense_then_layernorm, tmp_path):
     with pytest.raises(
         ConfigRefused,
-        match=r'staging mismatch at fc_aie\.out1\[0\] -> ln_aie\.in1\[0\] \([^)]*tiling_dimension',
+        match=r'staging mismatch at fc_aie\.out1\[0\] -> ln_aie\.in1\[0\]: the buffers hold the tensor in different',
     ):
         lower(
             dense_then_layernorm,
@@ -203,3 +203,39 @@ def test_a_consumer_adopts_the_split_its_producers_agree_on(two_denses_into_add,
     ctx = _lower_add(two_denses_into_add, tmp_path, outer, outer, add=parallelism(2))
     assert config_of(ctx, 'add_aie').parallelism.cas_num == 4
     assert {('fc_a_aie', 'add_aie'), ('fc_b_aie', 'add_aie')} <= direct_edges(ctx)
+
+
+def _dense_chain(features):
+    """x -> dense to `features` -> dense: the second reads the first's output whole or in slices."""
+    rng = np.random.default_rng(5)
+    nodes: list = []
+    dq(nodes, 'x_i8', 'x', 'x')
+    dq(nodes, 'w1_i8', 'w1', 'w1')
+    dq(nodes, 'w2_i8', 'w2', 'w2')
+    nodes.append(helper.make_node('MatMul', ['x', 'w1'], ['h_raw'], name='d1'))
+    qdq(nodes, 'h_raw', 'h', 'h')
+    nodes.append(helper.make_node('MatMul', ['h', 'w2'], ['y_raw'], name='d2'))
+    qdq(nodes, 'y_raw', 'y', 'y')
+    return make_model(
+        'dense_chain',
+        nodes=nodes,
+        inputs=[('x_i8', TensorProto.INT8, [8, 32])],
+        outputs=[('y', TensorProto.FLOAT, [8, 16])],
+        initializers=[
+            *qparams('x'),
+            *qparams('w1'),
+            *qparams('w2'),
+            *qparams('h'),
+            *qparams('y'),
+            numpy_helper.from_array(rng.integers(-4, 4, size=(32, features), dtype=np.int8), 'w1_i8'),
+            numpy_helper.from_array(rng.integers(-4, 4, size=(features, 16), dtype=np.int8), 'w2_i8'),
+        ],
+    )
+
+
+def test_a_producer_that_pads_each_slice_does_not_write_a_memory_tile(tmp_path):
+    """15 features in three slices, each padded to a whole tile: a memory tile holds the tensor itself, so each
+    slice's padding would land on the next slice's features. The transport refuses rather than miscompile."""
+    directives = {'d1': parallelism(3, contract='inner'), 'd2': parallelism(1, cas_length=2)}
+    with pytest.raises(ConfigRefused, match='holds padding inside the tensor'):
+        lower(_dense_chain(15), tmp_path, directives, part=PART)

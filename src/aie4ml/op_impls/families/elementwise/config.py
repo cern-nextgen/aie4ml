@@ -23,8 +23,7 @@ class AddConfig:
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
     alternating_horizontal: bool
-    preserved_staging: Optional[Tuple[Dict[str, Any], ...]] = None
-    #: Inputs `preserved_staging` describes verbatim, so they hand over with no memtile.
-    preserved_tensors: Tuple[str, ...] = ()
+    #: The producer stagings the add lays every tensor out in, port for port; None for its own layout.
+    adopted_staging: Optional[Tuple[Dict[str, Any], ...]] = None
     flags: AddFlags = AddFlags(transpose_lhs=False, transpose_rhs=False)
     microtile: Optional[MicrotileShape] = None

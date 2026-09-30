@@ -344,11 +344,9 @@ class _MemoryPlanMaterializer:
         readers = {}
         if entry.producer.node is not None or entry.graph_input is None:
             # The memory tile holds its tensor plainly: its box starts where the first port's staging puts the
-            # tensor's first element (past a producer frame's border), at the unit's share of the shard axis; the
-            # tensor's real elements end at its extent.
+            # tensor's first element (past a producer frame's border), at the unit's share of the shard axis.
             box_start = [int(logical) - int(offset) for offset, logical in zip(base['offset'], base['logical_origin'])]
             box_start[shard_dim] += int(unit_base_dim0)
-            data = [int(extent) for extent in base['io_boundary_dimension']]
             if entry.consumers:
                 consumer = entry.single_consumer()
                 inst = self._kernel_inst(consumer.node)
@@ -435,8 +433,9 @@ class _MemoryPlanMaterializer:
                     )
                 else:
                     staging, layout = readers[i]
-                    wanted = data if 'boundary_dimension' in staging else None  # it zeroes the rest itself
-                    desc = {**staging, **layout.walk(box_start, buf_dims, data=wanted)}
+                    # A reader that fills its own border takes its padding as it finds it.
+                    zeros = 'boundary_dimension' in staging
+                    desc = {**staging, **layout.walk(box_start, buf_dims, zero_padding=zeros)}
 
                 buffer['readers'].append(
                     {

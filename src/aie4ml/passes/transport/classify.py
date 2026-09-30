@@ -100,8 +100,9 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
         if staging_compatible:
             realization = 'direct'
         elif not can_memtile:
+            memtile = restage_failure if has_memtile else 'the device has no memory tile'
             raise ConfigRefused(
-                f'{tensor}: AIE1 cannot directly connect this transport: {direct_failure}; '
+                f'{tensor}: cannot connect directly ({direct_failure}), nor through a memory tile ({memtile}); '
                 'relay/relayout is not implemented.'
             )
         else:

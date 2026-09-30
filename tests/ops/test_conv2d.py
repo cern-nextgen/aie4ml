@@ -484,12 +484,17 @@ def _conv_fanout_model():
 
 
 def test_frame_readers_with_other_windows_read_through_a_memory_tile(tmp_path):
-    """The 1x1 conv reads the image its producer writes directly; the padded 3x3, which reads another window, and
-    the Add, which reads the image of two frames, take theirs through a memory tile that lays it out for them."""
+    """The 1x1 conv reads the image its producer writes directly; the padded 3x3, which reads another window, takes
+    its frame through a memory tile. The Add takes its operands' frame as its own layout: one arrives in shared
+    memory, the other by DMA, and the sum goes on to the next conv in shared memory."""
     ctx = lower(_conv_fanout_model(), tmp_path, part=PART)
-    edges = ctx.ir.physical.plan['direct_edges']
-    assert {e['target'].split('.')[0] for e in edges if e['source'].startswith('c_aie.')} == {'w1_aie'}
-    assert {'c_relu', 'p1_conv', 'p2_conv', 'sum'} <= {buffer['tensor'] for buffer in ctx.ir.physical.plan['buffers']}
+    plan = ctx.ir.physical.plan
+    edges = {(e['source'].split('.')[0], e['target']): e.get('realization') for e in plan['direct_edges']}
+    assert {target.split('.')[0] for source, target in edges if source == 'c_aie'} == {'w1_aie'}
+    assert [buffer['tensor'] for buffer in plan['buffers']] == ['c_relu']
+    assert edges[('p1_aie', 'sum_aie.in1[0]')] == 'shared_memory'
+    assert edges[('p2_aie', 'sum_aie.in2[0]')] == 'dma'
+    assert edges[('sum_aie', 'p3_aie.in1[0]')] == 'shared_memory'
 
 
 def _downsampling_block_model():
@@ -1495,9 +1500,13 @@ def test_an_add_of_nchw_activations_is_their_nhwc_tensor(tmp_path):
     assert tuple(add.outputs[0].shape) == (1, H // 2, W // 2, 32)
 
 
-def test_an_add_reads_conv_frames_through_a_memory_tile(tmp_path):
-    """A conv's frame is stored channel block by channel block, which the add kernel does not walk: a memory tile
-    lays the frames out as the add reads them, and the sum as the next conv reads it."""
+def test_an_add_takes_the_frame_its_operands_arrive_in(tmp_path):
+    """A conv's frame is stored channel block by channel block; an add sums element by element, so it takes that
+    frame as the layout of all its tensors: no memory tile, one operand in shared memory, the other by DMA."""
     ctx = lower(_residual_model(), tmp_path, part=PART)
-    staged = {reader['target'] for buffer in ctx.ir.physical.plan['buffers'] for reader in buffer['readers']}
-    assert {'sum_aie.in1[0]', 'sum_aie.in2[0]', 'proj_c_aie.in1[0]'} <= staged
+    plan = ctx.ir.physical.plan
+    assert plan['buffers'] == []
+    edges = {(e['source'].split('.')[0], e['target']): e.get('realization') for e in plan['direct_edges']}
+    assert edges[('main_c_aie', 'sum_aie.in1[0]')] == 'shared_memory'
+    assert edges[('skip_c_aie', 'sum_aie.in2[0]')] == 'dma'
+    assert edges[('sum_aie', 'proj_c_aie.in1[0]')] == 'shared_memory'

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence
-
-from ...ir.graph import STAGING_CONTRACTS, TensorContract
-from .tensor_view import STORAGE_LAYOUTS
+from typing import Any, Dict, List
 
 
 def check_io_view(node, generation: str) -> None:
@@ -47,56 +44,6 @@ def resolve_io_route(node) -> Dict[str, Any]:
             )
         route[direction].update(modes)
     return route
-
-
-def resolve_input_contract(
-    input_contracts: Dict[str, TensorContract],
-    tensor_names: Sequence[str],
-    default: str = 'outer',
-) -> tuple[str, Dict[str, str]]:
-    """Choose a multi-input staging contract from propagated producer contracts.
-
-    Returns (contract, io_route_patches). Inputs whose contract differs from the
-    chosen one are patched to 'memtile'. The first known input contract wins.
-    """
-
-    found = {name: input_contracts[name] for name in tensor_names if name in input_contracts}
-    if not found:
-        return default, {}
-
-    primary_name = next(name for name in tensor_names if name in found)
-    contract = found[primary_name].contract
-
-    if contract not in STAGING_CONTRACTS:
-        raise ValueError(
-            f'Producer emitted unknown staging contract {contract!r}; ' f'expected one of {sorted(STAGING_CONTRACTS)}.'
-        )
-
-    patches: Dict[str, str] = {name: 'memtile' for name, tc in found.items() if tc.contract != contract}
-    return contract, patches
-
-
-_STAGING_COMPAT_STRIP = frozenset({'access', 'boundary_dimension', 'slice_dimension'})
-"""Keys stripped from staging descriptors before compatibility comparison.
-
-'access' is read/write direction — irrelevant for shape compatibility.
-'boundary_dimension' is a per-shard override computed by the planner and absent
-from the canonical per-port descriptor; consumers must not compare it.
-'slice_dimension' names the logical partition axis; compatibility is determined by
-the concrete port count, offsets, dimensions, and traversal instead.
-"""
-
-
-def normalized_staging(desc: Dict[str, Any] | None) -> Dict[str, Any] | None:
-    if desc is None:
-        return None
-    storage_layout = desc.get('storage_layout')
-    if storage_layout not in STORAGE_LAYOUTS:
-        raise ValueError(f'Unknown or missing staging storage_layout {storage_layout!r}.')
-    data = {k: v for k, v in desc.items() if k not in _STAGING_COMPAT_STRIP}
-    if 'io_boundary_dimension' in data and 'boundary_dimension' not in data:
-        data['boundary_dimension'] = data['io_boundary_dimension']
-    return data
 
 
 def view_shape(node, tensor, direction: str) -> List[int]:
