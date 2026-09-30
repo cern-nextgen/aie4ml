@@ -18,6 +18,9 @@ adf::tiling({
   {% if desc.boundary_dimension %}
     , .boundary_dimension = { {{ desc.boundary_dimension|join(', ') }} }
   {% endif %}
+  {% if desc.boundary_offset %}
+    , .boundary_offset = { {{ desc.boundary_offset|join(', ') }} }
+  {% endif %}
 })
 {%- endmacro %}
 

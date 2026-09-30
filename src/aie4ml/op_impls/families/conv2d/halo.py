@@ -129,7 +129,11 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         # Every band writes its own rows into its reader's window, the frame's rows the reader's window covers; the
         # edge rows its neighbours read get ports of their own (halo_ports).
         view = frame_view(
-            node.outputs[0], column_block=column_block, column_align=column_align, row_slices=int(parallelism.cas_num)
+            node.outputs[0],
+            shared_consumer_spatial_access(node.outputs[0]),
+            column_block=column_block,
+            column_align=column_align,
+            row_slices=int(parallelism.cas_num),
         )
         rows = int(view.logical[1]) // int(parallelism.cas_num)
         if max(top, bottom) > rows:
@@ -221,15 +225,15 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
     def output_inner_shards(self, _node, _config, _tensor_name):
         return None
 
-    def describe_input_staging(self, node, config, tensor_name, port, _buf_dims=None, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
         if not _reads_halo(node):
-            return super().describe_input_staging(node, config, tensor_name, port, _buf_dims, _producer)
+            return super().describe_input_staging(node, config, tensor_name, port, _producer)
         rows, halo = self._halo(node, config, 'lhs')
         return describe_band_staging(config.io_views[tensor_name], 'read', rows, int(port), halo)
 
-    def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
+    def describe_output_staging(self, node, config, tensor_name, port):
         if not any(_sent_rows(node)):
-            return super().describe_output_staging(node, config, tensor_name, port, buf_dims)
+            return super().describe_output_staging(node, config, tensor_name, port)
         rows, halo = self._halo(node, config, 'output')
         return describe_band_staging(config.io_views[tensor_name], 'write', rows, int(port), halo)
 

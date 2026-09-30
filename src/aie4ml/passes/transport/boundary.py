@@ -42,7 +42,7 @@ def graph_input_port_descs(entry, ctx, port_base: int) -> Dict[int, Dict[str, An
     for local_port, port in enumerate(consumer_ports):
         graph_port = int(port_base) + int(local_port)
         descs[graph_port] = inst.variant.describe_input_staging(
-            consumer.node, inst.config, consumer.tensor, int(port), None, None
+            consumer.node, inst.config, consumer.tensor, int(port), None
         )
         rebase_descriptor_offset(descs[graph_port], consumer.offset_base)
         if binding.kind == PORT_KIND_STREAM:
@@ -63,7 +63,7 @@ def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
     consumer = entry.single_consumer()
     inst = ctx.ir.execution.get(consumer.node.name)
     port = int(consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)[0])
-    base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None, None)
+    base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None)
     rebase_descriptor_offset(base, consumer.offset_base)
     return host_visible_input_staging(base, offset=[0 for _ in base['io_tiling_dimension']])
 

@@ -27,6 +27,7 @@ from .descriptors import (
     localize_descriptor,
     localized_graph_io_descriptor,
 )
+from .layout import port_layout
 from .model import EdgeEntry
 
 
@@ -261,7 +262,7 @@ class _MemoryPlanMaterializer:
         for producer_port in producer_ports:
             endpoint = f'{producer_id}.{producer.group}[{int(producer_port)}]'
             base = inst.variant.describe_output_staging(
-                producer.node, inst.config, producer.tensor, int(producer_port), None
+                producer.node, inst.config, producer.tensor, int(producer_port)
             )
             staging = _host_visible_output_staging(base, stream=stream)
             descriptor = dict(base)
@@ -318,7 +319,7 @@ class _MemoryPlanMaterializer:
             inst = self._kernel_inst(entry.producer.node)
             first_port = int(unit.producer_ports[0])
             base = inst.variant.describe_output_staging(
-                entry.producer.node, inst.config, entry.producer.tensor, first_port, None
+                entry.producer.node, inst.config, entry.producer.tensor, first_port
             )
             localize_descriptor(base, entry.producer.offset_base, entry.producer.buffer_dimension)
             shard_dim = int(unit.dimension)
@@ -339,6 +340,32 @@ class _MemoryPlanMaterializer:
                 full_dims = list(base['buffer_dimension'])
                 buf_dims = list(full_dims)
                 buf_dims[shard_dim] = int(unit.dimension_size)
+
+        readers = {}
+        if entry.producer.node is not None or entry.graph_input is None:
+            # The memory tile holds its tensor plainly: its box starts where the first port's staging puts the
+            # tensor's first element (past a producer frame's border), at the unit's share of the shard axis; the
+            # tensor's real elements end at its extent.
+            box_start = [int(logical) - int(offset) for offset, logical in zip(base['offset'], base['logical_origin'])]
+            box_start[shard_dim] += int(unit_base_dim0)
+            data = [int(extent) for extent in base['io_boundary_dimension']]
+            if entry.consumers:
+                consumer = entry.single_consumer()
+                inst = self._kernel_inst(consumer.node)
+                for i in c_ports:
+                    staging = inst.variant.describe_input_staging(
+                        consumer.node, inst.config, consumer.tensor, i, entry.producer.node
+                    )
+                    readers[i] = (staging, port_layout(staging).shifted(consumer.offset_base))
+            # A reader that fills its own border reads it as it finds it, so the buffer holds whatever its window
+            # covers past the tensor: the box grows to every such walk.
+            box_end = [int(start) + int(extent) for start, extent in zip(box_start, buf_dims)]
+            for staging, layout in readers.values():
+                if 'boundary_dimension' in staging:
+                    continue
+                for axis, (low, high) in enumerate(layout.span()):
+                    box_start[axis], box_end[axis] = min(box_start[axis], low), max(box_end[axis], high)
+            buf_dims = [end - start for start, end in zip(box_start, box_end)]
 
         name = self._next_buffer_name(entry)
         buffer = {
@@ -366,13 +393,11 @@ class _MemoryPlanMaterializer:
                     desc['offset'][shard_dim] = (int(p) - int(base_p)) * int(port_stride)
                 self._max_graph_input_port = max(self._max_graph_input_port, int(p))
             else:
-                inst = self._kernel_inst(entry.producer.node)
-                desc = inst.variant.describe_output_staging(
-                    entry.producer.node, inst.config, entry.producer.tensor, p, buf_dims
-                )
-                localize_descriptor(desc, entry.producer.offset_base, entry.producer.buffer_dimension)
-                desc['buffer_dimension'] = list(buf_dims)
-                desc['offset'][shard_dim] -= int(unit_base_dim0)
+                producer = entry.producer
+                inst = self._kernel_inst(producer.node)
+                staging = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, p)
+                layout = port_layout(staging).shifted(producer.offset_base)
+                desc = {**staging, **layout.walk(box_start, buf_dims)}
 
             source_type, source_endpoint = self._producer_endpoint_meta(entry.producer.node, entry.producer.group, p)
             buffer['writers'].append(
@@ -409,15 +434,9 @@ class _MemoryPlanMaterializer:
                         list(buf_dims),
                     )
                 else:
-                    inst = self._kernel_inst(consumer.node)
-                    desc = inst.variant.describe_input_staging(
-                        consumer.node, inst.config, consumer.tensor, i, buf_dims, entry.producer.node
-                    )
-                    localize_descriptor(desc, consumer.offset_base, buf_dims)
-                    desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][shard_dim] -= int(unit_base_dim0)
-                    if int(unit.count) > 1:
-                        desc['boundary_dimension'] = list(buf_dims)
+                    staging, layout = readers[i]
+                    wanted = data if 'boundary_dimension' in staging else None  # it zeroes the rest itself
+                    desc = {**staging, **layout.walk(box_start, buf_dims, data=wanted)}
 
                 buffer['readers'].append(
                     {
@@ -473,7 +492,7 @@ class _MemoryPlanMaterializer:
         consumer = entry.single_consumer()
         inst = self._kernel_inst(consumer.node)
         port = int(consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)[0])
-        base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None, None)
+        base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None)
         return host_visible_input_staging(base, offset=[0 for _ in base['io_tiling_dimension']])
 
     def _graph_output_reader_descriptor(
@@ -485,7 +504,7 @@ class _MemoryPlanMaterializer:
     ) -> Dict[str, Any]:
         producer = entry.producer
         inst = self._kernel_inst(producer.node)
-        base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port, buf_dims)
+        base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
         shard_dim = int(base['slice_dimension'])
         io_tile = list(base['io_tiling_dimension'])
         io_boundary = list(base['io_boundary_dimension'])
@@ -580,7 +599,7 @@ class _MemoryPlanMaterializer:
     def _graph_output_staging(self, entry: EdgeEntry, port: int) -> Dict[str, Any]:
         producer = entry.producer
         inst = self._kernel_inst(producer.node)
-        base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port, None)
+        base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
         staging = _host_visible_output_staging(base)
         staging['tiling_dimension'] = self._whole_beats(
             entry, staging['tiling_dimension'], int(base['inner_dimension'])

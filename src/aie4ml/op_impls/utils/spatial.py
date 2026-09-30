@@ -48,34 +48,22 @@ class SpatialAccess2D:
 
 
 def shared_consumer_spatial_access(tensor) -> Optional[SpatialAccess2D]:
-    """The window this tensor's consumers read, or None when none of them is windowed.
+    """The window a producer lays this tensor's frame out for: the one its windowed consumers all read, or None
+    when none of them is windowed or they read different windows.
 
-    Producer and consumer both ask the tensor, so they derive the same padded frame without
-    knowing each other's op type. One frame serves one requirement: consumers that read different
-    windows, or a windowed consumer beside one that reads the image itself, need a per-edge view
-    that transport does not materialize, so they are refused rather than guessed.
+    A consumer that reads the frame with the window it was laid out for takes it as it is; any other consumer --
+    another window, or one that reads the image itself -- takes it through the transport, which re-frames it.
     """
     from ..family_registry import get_family_resolver_registry
 
     registry = get_family_resolver_registry()
     accesses = set()
-    windowed = 0
     for consumer in tensor.consumers:
         resolver = registry.find(consumer.op_type)
         access = resolver.spatial_access(consumer) if resolver is not None else None
         if access is not None:
             accesses.add(access)
-            windowed += 1
-    if len(accesses) > 1:
-        raise NotImplementedError(
-            f'{tensor.name}: its consumers read different windows ({sorted(map(str, accesses))}); one padded '
-            'frame serves one window, and a per-consumer view is not materialized.'
-        )
-    if windowed and windowed != len(tensor.consumers):
-        raise NotImplementedError(
-            f'{tensor.name}: a windowed consumer needs a zero border that its other consumers do not expect.'
-        )
-    return next(iter(accesses), None)
+    return next(iter(accesses)) if len(accesses) == 1 else None
 
 
 def build_padded_spatial_view(

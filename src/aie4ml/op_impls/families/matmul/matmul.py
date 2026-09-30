@@ -155,14 +155,14 @@ class MatmulOpImplVariant(_MatmulVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_full_outer
 
-    def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
         view = config.io_views[tensor_name]
         if input_role(node, tensor_name) == 'rhs':
-            return describe_inner_rhs_staging(view, config.parallelism, port, buf_dims)
-        return describe_inner_lhs_staging(view, port, buf_dims)
+            return describe_inner_rhs_staging(view, config.parallelism, port)
+        return describe_inner_lhs_staging(view, port)
 
-    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_inner_output_staging(config.io_views[tensor_name], port, buf_dims)
+    def describe_output_staging(self, _node, config, tensor_name, port):
+        return describe_inner_output_staging(config.io_views[tensor_name], port)
 
 
 @register_variant
@@ -175,11 +175,11 @@ class MatmulRowWiseOpImplVariant(_MatmulVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_tile_outer
 
-    def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
         view = config.io_views[tensor_name]
         if input_role(node, tensor_name) == 'rhs':
-            return describe_outer_rhs_staging(view, config.parallelism, port, buf_dims)
-        return describe_outer_lhs_staging(view, config.parallelism, port, buf_dims)
+            return describe_outer_rhs_staging(view, config.parallelism, port)
+        return describe_outer_lhs_staging(view, config.parallelism, port)
 
-    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_outer_output_staging(config.io_views[tensor_name], port, buf_dims)
+    def describe_output_staging(self, _node, config, tensor_name, port):
+        return describe_outer_output_staging(config.io_views[tensor_name], port)

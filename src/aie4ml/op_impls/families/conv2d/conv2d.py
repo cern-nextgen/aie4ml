@@ -20,7 +20,7 @@ from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, LayoutConversion, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import MicrotileShape, ParallelismConfig, TensorView, parse_directives
+from ...utils import MicrotileShape, ParallelismConfig, TensorView, parse_directives, shared_consumer_spatial_access
 from ...utils.math import align_up
 from ...utils.precision import (
     aie_rounding_token,
@@ -185,6 +185,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         io_views = {
             lhs.name: frame_view(
                 lhs,
+                spatial,
                 column_block=block,
                 column_align=column_align,
                 channel_slices=parallelism.cas_length,
@@ -242,6 +243,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         outer = parallelism.contract == 'outer'
         view = frame_view(
             node.outputs[0],
+            shared_consumer_spatial_access(node.outputs[0]),
             column_block=column_block,
             column_align=column_align,
             channel_slices=1 if outer else parallelism.cas_num,
@@ -647,7 +649,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         """Frame rows between the windows of neighbouring row slices: each one's output rows, strided."""
         return self._rows_per_chain(node, config) * int(config.spatial.strides[0])
 
-    def describe_input_staging(self, node, config, tensor_name, port, _buf_dims=None, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
         if self.port_kind == PORT_KIND_STREAM:
             return describe_logical_staging(config.io_views[tensor_name], 'read')
         # 'inner': the port is a channel slice every chain reads. 'outer': the port belongs to one
@@ -663,14 +665,15 @@ class Conv2dOpImplVariant(OpImplVariant):
             row_slice=row_slice,
             row_step=self._input_row_step(node, config),
             column_phases=int(config.spatial.strides[1]) if self.retiles_input(config) else 1,
+            fills_border=self.fills_border(node, config),
         )
 
-    def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
+    def describe_output_staging(self, node, config, tensor_name, port):
         view = config.io_views[tensor_name]
         if self.port_kind == PORT_KIND_STREAM:
             return describe_logical_staging(view, 'write')
         if config.flags.emit_flattened:
-            return describe_inner_output_staging(view, port, buf_dims)
+            return describe_inner_output_staging(view, port)
         outer = config.parallelism.contract == 'outer'
         # 'outer': each chain writes its share of the output rows -- the pooled ones, under a fused pool.
         return describe_frame_staging(

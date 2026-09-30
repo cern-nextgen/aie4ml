@@ -123,9 +123,9 @@ def _direct_boundary_failure(leg: Connection, execution) -> str | None:
         binding, element = inst.ports.inputs[endpoint.tensor], inst.variant.input_precision(inst.config, role)
     for port in endpoint.selected_ports(binding.count):
         if output:
-            staging = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, port, None)
+            staging = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, port)
         else:
-            staging = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, port, None, None)
+            staging = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, port, None)
             rebase_descriptor_offset(staging, endpoint.offset_base)
             inner = int(staging['inner_dimension'])
             if int(staging['io_tiling_dimension'][inner]) < staging_tile_shape(staging)[inner]:

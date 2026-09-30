@@ -17,7 +17,6 @@ from ...utils import (
     build_staging_descriptor,
     canonical_buffer_axes,
     ordered_view_shape,
-    shared_consumer_spatial_access,
 )
 from .config import Pool2DConfig
 
@@ -60,12 +59,20 @@ def fused_pool_of(node: OpNode) -> Optional[Pool2DConfig]:
 
 
 def frame_view(
-    tensor, *, column_block: int, column_align: int, channel_slices: int = 1, row_slices: int = 1
+    tensor,
+    access: Optional[SpatialAccess2D],
+    *,
+    column_block: int,
+    column_align: int,
+    channel_slices: int = 1,
+    row_slices: int = 1,
 ) -> TensorView:
-    """The padded frame of one activation, as every op on either side of it sees it."""
+    """The padded frame of one activation laid out for the window `access` reads (None: no window). A producer
+    lays its output out for the window its consumers share (`shared_consumer_spatial_access`); a consumer reads its
+    input with its own window, the same frame whenever the two agree."""
     return build_padded_spatial_view(
         tensor.shape,
-        shared_consumer_spatial_access(tensor),
+        access,
         column_block=column_block,
         column_align=column_align,
         inner_block=CHANNEL_BLOCK,
@@ -170,6 +177,7 @@ def describe_frame_staging(
     row_step: int = 0,
     row_base: int = 0,
     column_phases: int = 1,
+    fills_border: bool = False,
 ):
     """Staging of one port's window on a spatial frame.
 
@@ -182,6 +190,8 @@ def describe_frame_staging(
     `column_phases` > 1 marks a frame whose columns are grouped by their residue modulo it, as a
     strided window reads them. Only a retiler writes one, and the marker keeps any frame in plain
     column order from ever matching it.
+
+    A read wants zeros where its window leaves the image, unless the reading kernel `fills_border` itself.
     """
     extras = {'storage_layout': STORAGE_LAYOUT_INNER_BLOCKED}
     if column_phases > 1:
@@ -195,6 +205,8 @@ def describe_frame_staging(
     plans = {inner_dim: AxisPlan(CHANNEL_BLOCK, CHANNEL_BLOCK, blocks, int(port) * blocks * CHANNEL_BLOCK)}
     if row_step:
         plans[row_dim] = AxisPlan(int(tile[row_dim]), int(tile[row_dim]), 1, row_offset)
+    else:  # the port holds the tile's rows; a strided window may end before the frame's border does
+        plans[row_dim] = AxisPlan(1, 1, int(tile[row_dim]))
     # The frame is the image inside its zero border, so a window starts `origin` before the image.
     starts = {dim: 0 for dim in range(view.rank)}
     starts[inner_dim] = int(port) * blocks * CHANNEL_BLOCK
@@ -206,6 +218,6 @@ def describe_frame_staging(
         order=traversal_dims,
         io_tiling_base='tile',
         logical_origin={dim: starts[dim] - int(origin[dim]) for dim in range(view.rank)},
-        boundary_shape='logical' if access == 'read' else None,
+        boundary_shape='logical' if access == 'read' and not fills_border else None,
         extras=extras,
     )

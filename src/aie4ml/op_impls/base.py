@@ -159,9 +159,7 @@ class OpImplVariant:
     def output_precision(self, config: Any) -> Any:
         return config.precision['output']
 
-    def describe_output_staging(
-        self, _node: OpNode, _config: Any, _tensor_name: str, _port: int, _buf_dims: Any = None
-    ) -> Any:
+    def describe_output_staging(self, _node: OpNode, _config: Any, _tensor_name: str, _port: int) -> Any:
         return None
 
     def describe_input_staging(
@@ -170,7 +168,6 @@ class OpImplVariant:
         _config: Any,
         _tensor_name: str,
         _port: int,
-        _buf_dims: Any = None,
         _producer: Optional[OpNode] = None,
     ) -> Any:
         return None

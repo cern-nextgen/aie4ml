@@ -210,7 +210,7 @@ class LegalizeMemtilePortLimits(AIEPass):
 
         for c_port in consumer_ports:
             desc = inst.variant.describe_input_staging(
-                consumer.node, inst.config, consumer.tensor, c_port, None, entry.producer.node
+                consumer.node, inst.config, consumer.tensor, c_port, entry.producer.node
             )
             rebase_descriptor_offset(desc, consumer.offset_base)
             offset = int(desc['offset'][shard_dim])
@@ -272,13 +272,9 @@ class LegalizeMemtilePortLimits(AIEPass):
         if entry.producer.node is not None:
             inst = ctx.ir.execution.get(entry.producer.node.name)
             ports = self._producer_port_ids(entry, ctx)
-            d0 = inst.variant.describe_output_staging(
-                entry.producer.node, inst.config, entry.producer.tensor, ports[0], None
-            )
+            d0 = inst.variant.describe_output_staging(entry.producer.node, inst.config, entry.producer.tensor, ports[0])
             d1 = (
-                inst.variant.describe_output_staging(
-                    entry.producer.node, inst.config, entry.producer.tensor, ports[1], None
-                )
+                inst.variant.describe_output_staging(entry.producer.node, inst.config, entry.producer.tensor, ports[1])
                 if len(ports) > 1
                 else None
             )
@@ -289,9 +285,9 @@ class LegalizeMemtilePortLimits(AIEPass):
             consumer = entry.single_consumer()
             inst = ctx.ir.execution.get(consumer.node.name)
             ports = self._consumer_port_ids(entry, ctx)
-            d0 = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, ports[0], None, None)
+            d0 = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, ports[0], None)
             d1 = (
-                inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, ports[1], None, None)
+                inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, ports[1], None)
                 if len(ports) > 1
                 else None
             )

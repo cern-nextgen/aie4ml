@@ -316,11 +316,11 @@ class DenseOpImplVariant(_DenseVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_full_outer
 
-    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_inner_lhs_staging(config.io_views[tensor_name], port, buf_dims)
+    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+        return describe_inner_lhs_staging(config.io_views[tensor_name], port)
 
-    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_inner_output_staging(config.io_views[tensor_name], port, buf_dims)
+    def describe_output_staging(self, _node, config, tensor_name, port):
+        return describe_inner_output_staging(config.io_views[tensor_name], port)
 
     def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         # 'inner': cas_num slices the columns, so chain c owns weight/bias columns
@@ -385,11 +385,11 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_tile_outer
 
-    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_outer_lhs_staging(config.io_views[tensor_name], config.parallelism, port, buf_dims)
+    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+        return describe_outer_lhs_staging(config.io_views[tensor_name], config.parallelism, port)
 
-    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_outer_output_staging(config.io_views[tensor_name], port, buf_dims)
+    def describe_output_staging(self, _node, config, tensor_name, port):
+        return describe_outer_output_staging(config.io_views[tensor_name], port)
 
     def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         # The packers slice columns as chain*N_slice; here N_slice is the whole N, so pack a
@@ -438,13 +438,13 @@ class _StreamDenseMixin:
     def footprint(self, _node, config) -> OpImplFootprint:
         return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
 
-    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
         return describe_stream_staging(
-            config.io_views[tensor_name], port, 'read', self.contract, config.parallelism.cas_length, buf_dims
+            config.io_views[tensor_name], port, 'read', self.contract, config.parallelism.cas_length
         )
 
-    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_stream_staging(config.io_views[tensor_name], port, 'write', self.contract, buf_dims=buf_dims)
+    def describe_output_staging(self, _node, config, tensor_name, port):
+        return describe_stream_staging(config.io_views[tensor_name], port, 'write', self.contract)
 
     def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
         super().validate_config(node, config, device)

@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 
 from ...op_impls.common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM
-from ...op_impls.utils import STORAGE_LAYOUT_INNER_BLOCKED
 from ...op_impls.utils.io import normalized_staging
 from .descriptors import localize_descriptor
 from .model import Endpoint
@@ -36,14 +35,9 @@ def memtile_staging_failure(execution, endpoints) -> str | None:
             continue
         inst = execution.get(endpoint.node.name)
         if endpoint.tensor in inst.ports.outputs:
-            desc = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, 0, None)
+            desc = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, 0)
         else:
-            desc = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0, None, None)
-        if desc.get('storage_layout') == STORAGE_LAYOUT_INNER_BLOCKED:
-            return (
-                f'{endpoint.node.name}.{endpoint.group} stages an inner-blocked buffer, which memtile '
-                'sharding does not implement'
-            )
+            desc = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0, None)
         if 'transfer_bytes' in desc:
             return (
                 f'{endpoint.node.name}.{endpoint.group} frames each inference as a padded transfer, which '
@@ -86,7 +80,7 @@ def direct_transport_failure(
 
     for p_port, c_port in zip(producer_ports, consumer_ports):
         src_desc = producer_inst.variant.describe_output_staging(
-            producer.node, producer_inst.config, producer.tensor, int(p_port), None
+            producer.node, producer_inst.config, producer.tensor, int(p_port)
         )
         if producer.offset_base:
             src_desc = copy.deepcopy(src_desc)
@@ -96,7 +90,6 @@ def direct_transport_failure(
             consumer_inst.config,
             consumer.tensor,
             int(c_port),
-            None,
             producer.node,
         )
         dst_desc = copy.deepcopy(dst_desc)

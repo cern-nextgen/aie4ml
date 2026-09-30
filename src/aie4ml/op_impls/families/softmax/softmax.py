@@ -189,17 +189,16 @@ class _SoftmaxVariantBase(OpImplVariant):
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
         return describe_partition_staging(
             config.io_views[tensor_name],
             port,
             'read',
             'outer',
-            buf_dims,
         )
 
-    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
+    def describe_output_staging(self, _node, config, tensor_name, port):
+        return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer')
 
     def output_staging_contract(self, _node, config: SoftmaxConfig, _tensor_name: str):
         return str(config.parallelism.contract)

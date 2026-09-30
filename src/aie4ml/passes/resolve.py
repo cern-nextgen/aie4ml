@@ -27,7 +27,7 @@ def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
         contracts[tensor] = TensorContract(
             contract=contract,
             port_staging=tuple(
-                normalized_staging(inst.variant.describe_output_staging(inst.node, inst.config, tensor, port, None))
+                normalized_staging(inst.variant.describe_output_staging(inst.node, inst.config, tensor, port))
                 for port in ports
             ),
             inner_shards=inst.variant.output_inner_shards(inst.node, inst.config, tensor),

@@ -463,15 +463,16 @@ def test_conv_refuses_a_split_taller_than_the_array(tmp_path):
         lower(model, tmp_path, {'c': {'parallelism': {'cas_num': 8}}}, part=MLV2_PART)
 
 
-def test_frame_refuses_consumers_that_read_different_windows(tmp_path):
-    """One padded frame serves one window: a fanout whose branches pad differently needs a
-    per-consumer view, which transport does not materialize, so it is refused up front."""
+def _conv_fanout_model():
+    """A tensor read by a padded 3x3 and a 1x1 conv, whose branches meet in an Add, then a 1x1 conv and a Dense: its
+    readers want different windows, so its producer writes the image, and the transport frames it for the padded
+    reader and lays the Add's operands and output out between frame and plain order."""
     nodes: list = []
     inits: list = []
     _start(nodes, inits)
     _conv(nodes, inits, 'x_nchw', 'a', 'c', CIN, C3, 3, pad=1, relu=True, seed=7)
-    _conv(nodes, inits, 'a', 'b1', 'w3', C3, C3, 3, pad=1, relu=True, seed=8)  # needs a 1-pixel border
-    _conv(nodes, inits, 'a', 'b2', 'w1', C3, C3, 1, pad=0, relu=True, seed=9)  # needs none
+    _conv(nodes, inits, 'a', 'b1', 'w3', C3, C3, 3, pad=1, relu=True, seed=8)  # reads a 1-pixel border
+    _conv(nodes, inits, 'a', 'b2', 'w1', C3, C3, 1, pad=0, relu=True, seed=9)  # reads none
     _conv(nodes, inits, 'b1', 'b3', 'p1', C3, C3, 1, pad=0, relu=False, seed=10)
     _conv(nodes, inits, 'b2', 'b4', 'p2', C3, C3, 1, pad=0, relu=False, seed=11)
     nodes.append(helper.make_node('Add', ['b3', 'b4'], ['sum'], name='sum'))
@@ -479,8 +480,60 @@ def test_frame_refuses_consumers_that_read_different_windows(tmp_path):
     qdq(nodes, 'sum', 'a2', 'sumo')
     _conv(nodes, inits, 'a2', 'a3', 'p3', C3, C3, 1, pad=0, relu=False, seed=12)
     _head(nodes, inits, 'a3', H * W * C3, seed=13)
-    with pytest.raises(NotImplementedError, match='read different windows'):
-        lower(_model('conv_fanout', nodes, inits), tmp_path, part=AIE1_PART)
+    return _model('conv_fanout', nodes, inits)
+
+
+def test_frame_readers_with_other_windows_read_through_a_memory_tile(tmp_path):
+    """The 1x1 conv reads the image its producer writes directly; the padded 3x3, which reads another window, and
+    the Add, which reads the image of two frames, take theirs through a memory tile that lays it out for them."""
+    ctx = lower(_conv_fanout_model(), tmp_path, part=PART)
+    edges = ctx.ir.physical.plan['direct_edges']
+    assert {e['target'].split('.')[0] for e in edges if e['source'].startswith('c_aie.')} == {'w1_aie'}
+    assert {'c_relu', 'p1_conv', 'p2_conv', 'sum'} <= {buffer['tensor'] for buffer in ctx.ir.physical.plan['buffers']}
+
+
+def _downsampling_block_model():
+    """A ResNet downsampling block: the stem's output is read by a padded stride-2 3x3 and a stride-2 1x1 conv, each
+    behind a retiler that takes it through a memory tile; the branches meet in an Add, then a 1x1 conv and a Dense."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 's', 'stem', CIN, C3, 3, pad=1, relu=True, seed=40)
+    _conv(nodes, inits, 's', 'a', 'down', C3, C3, 3, pad=1, stride=2, relu=True, seed=41)
+    _conv(nodes, inits, 'a', 'b', 'mid', C3, C3, 3, pad=1, relu=False, seed=42)
+    _conv(nodes, inits, 's', 'k', 'skip', C3, C3, 1, pad=0, stride=2, relu=False, seed=43)
+    nodes.append(helper.make_node('Add', ['b', 'k'], ['sum'], name='sum'))
+    inits += _qparams('sumo', frac=FRAC)
+    qdq(nodes, 'sum', 'r', 'sumo')
+    _conv(nodes, inits, 'r', 'p', 'proj', C3, C3, 1, pad=0, relu=False, seed=44)
+    _head(nodes, inits, 'p', H // 2 * W // 2 * C3, seed=45)
+    return _model('conv_downsampling', nodes, inits)
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [PART, MLV2_PART], ids=['aie-ml', 'aie-mlv2'])
+def test_tensor_readers_with_other_windows_match_onnx(tmp_path, part):
+    """Four iterations of distinct inputs through aiesim, exact: memory tiles lay one tensor out for two retilers,
+    two conv frames out for an Add and its sum for the next conv."""
+    feeds = np.random.default_rng(17).integers(-40, 40, size=(4, 1, H, W, CIN), dtype=np.int8)
+    assert_aie_matches_onnx(
+        _downsampling_block_model(),
+        {'x_q': feeds},
+        {},
+        tmp_path,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=4,
+        per_iteration=True,
+    )
+
+
+def test_frame_readers_with_other_windows_need_a_memory_tile(tmp_path):
+    """AIE1 has no memory tile to lay a frame out for another reader, so it refuses the tensor's other readers."""
+    whole = {conv: {'parallelism': {'cas_num': 1, 'cas_length': 1}} for conv in ('c', 'w3', 'w1', 'p1', 'p2', 'p3')}
+    with pytest.raises(ConfigRefused, match='relay/relayout is not implemented'):
+        lower(_conv_fanout_model(), tmp_path, whole, part=AIE1_PART)
 
 
 def test_frame_rows_hold_whole_register_tiles(tmp_path):
@@ -1442,9 +1495,9 @@ def test_an_add_of_nchw_activations_is_their_nhwc_tensor(tmp_path):
     assert tuple(add.outputs[0].shape) == (1, H // 2, W // 2, 32)
 
 
-def test_an_add_refuses_a_conv_frame_it_cannot_walk(tmp_path):
-    """A conv's frame is stored channel block by channel block, which the add kernel does not walk: the add takes
-    its operands through a memory tile, which does not re-stage such a frame, so the design is refused -- never
-    lowered with a geometry decoded from the frame."""
-    with pytest.raises(ConfigRefused, match='inner-blocked'):
-        lower(_residual_model(), tmp_path, part=PART)
+def test_an_add_reads_conv_frames_through_a_memory_tile(tmp_path):
+    """A conv's frame is stored channel block by channel block, which the add kernel does not walk: a memory tile
+    lays the frames out as the add reads them, and the sum as the next conv reads it."""
+    ctx = lower(_residual_model(), tmp_path, part=PART)
+    staged = {reader['target'] for buffer in ctx.ir.physical.plan['buffers'] for reader in buffer['readers']}
+    assert {'sum_aie.in1[0]', 'sum_aie.in2[0]', 'proj_c_aie.in1[0]'} <= staged

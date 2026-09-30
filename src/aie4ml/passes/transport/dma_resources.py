@@ -7,9 +7,11 @@ the budgets; a descriptor form outside what was measured is an error, never a gu
 
 from __future__ import annotations
 
+from itertools import product
 from math import prod
 from typing import Any, Dict, Optional, Sequence
 
+from ...errors import ConfigRefused
 from ...ir.context import DmaSpec
 
 
@@ -38,33 +40,41 @@ MEMTILE_FOLD_TILES = {'AIE-ML': 15, 'AIE-MLV2': 63}
 def memtile_port_bds(descriptor: Dict[str, Any], buffers: int, generation: str, where: str) -> int:
     """BDs a memory tile spends on one port of a shared buffer: two per run of its stream, per buffer.
 
-    A port streams 2-D tiles, the tiles along axis 0 (contiguous) inside each row of tiles along axis 1;
-    `boundary_dimension` ends the data, and tiles past it carry zeros. A run is a stretch of consecutive tiles of
-    one shape (the data columns and rows each holds), across rows of tiles too, and one merge more:
+    A port streams tiles in its traversal order, the first step fastest; `boundary_dimension` ends the data, and
+    tiles past it carry zeros. A run is a stretch of consecutive tiles of one shape (the data each holds per axis),
+    and one merge more:
       - a zero run right after a run of full tiles folds into it, as that BD's padding, when it spans at most
         MEMTILE_FOLD_TILES tiles.
-    Measured on every AIE-ML and AIE-MLv2 port shape aie4ml generates, reads and writes alike.
+    Measured on AIE-ML and AIE-MLv2, reads and writes alike: every 2-D port shape aie4ml generates, and unpadded
+    walks of higher rank (a frame relayout); a padded walk of higher rank is refused as unmeasured.
     """
     tile = [int(v) for v in descriptor['tiling_dimension']]
     offset = [int(v) for v in descriptor['offset']]
-    extent = list(tile)
-    for step in descriptor.get('tile_traversal') or ():
-        extent[int(step['dimension'])] = int(step['stride']) * int(step['wrap'])
-    boundary = descriptor.get('boundary_dimension') or [o + e for o, e in zip(offset, extent)]
-    if len(tile) != 2 or len(boundary) != 2:
-        raise RuntimeError(f'{where}: a rank-{len(tile)} memory-tile walk has no measured BD cost.')
+    steps = [step for step in descriptor.get('tile_traversal') or () if int(step['wrap']) > 1]
+    end = [o + t for o, t in zip(offset, tile)]
+    for step in steps:
+        end[int(step['dimension'])] += int(step['stride']) * (int(step['wrap']) - 1)
+    boundary = [int(b) for b in descriptor.get('boundary_dimension') or end]
+    if descriptor.get('boundary_offset'):
+        raise ConfigRefused(f'{where}: a memory-tile walk with a boundary offset has no measured BD cost.')
+
+    stride = {int(step['dimension']): int(step['stride']) for step in steps}
 
     def held(axis: int, index: int) -> int:  # the data one tile holds along an axis
-        start = offset[axis] + index * tile[axis]
-        return max(0, min(int(boundary[axis]) - start, tile[axis]))
+        start = offset[axis] + index * stride.get(axis, 0)
+        return max(0, min(boundary[axis] - start, tile[axis]))
 
-    cols = [held(0, c) for c in range(extent[0] // tile[0])]
-    rows = [held(1, r) for r in range(extent[1] // tile[1])]
-    stream = [[(c, r) if c and r else None for c in cols] for r in rows]  # None: an all-zero tile
+    shapes = []  # the stream, first step fastest; None: an all-zero tile
+    for indices in product(*(range(int(step['wrap'])) for step in reversed(steps))):
+        at = dict(zip((int(step['dimension']) for step in reversed(steps)), indices))
+        shape = tuple(held(axis, at.get(axis, 0)) for axis in range(len(tile)))
+        shapes.append(shape if all(shape) else None)
 
-    full = (tile[0], tile[1])
+    full = tuple(tile)
+    if len(tile) > 2 and any(shape != full for shape in shapes):
+        raise ConfigRefused(f'{where}: a padded rank-{len(tile)} memory-tile walk has no measured BD cost.')
     runs = []  # [shape, tiles]
-    for shape in (shape for row in stream for shape in row):
+    for shape in shapes:
         if runs and runs[-1][0] == shape:
             runs[-1][1] += 1
         else:

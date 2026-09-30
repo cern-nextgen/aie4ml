@@ -326,7 +326,6 @@ def build_staging_descriptor(
     order: Sequence[int],
     io_tiling_base: str = 'logical',
     io_tiling_overrides: Mapping[int, int] | None = None,
-    buf_dims: Sequence[int] | None = None,
     boundary_shape: str | None = None,
     io_boundary_shape: str | None = 'logical',
     slice_dim: int | None = None,
@@ -340,7 +339,7 @@ def build_staging_descriptor(
     order (axes absent from `plans` stream the whole extent, chunk 1). `io_tiling_base`
     seeds io_tiling_dimension; `io_tiling_overrides` set per-axis raw extents.
     """
-    buffer_dimension = ordered_view_shape(view, 'full') if buf_dims is None else [int(x) for x in buf_dims]
+    buffer_dimension = ordered_view_shape(view, 'full')
     inner_dim, outer_dim, _ = canonical_buffer_axes(view)
 
     io_tiling_dimension = ordered_view_shape(view, io_tiling_base)
@@ -376,7 +375,7 @@ def build_staging_descriptor(
     )
 
 
-def describe_partition_staging(view, port: int, access: str, contract: str, buf_dims=None):
+def describe_partition_staging(view, port: int, access: str, contract: str):
     """Partition pattern: split one axis across ports, stream the rest. Shared by
     row-wise/reduction ops. `contract` picks the partitioned axis:
     'inner' the kernel axis,'outer' the work axis.
@@ -432,7 +431,6 @@ def describe_partition_staging(view, port: int, access: str, contract: str, buf_
         io_tiling_base='tile_raw',
         slice_dim=partition_dim,
         logical_origin={partition_dim: int(port) * int(part_raw)},
-        buf_dims=buf_dims,
         boundary_shape='logical' if access == 'read' else None,
     )
 

@@ -87,7 +87,9 @@ void clear_border(T* out)
 
 template<typename ConfigT>
 frame_retile<ConfigT>::frame_retile() {
-  constexpr int H = ConfigT::SRC_H, W = ConfigT::SRC_W, C = ConfigT::SRC_C;
+  constexpr int W = ConfigT::SRC_W, C = ConfigT::SRC_C;
+  constexpr int H = ConfigT::ROWS - ConfigT::ORIGIN_R < ConfigT::SRC_H ? ConfigT::ROWS - ConfigT::ORIGIN_R
+                                                                      : ConfigT::SRC_H;  // image rows it reads
   constexpr bool LINEAR = ConfigT::SRC_BASE == 0 && ConfigT::SRC_PIXEL == C && ConfigT::SRC_ROW == W * C &&
                           ConfigT::SRC_BLOCK == 8;
   constexpr bool BLOCKED = C % 8 == 0 && ConfigT::SRC_PIXEL == 8 && ConfigT::SRC_ROW >= W * 8 &&
@@ -96,7 +98,7 @@ frame_retile<ConfigT>::frame_retile() {
   static_assert(sizeof(data_t) == 1, "the frame holds 8-channel blocks of bytes");
   static_assert(ConfigT::SRC_BASE + (ConfigT::CB - 1) * ConfigT::SRC_BLOCK + (H - 1) * ConfigT::SRC_ROW +
                     (W - 1) * ConfigT::SRC_PIXEL + (C - (ConfigT::CB - 1) * 8) <= ConfigT::SRC_BYTES,
-                "the source holds the whole image");
+                "the source holds the image rows it reads");
   static_assert(ConfigT::CB * 8 >= ConfigT::SRC_C && ConfigT::CB * 8 < ConfigT::SRC_C + 8,
                 "the frame has exactly the channel blocks the tensor needs");
   static_assert(ConfigT::COLS % ConfigT::STRIDE == 0, "frame columns divide into phases");

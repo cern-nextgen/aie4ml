@@ -149,7 +149,7 @@ class _Search:
             binding = inst.ports.outputs[tensor]
             contract = self._output_contracts(inst).get(tensor)
             stagings = [
-                inst.variant.describe_output_staging(inst.node, inst.config, tensor, port, None)
+                inst.variant.describe_output_staging(inst.node, inst.config, tensor, port)
                 for port in range(int(binding.count))
             ]
             self._signatures[key] = json.dumps(

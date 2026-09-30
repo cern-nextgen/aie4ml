@@ -92,7 +92,7 @@ def requested_contract(node, directives) -> str:
     return contract
 
 
-def describe_inner_lhs_staging(view: TensorView, port: int, buf_dims=None):
+def describe_inner_lhs_staging(view: TensorView, port: int):
     """LHS staging for the 'inner' contract: the port selects a K-chain; the rows stay whole."""
     microtile_m = int(view.microtile.outer)
     microtile_k = int(view.microtile.inner)
@@ -109,12 +109,11 @@ def describe_inner_lhs_staging(view: TensorView, port: int, buf_dims=None):
         order=traversal_dims,
         logical_origin={inner_dim: int(port) * view.tile_raw_inner},
         io_tiling_overrides={inner_dim: view.tile_raw_inner},
-        buf_dims=buf_dims,
         boundary_shape='logical',
     )
 
 
-def describe_inner_output_staging(view: TensorView, port: int, buf_dims=None):
+def describe_inner_output_staging(view: TensorView, port: int):
     """Output staging for the 'inner' contract: the port selects an N-slice; the rows stay whole."""
     microtile_m = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
@@ -131,11 +130,10 @@ def describe_inner_output_staging(view: TensorView, port: int, buf_dims=None):
         order=traversal_dims,
         logical_origin={inner_dim: int(port) * view.tile_raw_inner},
         io_tiling_overrides={inner_dim: view.tile_raw_inner},
-        buf_dims=buf_dims,
     )
 
 
-def describe_outer_lhs_staging(view: TensorView, parallelism, port: int, buf_dims=None):
+def describe_outer_lhs_staging(view: TensorView, parallelism, port: int):
     """LHS staging for the 'outer' contract: the port selects a (row-group, K-chain) tile."""
     microtile_m = int(view.microtile.outer)
     microtile_k = int(view.microtile.inner)
@@ -160,13 +158,12 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int, buf_dim
         },
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
-        buf_dims=buf_dims,
         slice_dim=outer_dim,
         boundary_shape='logical',
     )
 
 
-def describe_outer_output_staging(view: TensorView, port: int, buf_dims=None):
+def describe_outer_output_staging(view: TensorView, port: int):
     """Output staging for the 'outer' contract: the port selects a row-group; N stays whole."""
     microtile_m = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
@@ -183,14 +180,11 @@ def describe_outer_output_staging(view: TensorView, port: int, buf_dims=None):
         logical_origin={outer_dim: int(port) * view.tile_raw_outer},
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
-        buf_dims=buf_dims,
         slice_dim=outer_dim,
     )
 
 
-def describe_stream_staging(
-    view: TensorView, port: int, access: str, contract: str, cas_length: int = 1, buf_dims=None
-):
+def describe_stream_staging(view: TensorView, port: int, access: str, contract: str, cas_length: int = 1):
     """Staging of one stream port: the whole padded per-port tile, row by row.
 
     A stream has no DMA to re-tile or de-pad, so this is exactly the element sequence the
@@ -220,14 +214,13 @@ def describe_stream_staging(
         order=traversal_dims,
         logical_origin=origin,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
-        buf_dims=buf_dims,
         slice_dim=outer_dim if contract == 'outer' else inner_dim,
         boundary_shape='logical' if access == 'read' else None,
         extras={'storage_layout': STORAGE_LAYOUT_LINEAR},
     )
 
 
-def describe_outer_rhs_staging(view: TensorView, parallelism, port: int, buf_dims=None):
+def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
     """RHS staging for the 'outer' contract: the port selects a K-chain; every row group shares it."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
@@ -247,7 +240,6 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int, buf_dim
         logical_origin={outer_dim: int(k_chain) * view.tile_raw_outer},
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
-        buf_dims=buf_dims,
         boundary_shape='logical',
         extras={
             'packing': 'mmul_rhs',
@@ -257,7 +249,7 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int, buf_dim
     )
 
 
-def describe_inner_rhs_staging(view: TensorView, parallelism, port: int, buf_dims=None):
+def describe_inner_rhs_staging(view: TensorView, parallelism, port: int):
     """RHS staging for the 'inner' contract: the port selects an (N-slice, K-chain) tile."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
@@ -282,7 +274,6 @@ def describe_inner_rhs_staging(view: TensorView, parallelism, port: int, buf_dim
         },
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
-        buf_dims=buf_dims,
         boundary_shape='logical',
         extras={
             'packing': 'mmul_rhs',

@@ -2,6 +2,7 @@
 
 import pytest
 from aie4ml.device_catalog import resolve_device
+from aie4ml.errors import ConfigRefused
 from aie4ml.passes.transport.dma_resources import memtile_port_bds, pool_use, tile_port_bds
 
 AIE_ML, AIE_MLV2 = 'AIE-ML', 'AIE-MLV2'
@@ -31,9 +32,39 @@ MEASURED = [
 ]
 
 
-@pytest.mark.parametrize('generation, walk, bds', MEASURED)
+def _frame_walk(cols, rows, offset=(0, 0, 0, 0), boundary=None):
+    """A 4-D walk of a conv frame in a memory tile: 8-channel pixels along each row, row by row."""
+    desc = {
+        'tiling_dimension': [8, 1, 1, 1],
+        'offset': list(offset),
+        'tile_traversal': [
+            {'dimension': 1, 'stride': 1, 'wrap': cols},
+            {'dimension': 2, 'stride': 1, 'wrap': rows},
+            {'dimension': 3, 'stride': 1, 'wrap': 1},
+            {'dimension': 0, 'stride': 8, 'wrap': 1},
+        ],
+    }
+    if boundary is not None:
+        desc['boundary_dimension'] = list(boundary)
+    return desc
+
+
+# (generation, walk, BDs the compiler allocated for the port's two buffers), each from a compiled project
+MEASURED_FRAMES = [
+    (AIE_ML, _frame_walk(16, 8, offset=(0, 4, 1, 0)), 4),  # an image written into a frame's interior
+    (AIE_ML, _frame_walk(24, 10), 4),  # the frame read whole
+    (AIE_MLV2, _frame_walk(48, 18), 4),
+]
+
+
+@pytest.mark.parametrize('generation, walk, bds', MEASURED + MEASURED_FRAMES)
 def test_a_memory_tile_port_costs_two_bds_per_run_of_its_stream(generation, walk, bds):
     assert memtile_port_bds(walk, 2, generation, 'port') == bds
+
+
+def test_a_padded_walk_of_higher_rank_is_refused_as_unmeasured():
+    with pytest.raises(ConfigRefused, match='no measured BD cost'):
+        memtile_port_bds(_frame_walk(24, 10, boundary=(8, 16, 8, 1)), 2, AIE_ML, 'port')
 
 
 def test_channels_draw_from_the_pool_of_their_parity():

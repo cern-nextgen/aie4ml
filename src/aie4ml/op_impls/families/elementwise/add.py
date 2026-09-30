@@ -111,6 +111,8 @@ class AddOpImplVariant(OpImplVariant):
         bank_bytes = int(device.bank_mem_bytes)
         max_rows = max(1, int(device.rows) - int(device.row_start))
         elem_bytes = storage_bytes_for_spec(precision['lhs'])
+        # The kernel adds whole vectors: rows padded to a DMA word when a tile then holds whole vectors, else to one.
+        aligns = (max(1, 4 // elem_bytes), vec_size)
 
         if inherited_view is not None:
             cas_num = len(preserved_staging)
@@ -127,21 +129,23 @@ class AddOpImplVariant(OpImplVariant):
                 microtile=inherited_view.microtile,
             )
         elif staging_contract == 'inner':
-            full_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
-            full_inner = align_up(full_inner, vec_size)
-            raw_inner = int(lhs_shape[-1])
+            raw_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
             compacted_outer = outer_prefix * last_outer
-            cas_num, tile_inner = find_tile_split(
-                partition_size=full_inner,
-                max_rows=max_rows,
-                bank_bytes=bank_bytes,
-                tile_bytes_fn=lambda ti: compacted_outer * ti * elem_bytes,
-                parallel_cfg=parallel_cfg,
-                input_contracts=input_contracts,
-                primary_tensor_name=lhs_tensor.name,
-                contract='inner',
-                require_match=microtile_override is None,
-            )
+            for align in aligns:
+                full_inner = align_up(raw_inner, align)
+                cas_num, tile_inner = find_tile_split(
+                    partition_size=full_inner,
+                    max_rows=max_rows,
+                    bank_bytes=bank_bytes,
+                    tile_bytes_fn=lambda ti: compacted_outer * ti * elem_bytes,
+                    parallel_cfg=parallel_cfg,
+                    input_contracts=input_contracts,
+                    primary_tensor_name=lhs_tensor.name,
+                    contract='inner',
+                    require_match=microtile_override is None,
+                )
+                if compacted_outer * tile_inner % vec_size == 0:
+                    break
             io_views = build_io_views(
                 node,
                 list(node.inputs),
@@ -155,19 +159,21 @@ class AddOpImplVariant(OpImplVariant):
                 microtile=microtile_override,
             )
         else:
-            full_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
-            full_inner = align_up(full_inner, vec_size)
-            raw_inner = int(lhs_shape[-1])
-            cas_num, tile_outer = find_tile_split(
-                partition_size=last_outer,
-                max_rows=max_rows,
-                bank_bytes=bank_bytes,
-                tile_bytes_fn=lambda to: outer_prefix * to * full_inner * elem_bytes,
-                parallel_cfg=parallel_cfg,
-                input_contracts=input_contracts,
-                primary_tensor_name=lhs_tensor.name,
-                contract='outer',
-            )
+            raw_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
+            for align in aligns:
+                full_inner = align_up(raw_inner, align)
+                cas_num, tile_outer = find_tile_split(
+                    partition_size=last_outer,
+                    max_rows=max_rows,
+                    bank_bytes=bank_bytes,
+                    tile_bytes_fn=lambda to, inner=full_inner: outer_prefix * to * inner * elem_bytes,
+                    parallel_cfg=parallel_cfg,
+                    input_contracts=input_contracts,
+                    primary_tensor_name=lhs_tensor.name,
+                    contract='outer',
+                )
+                if outer_prefix * tile_outer * full_inner % vec_size == 0:
+                    break
             io_views = build_io_views(
                 node,
                 list(node.inputs),
@@ -224,6 +230,12 @@ class AddOpImplVariant(OpImplVariant):
         )
 
     def validate_config(self, node: OpNode, config: AddConfig, _device) -> None:
+        elements = int(math.prod(config.io_views[input_tensor_for_role(node, 'lhs').name].tile))
+        if elements % int(config.vec_size):
+            raise ValueError(
+                f'{node.name}: a tile of {elements} elements is not whole {config.vec_size}-element vectors, which '
+                'the add kernel steps through.'
+            )
         if config.preserved_staging is not None:
             port_count = self.output_port_count(node, config)
             if len(config.preserved_staging) != port_count:
@@ -238,7 +250,7 @@ class AddOpImplVariant(OpImplVariant):
         params['tile_elements'] = int(math.prod(lhs_view.tile))
         return params
 
-    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
         if tensor_name in config.preserved_tensors:
             return dict(config.preserved_staging[int(port)])
         return describe_partition_staging(
@@ -246,16 +258,14 @@ class AddOpImplVariant(OpImplVariant):
             port,
             'read',
             config.parallelism.contract,
-            buf_dims,
         )
 
-    def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
+    def describe_output_staging(self, node, config, tensor_name, port):
         return describe_partition_staging(
             config.io_views[tensor_name],
             port,
             'write',
             config.parallelism.contract,
-            buf_dims,
         )
 
     def output_staging_contract(self, node, config: AddConfig, tensor_name: str):

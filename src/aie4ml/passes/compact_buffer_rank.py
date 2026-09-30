@@ -3,16 +3,17 @@
 
 from __future__ import annotations
 
-import logging
 from math import prod
 
 from ..ir import get_backend_context
 from .base import AIEPass
 
-log = logging.getLogger(__name__)
-
 
 class CompactBufferRank(AIEPass):
+    """Fold a memory tile's batch axes into its rows, so a matrix's walks stay 2-D. A buffer whose walks do not fold
+    -- a frame's rows and columns are walked apart, around its border -- keeps its rank; the DMA accounting refuses a
+    rank it has no measured cost for."""
+
     def __init__(self):
         self.name = 'compact_buffer_rank'
 
@@ -32,20 +33,11 @@ class CompactBufferRank(AIEPass):
             descriptors = [desc for desc, _ in desc_entries]
 
             axis_pairs = self._axis_pairs(descriptors, rank)
-            if axis_pairs is None:
-                self._warn_skip(buf, 'feature/independent axes are not collapsible to a 2D contract')
-                continue
-
             drop_axes = list(range(2, rank))
-            if not drop_axes:
-                continue
-
-            if not self._is_legal_to_collapse(desc_entries, drop_axes):
-                self._warn_skip(buf, 'descriptor prevent legal rank compaction')
-                continue
-
             old_buf_dim = [int(x) for x in buf['dimension']]
             factor = int(prod(old_buf_dim[a] for a in drop_axes))
+            if axis_pairs is None or not self._is_legal_to_collapse(desc_entries, drop_axes, factor):
+                continue
 
             outer_dims = {indep for _feat, indep in axis_pairs}
             if len(outer_dims) == 1:
@@ -53,8 +45,7 @@ class CompactBufferRank(AIEPass):
             elif factor == 1:
                 merge_axis = 1
             else:
-                self._warn_skip(buf, 'independent axes disagree across descriptors, so collapse is unsafe')
-                continue
+                continue  # the walks disagree on which axis the batch folds into
 
             buf['dimension'] = [old_buf_dim[0], old_buf_dim[1] * factor]
             changed = True
@@ -63,9 +54,6 @@ class CompactBufferRank(AIEPass):
                 self._collapse_descriptor(desc, drop_axes, factor, merge_axis=merge_axis, is_graph_io=is_graph_io)
 
         return changed
-
-    def _warn_skip(self, buf, reason: str) -> None:
-        raise RuntimeError(f'{buf.get("name", "<unnamed buffer>")}: compact_buffer_rank failed because {reason}.')
 
     def _axis_pairs(self, descriptors, rank: int):
         pairs = []
@@ -88,9 +76,13 @@ class CompactBufferRank(AIEPass):
 
         return pairs
 
-    def _is_legal_to_collapse(self, desc_entries, drop_axes) -> bool:
+    def _is_legal_to_collapse(self, desc_entries, drop_axes, factor: int) -> bool:
         for desc, is_graph_io in desc_entries:
             buf = [int(x) for x in desc['buffer_dimension']]
+            # Folded axes run on from the end of axis 1, so every walk must cover axis 1 whole for its elements to
+            # stay contiguous -- a frame walked short of its padded columns does not.
+            if factor > 1 and not self._covers(desc, 1):
+                return False
 
             for axis in drop_axes:
                 if int(desc['offset'][axis]) != 0:
@@ -100,6 +92,8 @@ class CompactBufferRank(AIEPass):
                     return False
 
                 if 'boundary_dimension' in desc and int(desc['boundary_dimension'][axis]) != int(buf[axis]):
+                    return False
+                if 'boundary_offset' in desc and int(desc['boundary_offset'][axis]) != 0:
                     return False
                 if 'io_boundary_dimension' in desc and int(desc['io_boundary_dimension'][axis]) != int(buf[axis]):
                     return False
@@ -117,12 +111,27 @@ class CompactBufferRank(AIEPass):
 
         return True
 
+    @staticmethod
+    def _covers(desc, axis: int) -> bool:
+        """Whether a walk visits all of `axis` in order, as one run of its elements."""
+        extent = int(desc['buffer_dimension'][axis])
+        if int(desc['offset'][axis]) != 0 or int((desc.get('boundary_offset') or [0] * (axis + 1))[axis]) != 0:
+            return False
+        if 'boundary_dimension' in desc and int(desc['boundary_dimension'][axis]) != extent:
+            return False
+        tile = int(desc['tiling_dimension'][axis])
+        steps = [step for step in desc.get('tile_traversal', ()) if int(step['dimension']) == axis]
+        if not steps:
+            return tile == extent
+        return int(steps[0]['stride']) == tile and tile * int(steps[0]['wrap']) == extent
+
     def _collapse_descriptor(self, desc, drop_axes, factor: int, merge_axis: int, is_graph_io: bool) -> None:
         vector_fields = (
             'buffer_dimension',
             'tiling_dimension',
             'offset',
             'boundary_dimension',
+            'boundary_offset',
             'io_tiling_dimension',
             'io_boundary_dimension',
         )
