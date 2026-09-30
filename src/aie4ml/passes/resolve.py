@@ -55,6 +55,7 @@ def resolve_instance(node, device, input_contracts, parallelism=None) -> Executi
 
     inputs = tuple(ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter)
     outputs = tuple(t.name for t in node.outputs)
+    _check_port_frames(node, config, variant, ports)
     return ExecutionInstance(
         node=node,
         variant=variant,
@@ -78,6 +79,25 @@ def _check_fits_array(node, footprint, device) -> None:
             f'{node.name}: its kernel graph spans {footprint.width}x{footprint.height} tiles (columns x rows), beyond '
             f'the {columns}x{rows} tiles of the {device.platform} array; split it the other way.'
         )
+
+
+def _check_port_frames(node, config, variant, ports) -> None:
+    """Transport reads a port's staging as where its buffer sits in the op's frame (`offset`) and which element of
+    the tensor that is (`logical_origin`), so all the ports of one tensor place the frame at one origin."""
+    for bindings, describe in (
+        (ports.inputs, lambda tensor, port: variant.describe_input_staging(node, config, tensor, port, None)),
+        (ports.outputs, lambda tensor, port: variant.describe_output_staging(node, config, tensor, port)),
+    ):
+        for tensor, binding in bindings.items():
+            origins = set()
+            for port in range(int(binding.count)):
+                staging = describe(tensor, port)
+                origins.add(tuple(int(o) - int(b) for o, b in zip(staging['logical_origin'], staging['offset'])))
+            if len(origins) > 1:
+                raise RuntimeError(
+                    f"{node.name}: the ports of {tensor!r} place its frame at {sorted(origins)}; each port's "
+                    '`logical_origin` must be its `offset` from one frame origin.'
+                )
 
 
 def _check_transposed_views(node, config, variant) -> None:

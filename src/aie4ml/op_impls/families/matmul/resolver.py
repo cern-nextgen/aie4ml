@@ -162,6 +162,9 @@ def _parallelism_candidate(
     if row_wise and tile_outer * cas_num > full_outer:
         # Padding a row-slice past the real M would compute rows that do not exist.
         return None
+    # The ports cut each axis, padded as a whole, into slices: a slice that starts past the tensor holds nothing.
+    if (cas_length - 1) * tile_inner_lhs >= in_shape or (not row_wise and (cas_num - 1) * tile_inner_rhs >= out_shape):
+        return None
 
     bank_usage = _tile_bank_usage(
         op_type=op_type,

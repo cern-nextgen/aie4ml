@@ -233,9 +233,17 @@ def _dense_chain(features):
     )
 
 
-def test_a_producer_that_pads_each_slice_does_not_write_a_memory_tile(tmp_path):
-    """15 features in three slices, each padded to a whole tile: a memory tile holds the tensor itself, so each
-    slice's padding would land on the next slice's features. The transport refuses rather than miscompile."""
-    directives = {'d1': parallelism(3, contract='inner'), 'd2': parallelism(1, cas_length=2)}
-    with pytest.raises(ConfigRefused, match='holds padding inside the tensor'):
-        lower(_dense_chain(15), tmp_path, directives, part=PART)
+def test_a_split_port_holds_the_slice_its_weights_are_packed_for(tmp_path):
+    """A dense cuts K, padded as a whole, into one slice per cascade stage, as its weights are packed: each input
+    port's data starts where its slice of the buffer does, so every transport hands it that slice."""
+    ctx = lower(_dense_chain(24), tmp_path, {'d2': parallelism(1, cas_length=2)}, part=PART)
+    inst = ctx.ir.execution.get('d2_aie')
+    for port in range(2):
+        staging = inst.variant.describe_input_staging(inst.node, inst.config, inst.node.inputs[0].name, port, None)
+        assert staging['logical_origin'] == staging['offset']
+
+
+def test_a_split_that_leaves_a_stage_no_data_is_refused(tmp_path):
+    """15 features padded to two slices of 16: the second cascade stage would hold nothing."""
+    with pytest.raises(ConfigRefused, match='does not tile it'):
+        lower(_dense_chain(15), tmp_path, {'d2': parallelism(1, cas_length=2)}, part=PART)

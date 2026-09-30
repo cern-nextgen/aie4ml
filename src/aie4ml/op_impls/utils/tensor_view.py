@@ -114,6 +114,16 @@ class TensorView:
         return int(math.prod(self.tile[:-1])) if self.rank >= 2 else 1
 
     @property
+    def logical_inner(self) -> int:
+        """The tensor's unpadded inner-dim extent."""
+        return int(_logical_to_view(self.logical, self.perm)[-1])
+
+    @property
+    def logical_outer(self) -> int:
+        """The tensor's unpadded outer-dim extent."""
+        return int(_logical_to_view(self.logical, self.perm)[-2]) if self.rank >= 2 else 1
+
+    @property
     def tile_raw_inner(self) -> int:
         """Per-port unaligned tile extent along the inner dim."""
         return int(self.tile_raw[-1])

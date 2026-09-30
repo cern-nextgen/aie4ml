@@ -85,7 +85,7 @@ def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False, of
         'tiling_dimension': list(base['tiling_dimension']) if stream else list(io_tile),
         'io_tiling_dimension': list(io_tile),
         'io_boundary_dimension': list(base['io_boundary_dimension']),
-        'offset': host_offsets(base) if offset is None else list(offset),
+        'offset': list(base['offset'] if offset is None else offset),
         'logical_origin': list(base['logical_origin']),
         'slice_dimension': int(base['slice_dimension']),
         'inner_dimension': int(base['inner_dimension']),
@@ -94,35 +94,6 @@ def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False, of
     if 'transfer_bytes' in base:
         desc['transfer_bytes'] = int(base['transfer_bytes'])
     return desc
-
-
-def host_offsets(desc: Dict[str, Any]) -> List[int]:
-    """Where a port sits among its peers, in logical units: the coordinate memtile sharding groups
-    ports by. Where its data lands in the tensor is `logical_origin`, which its op publishes.
-    """
-    offsets = [int(x) for x in desc['offset']]
-    io_tile = [int(x) for x in desc['io_tiling_dimension']]
-    traversal = list(desc.get('tile_traversal', ()))
-
-    out: List[int] = []
-    for dim, offset in enumerate(offsets):
-        if offset == 0:
-            out.append(0)
-            continue
-        slice_extent = None
-        for item in traversal:
-            if int(item.get('dimension', -1)) != dim:
-                continue
-            stride = int(item.get('stride', 0))
-            wrap = int(item.get('wrap', 0))
-            if stride > 0 and wrap > 0:
-                slice_extent = stride * wrap
-                break
-        if slice_extent and offset % slice_extent == 0:
-            out.append((offset // slice_extent) * int(io_tile[dim]))
-        else:
-            out.append(offset)
-    return out
 
 
 def graph_input_writer_port_descs(

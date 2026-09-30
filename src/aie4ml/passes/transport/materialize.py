@@ -17,7 +17,6 @@ from .boundary import (
     direct_boundary_access,
     graph_input_port_descriptor,
     graph_input_writer_port_descriptor,
-    host_offsets,
     host_visible_input_staging,
     require_linear_stream_staging,
 )
@@ -261,9 +260,7 @@ class _MemoryPlanMaterializer:
 
         for producer_port in producer_ports:
             endpoint = f'{producer_id}.{producer.group}[{int(producer_port)}]'
-            base = inst.variant.describe_output_staging(
-                producer.node, inst.config, producer.tensor, int(producer_port)
-            )
+            base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, int(producer_port))
             staging = _host_visible_output_staging(base, stream=stream)
             descriptor = dict(base)
             graph_port = self._next_graph_output_port
@@ -440,7 +437,7 @@ class _MemoryPlanMaterializer:
                 buffer['readers'].append(
                     {
                         'source': f'{name}.out[{local_out}]',
-                        'target': (f'{sanitize_identifier(consumer.node.name)}.' f'{consumer.group}[{i}]'),
+                        'target': (f'{sanitize_identifier(consumer.node.name)}.{consumer.group}[{i}]'),
                         'target_type': 'op_impl',
                         'target_endpoint': {
                             'op_impl': consumer.node.name,
@@ -658,7 +655,7 @@ def _host_visible_output_staging(base: Dict[str, Any], *, stream: bool = False) 
 
     desc = dict(base)
     desc['buffer_dimension'] = list(base['io_boundary_dimension'])
-    desc['offset'] = host_offsets(base)
+    desc['offset'] = list(base['offset'])
     desc['logical_origin'] = list(base['logical_origin'])
     desc['tiling_dimension'] = list(base['tiling_dimension'] if stream else base['io_tiling_dimension'])
     desc['storage_layout'] = STORAGE_LAYOUT_LINEAR

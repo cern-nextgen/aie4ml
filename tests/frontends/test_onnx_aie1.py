@@ -671,7 +671,7 @@ def test_aie1_outer_parallel_dense_uses_direct_boundary_ports(tmp_path):
 
 def test_aie1_dense_cascade_ports_follow_logical_snake_order(tmp_path):
     aie_model = _run_pipeline(
-        _dense_model(out_features=32),
+        _dense_model(out_features=32, in_features=32),
         tmp_path,
         directives={'dense': {'parallelism': {'contract': 'inner', 'cas_num': 2, 'cas_length': 2}}},
         project='aie1_cascade',

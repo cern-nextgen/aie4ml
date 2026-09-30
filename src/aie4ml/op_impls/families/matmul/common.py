@@ -92,6 +92,17 @@ def requested_contract(node, directives) -> str:
     return contract
 
 
+def _slice(extent: int, size: int, share: int, index: int) -> Tuple[int, int]:
+    """Where slice `index` of a partitioned axis starts in the tensor, and the extent its port moves from there.
+
+    The ports cut the axis, padded as a whole, into slices of `size`, as the weights and bias are packed: a slice
+    starts where its buffer does, and only the last ones reach past the tensor. A port moves the tensor's elements
+    from its start -- at most a slice, and at least its `share`, the word-aligned extent transfers are sized by.
+    """
+    start = int(index) * int(size)
+    return start, min(int(size), max(int(share), int(extent) - start))
+
+
 def describe_inner_lhs_staging(view: TensorView, port: int):
     """LHS staging for the 'inner' contract: the port selects a K-chain; the rows stay whole."""
     microtile_m = int(view.microtile.outer)
@@ -99,6 +110,7 @@ def describe_inner_lhs_staging(view: TensorView, port: int):
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    k_start, k_held = _slice(view.logical_inner, in_slice, view.tile_raw_inner, port)
     return build_staging_descriptor(
         view,
         access='read',
@@ -107,8 +119,8 @@ def describe_inner_lhs_staging(view: TensorView, port: int):
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
         },
         order=traversal_dims,
-        logical_origin={inner_dim: int(port) * view.tile_raw_inner},
-        io_tiling_overrides={inner_dim: view.tile_raw_inner},
+        logical_origin={inner_dim: k_start},
+        io_tiling_overrides={inner_dim: k_held},
         boundary_shape='logical',
     )
 
@@ -120,6 +132,7 @@ def describe_inner_output_staging(view: TensorView, port: int):
     out_slice = view.tile_inner
     outer_slice = view.tile_outer
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    n_start, n_held = _slice(view.logical_inner, out_slice, view.tile_raw_inner, port)
     return build_staging_descriptor(
         view,
         access='write',
@@ -128,8 +141,8 @@ def describe_inner_output_staging(view: TensorView, port: int):
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
         },
         order=traversal_dims,
-        logical_origin={inner_dim: int(port) * view.tile_raw_inner},
-        io_tiling_overrides={inner_dim: view.tile_raw_inner},
+        logical_origin={inner_dim: n_start},
+        io_tiling_overrides={inner_dim: n_held},
     )
 
 
@@ -144,6 +157,8 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int):
     cas_length = max(1, int(parallelism.cas_length))
     row_group = int(port) // cas_length
     k_chain = int(port) % cas_length
+    k_start, k_held = _slice(view.logical_inner, in_slice, view.tile_raw_inner, k_chain)
+    row_start, rows_held = _slice(view.logical_outer, outer_slice, view.tile_raw_outer, row_group)
 
     return build_staging_descriptor(
         view,
@@ -152,12 +167,9 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int):
             inner_dim: AxisPlan(microtile_k, microtile_k, in_slice // microtile_k, k_chain * in_slice),
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, row_group * outer_slice),
         },
-        logical_origin={
-            inner_dim: int(k_chain) * view.tile_raw_inner,
-            outer_dim: int(row_group) * view.tile_raw_outer,
-        },
+        logical_origin={inner_dim: k_start, outer_dim: row_start},
         order=traversal_dims,
-        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        io_tiling_overrides={inner_dim: k_held, outer_dim: rows_held},
         slice_dim=outer_dim,
         boundary_shape='logical',
     )
@@ -170,6 +182,7 @@ def describe_outer_output_staging(view: TensorView, port: int):
     out_slice = view.tile_inner
     outer_slice = view.tile_outer
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    row_start, rows_held = _slice(view.logical_outer, outer_slice, view.tile_raw_outer, port)
     return build_staging_descriptor(
         view,
         access='write',
@@ -177,9 +190,9 @@ def describe_outer_output_staging(view: TensorView, port: int):
             inner_dim: AxisPlan(microtile_n, microtile_n, out_slice // microtile_n),
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, int(port) * outer_slice),
         },
-        logical_origin={outer_dim: int(port) * view.tile_raw_outer},
+        logical_origin={outer_dim: row_start},
         order=traversal_dims,
-        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: rows_held},
         slice_dim=outer_dim,
     )
 
@@ -206,14 +219,15 @@ def describe_stream_staging(view: TensorView, port: int, access: str, contract: 
     plans = {dim: AxisPlan(int(full[dim]), int(full[dim]), 1) for dim in traversal_dims}
     plans[inner_dim] = AxisPlan(in_slice, in_slice, 1, k_chain * in_slice)
     plans[outer_dim] = AxisPlan(outer_slice, outer_slice, 1, row_group * outer_slice)
-    origin = {inner_dim: int(k_chain) * view.tile_raw_inner, outer_dim: int(row_group) * view.tile_raw_outer}
+    k_start, k_held = _slice(view.logical_inner, in_slice, view.tile_raw_inner, k_chain)
+    row_start, rows_held = _slice(view.logical_outer, outer_slice, view.tile_raw_outer, row_group)
     return build_staging_descriptor(
         view,
         access=access,
         plans=plans,
         order=traversal_dims,
-        logical_origin=origin,
-        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        logical_origin={inner_dim: k_start, outer_dim: row_start},
+        io_tiling_overrides={inner_dim: k_held, outer_dim: rows_held},
         slice_dim=outer_dim if contract == 'outer' else inner_dim,
         boundary_shape='logical' if access == 'read' else None,
         extras={'storage_layout': STORAGE_LAYOUT_LINEAR},
@@ -229,6 +243,7 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
 
     k_chain = int(port) % max(1, int(parallelism.cas_length))
+    k_start, k_held = _slice(view.logical_outer, k_slice, view.tile_raw_outer, k_chain)
 
     return build_staging_descriptor(
         view,
@@ -237,9 +252,9 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
             inner_dim: AxisPlan(microtile_n, microtile_n, max(1, n_slice // microtile_n)),
             outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), k_chain * k_slice),
         },
-        logical_origin={outer_dim: int(k_chain) * view.tile_raw_outer},
+        logical_origin={outer_dim: k_start},
         order=traversal_dims,
-        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: k_held},
         boundary_shape='logical',
         extras={
             'packing': 'mmul_rhs',
@@ -260,6 +275,8 @@ def describe_inner_rhs_staging(view: TensorView, parallelism, port: int):
 
     row = int(port) // int(parallelism.cas_length)
     col = int(port) % int(parallelism.cas_length)
+    n_start, n_held = _slice(view.logical_inner, n_slice, view.tile_raw_inner, row)
+    k_start, k_held = _slice(view.logical_outer, k_slice, view.tile_raw_outer, col)
 
     return build_staging_descriptor(
         view,
@@ -268,12 +285,9 @@ def describe_inner_rhs_staging(view: TensorView, parallelism, port: int):
             inner_dim: AxisPlan(microtile_n, microtile_n, max(1, n_slice // microtile_n), row * n_slice),
             outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), col * k_slice),
         },
-        logical_origin={
-            inner_dim: int(row) * view.tile_raw_inner,
-            outer_dim: int(col) * view.tile_raw_outer,
-        },
+        logical_origin={inner_dim: n_start, outer_dim: k_start},
         order=traversal_dims,
-        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        io_tiling_overrides={inner_dim: n_held, outer_dim: k_held},
         boundary_shape='logical',
         extras={
             'packing': 'mmul_rhs',
