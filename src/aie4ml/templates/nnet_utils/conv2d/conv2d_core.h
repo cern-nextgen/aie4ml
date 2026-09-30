@@ -59,10 +59,9 @@ inline void conv2d_check_contract() {
   static_assert(ConfigT::FLATTEN || ConfigT::OUT_ORIGIN_C + ConfigT::OUT_W_COMPUTED / (ConfigT::POOL ? 2 : 1) <=
                                         ConfigT::OUT_COLS,
                 "output frame holds every column the computed tiles write");
-  static_assert(!ConfigT::PARALLELISM_CONTRACT_OUTER || ConfigT::FLATTEN ||
-                    (ConfigT::OUT_ORIGIN_R == 0 && ConfigT::OUT_ROWS == conv2d_rows<ConfigT> / (ConfigT::POOL ? 2 : 1)),
-                "a row band's buffer holds exactly its own output rows, from row 0: the frame's border rows are its "
-                "readers' halo, and its border columns the readers zero");
+  static_assert(ConfigT::FLATTEN || ConfigT::OUT_ORIGIN_R + conv2d_rows<ConfigT> / (ConfigT::POOL ? 2 : 1) <=
+                                        ConfigT::OUT_ROWS,
+                "output frame holds every row the core writes; its border rows are its reader's to fill");
 }
 
 // AIE1 has no 8-bit vector ALU: it pools in int16 and packs once on the store.

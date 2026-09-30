@@ -20,17 +20,17 @@ conv2d_halo_base<ConfigT, B>::conv2d_halo_base() {
                   "the window is the halo and the band's own rows; its column border is zeroed by the core");
     static_assert(ConfigT::HALO_TOP <= ConfigT::OWN_ROWS && ConfigT::HALO_BOTTOM <= ConfigT::OWN_ROWS,
                   "a band's halo comes from its neighbours' own rows alone");
-    static_assert(ConfigT::OWN_ELEMENTS == ConfigT::CB * ConfigT::OWN_ROWS * ConfigT::IN_COLS * 8 &&
-                      ConfigT::IN_ELEMENTS == ConfigT::CB * ConfigT::IN_ROWS * ConfigT::IN_COLS * 8,
-                  "own rows and window share the frame's channel blocks and columns");
-  } else {
-    static_assert(ConfigT::OWN_ELEMENTS == ConfigT::IN_ELEMENTS, "a band that reads no halo reads its window whole");
+    static_assert(ConfigT::IN_ELEMENTS == ConfigT::CB * ConfigT::IN_ROWS * ConfigT::IN_COLS * 8,
+                  "the window is whole frame rows of every channel block");
   }
   if constexpr (ConfigT::SEND_FIRST + ConfigT::SEND_LAST > 0) {
-    static_assert(!ConfigT::FLATTEN && ConfigT::OUT_ORIGIN_R == 0 &&
-                      ConfigT::OUT_ELEMENTS == ConfigT::NB * ConfigT::OUT_ROWS * ConfigT::OUT_COLS * 8 &&
-                      ConfigT::SEND_FIRST <= ConfigT::OUT_ROWS && ConfigT::SEND_LAST <= ConfigT::OUT_ROWS,
-                  "a band sends whole rows of its own output frame");
+    constexpr int ROWS = conv2d_rows<ConfigT> / (ConfigT::POOL ? 2 : 1);
+    static_assert(!ConfigT::FLATTEN && ConfigT::OUT_ELEMENTS == ConfigT::NB * ConfigT::OUT_ROWS * ConfigT::OUT_COLS * 8,
+                  "a band writes whole frame rows of every channel block");
+    static_assert(ConfigT::OUT_ORIGIN_R == ConfigT::SEND_LAST &&
+                      ConfigT::OUT_ROWS == ConfigT::SEND_LAST + ROWS + ConfigT::SEND_FIRST,
+                  "its output buffer is its reader's window: its rows, and room for the halo its reader fills");
+    static_assert(ConfigT::SEND_FIRST <= ROWS && ConfigT::SEND_LAST <= ROWS, "a band sends rows of its own");
   }
 }
 
@@ -63,29 +63,29 @@ void conv2d_halo_base<ConfigT, B>::compute(const data_t* own, const data_t* cons
                                             result_t* out, result_t* const* edge) {
   data_t* window = const_cast<data_t*>(own);
   if constexpr (READS) {
-    // Per channel block: the band above's last rows (or zeros), its own rows, the band below's first rows.
-    constexpr int ROW = ConfigT::IN_COLS * 8, OWN = ConfigT::OWN_ROWS * ROW, WINDOW = ConfigT::IN_ROWS * ROW;
+    // Its own rows sit in the middle of its window: per channel block, fill the rows above them with the band
+    // above's last rows and the rows below with the band below's first ones, or zeros where the image ends.
+    constexpr int ROW = ConfigT::IN_COLS * 8, WINDOW = ConfigT::IN_ROWS * ROW;
     constexpr int HT = ConfigT::HALO_TOP, HB = ConfigT::HALO_BOTTOM;
     const data_t* top = role::TOP ? halo[0] : nullptr;
     const data_t* bottom = role::BOTTOM ? halo[role::TOP] : nullptr;
     for (int cb = 0; cb < ConfigT::CB; ++cb) {
-      data_t* f = frame + cb * WINDOW;
+      data_t* f = window + cb * WINDOW;
       conv2d_halo_rows<data_t, ROW>(f, top ? top + cb * HT * ROW : nullptr, HT);
-      conv2d_halo_rows<data_t, ROW>(f + HT * ROW, window + cb * OWN, ConfigT::OWN_ROWS);
-      conv2d_halo_rows<data_t, ROW>(f + HT * ROW + OWN, bottom ? bottom + cb * HB * ROW : nullptr, HB);
+      conv2d_halo_rows<data_t, ROW>(f + (HT + ConfigT::OWN_ROWS) * ROW, bottom ? bottom + cb * HB * ROW : nullptr, HB);
     }
-    window = frame;
   }
   conv2d_compute<ConfigT, false, false>(window, wts, bias, out, nullptr, nullptr);
   // The rows its neighbours' windows read, per channel block: its first ones for the band above, its last ones
   // for the band below.
   constexpr int ROW = ConfigT::OUT_COLS * 8, FRAME = ConfigT::OUT_ROWS * ROW;
   constexpr int SF = ConfigT::SEND_FIRST, SL = ConfigT::SEND_LAST;
+  constexpr int FIRST = ConfigT::OUT_ORIGIN_R, LAST = FIRST + conv2d_rows<ConfigT> / (ConfigT::POOL ? 2 : 1) - SL;
   for (int nb = 0; nb < ConfigT::NB; ++nb) {
-    if constexpr (role::FIRST) conv2d_halo_rows<result_t, ROW>(edge[0] + nb * SF * ROW, out + nb * FRAME, SF);
+    if constexpr (role::FIRST)
+      conv2d_halo_rows<result_t, ROW>(edge[0] + nb * SF * ROW, out + nb * FRAME + FIRST * ROW, SF);
     if constexpr (role::LAST)
-      conv2d_halo_rows<result_t, ROW>(edge[role::FIRST] + nb * SL * ROW, out + nb * FRAME + (ConfigT::OUT_ROWS - SL) * ROW,
-                                      SL);
+      conv2d_halo_rows<result_t, ROW>(edge[role::FIRST] + nb * SL * ROW, out + nb * FRAME + LAST * ROW, SL);
   }
 }
 

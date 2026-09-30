@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Tuple
 
 from ....errors import ConfigRefused
@@ -12,12 +11,10 @@ from ...common_types import PORT_KIND_BUFFER, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, TensorView, shared_consumer_spatial_access
 from .common import (
-    CHANNEL_BLOCK,
     describe_band_staging,
     frame_view,
     halo_ports,
     reads_neighbour_rows,
-    row_band_view,
     spatial_access_of,
 )
 from .config import Conv2dConfig
@@ -38,7 +35,9 @@ def _sent_rows(node: OpNode) -> Tuple[int, int]:
     if any(consumer.op_type != 'conv2d' for consumer in out.consumers):
         return 0, 0  # only a conv band reads its halo from its neighbours
     access = shared_consumer_spatial_access(out)
-    return (int(access.pads[0]), int(access.pads[2])) if access is not None else (0, 0)
+    if access is None or access.strides[0] != 1 or access.pads[0] + access.pads[2] != access.window[0] - 1:
+        return 0, 0  # a window that strides or changes the height does not read its halo from row bands
+    return int(access.pads[0]), int(access.pads[2])
 
 
 @register_variant
@@ -85,9 +84,7 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
                 f'{node.name}: a halo of {max(top, bottom)} rows is more than a band of {rows} holds; a band reads '
                 'only the bands beside it.'
             )
-        # The input port carries the producer band's own rows; the window around them is assembled on the tile.
-        band = row_band_view(config.io_views[lhs.name], int(config.parallelism.cas_num))
-        return dataclasses.replace(config, io_views={**config.io_views, lhs.name: band})
+        return config
 
     def _resolve_parallelism(self, node, parallel_cfg, input_contracts, *, flatten: bool) -> ParallelismConfig:
         """One tile per band: the producer's bands when its window reads them, else the requested ones."""
@@ -129,14 +126,16 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         top, bottom = _sent_rows(node)
         if not (top or bottom):
             return super()._output_frame(node, parallelism, column_block=column_block, column_align=column_align)
-        # Every band writes its own rows of the bordered frame; the edge rows its neighbours read get ports of their
-        # own (halo_ports).
-        frame = frame_view(node.outputs[0], column_block=column_block, column_align=column_align)
-        view = row_band_view(frame, int(parallelism.cas_num))
-        if max(top, bottom) > int(view.tile[1]):
+        # Every band writes its own rows into its reader's window, the frame's rows the reader's window covers; the
+        # edge rows its neighbours read get ports of their own (halo_ports).
+        view = frame_view(
+            node.outputs[0], column_block=column_block, column_align=column_align, row_slices=int(parallelism.cas_num)
+        )
+        rows = int(view.logical[1]) // int(parallelism.cas_num)
+        if max(top, bottom) > rows:
             raise ConfigRefused(
-                f'{node.name}: its consumer reads {max(top, bottom)} rows past each of its bands of '
-                f'{int(view.tile[1])} rows; a band hands rows only to the bands beside it.'
+                f'{node.name}: its consumer reads {max(top, bottom)} rows past each of its bands of {rows} rows; a '
+                'band hands rows only to the bands beside it.'
             )
         return view
 
@@ -148,7 +147,8 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         else:
             top, bottom = _sent_rows(node)
             view = config.io_views[node.outputs[0].name]
-        return int(view.tile[1]), halo_ports(int(config.parallelism.cas_num), int(view.tile[1]), top, bottom)
+        rows = int(view.logical[1]) // int(config.parallelism.cas_num)
+        return rows, halo_ports(int(config.parallelism.cas_num), rows, top, bottom)
 
     def uses_depthwise_core(self, _node, _config) -> bool:
         return False  # a band's window is a frame for the mmul core
@@ -157,8 +157,6 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         params = super().kernel_params(node, config)
         top, _, bottom, _ = config.spatial.pads if _reads_halo(node) else (0, 0, 0, 0)
         sent_top, sent_bottom = _sent_rows(node)
-        own = int(params['in_rows'])
-        window = top + own + bottom
         params.update(
             halo_top=top,
             halo_bottom=bottom,
@@ -166,41 +164,32 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
             # of the band below.
             send_first=sent_bottom,
             send_last=sent_top,
-            own_rows=own,
-            own_elements=params['in_elements'],
+            own_rows=self._halo(node, config, 'lhs')[0],
         )
-        if top or bottom:
-            params.update(
-                in_rows=window,
-                in_h=window,
-                in_elements=int(params['in_blocks']) * window * int(params['in_cols']) * CHANNEL_BLOCK,
-            )
-        if sent_top or sent_bottom:
-            params.update(out_origin_r=0)  # a band's buffer holds its own rows
         return params
 
     def validate_config(self, node: OpNode, config: Conv2dConfig, device) -> None:
         super().validate_config(node, config, device)
         if not _reads_halo(node):
             return
+        # A reading band's tile holds, per bank (ping and pong one bank apart): its window in banks 0 and 3, beside
+        # its output unless that goes on to the band that reads it; in banks 1 and 2 the halo rows its producer band
+        # writes there for the bands beside it, with the bias in bank 1 and the weights in bank 2.
         params = self.build_template_params(node, config, {'row': 0, 'col': 0})
-        own = self._frame_bytes(config, 'lhs', params['own_elements'])
-        out = self._frame_bytes(config, 'output', params['out_elements'])
         window = self._frame_bytes(config, 'lhs', params['in_elements'])
+        out = 0 if any(_sent_rows(node)) else self._frame_bytes(config, 'output', params['out_elements'])
+        halo = window // int(params['in_rows']) * (int(params['halo_top']) + int(params['halo_bottom']))
         bias = int(params['bias_count']) * int(config.precision['bias'].width) // 8
-        # Its tile holds its band's ping and pong and its output's (both in banks 0 and 3), its window, weights and
-        # bias.
-        if own + out > int(config.bank_mem_bytes):
-            raise ConfigRefused(
-                f"{node.name}: a band's own rows ({own} B) and output ({out} B) share a {config.bank_mem_bytes} B "
-                'memory bank; split it into more row bands.'
-            )
-        need = 2 * own + 2 * out + window + int(params['weight_count']) + bias
-        if need > int(device.tile_mem_bytes):
-            raise ConfigRefused(
-                f'{node.name}: a band needs {need} B for its rows, window, output, weights and bias, but a '
-                f'{device.platform} tile has {device.tile_mem_bytes} B; split it into more row bands.'
-            )
+        for banks, what, size in (
+            ('0 and 3', 'window and output', window + out),
+            ('1', 'halo rows and bias', halo + bias),
+            ('2', 'halo rows and weights', halo + int(params['weight_count'])),
+        ):
+            if size > int(config.bank_mem_bytes):
+                raise ConfigRefused(
+                    f"{node.name}: a band's {what} need {size} B of bank {banks}, which holds "
+                    f'{config.bank_mem_bytes} B; split it into more row bands.'
+                )
 
     def buffer_locations(self, node, config: Conv2dConfig, anchor_row):
         """Band b on row b. The rows a band writes for its reader -- its own and its edge rows -- sit where the
@@ -214,10 +203,12 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         for band, flow in enumerate(flows):
             locations.append(BufferLocation('in1', band, flow.output_col if reads else flow.input_col, band, (0, 3)))
             locations.append(BufferLocation('out1', band, flow.input_col if sends else flow.output_col, band, (0, 3)))
+        # Halo rows are a row or two: they go beside the stack, bias and weights, and leave banks 0 and 3 to the
+        # windows.
         for index, port in enumerate(self._halo(node, config, 'lhs')[1], start=bands):
-            locations.append(BufferLocation('in1', index, 0, port.band, (0, 3)))
+            locations.append(BufferLocation('in1', index, 0, port.band, (1, 2)))
         for index, port in enumerate(self._halo(node, config, 'output')[1], start=bands):
-            locations.append(BufferLocation('out1', index, flows[port.band].input_col, port.band, (0, 3)))
+            locations.append(BufferLocation('out1', index, flows[port.band].input_col, port.band, (1, 2)))
         return tuple(locations)
 
     def output_staging_contract(self, _node, config, _tensor_name):

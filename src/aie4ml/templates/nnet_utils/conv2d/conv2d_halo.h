@@ -5,7 +5,8 @@
 // reads HALO_TOP rows of band b - 1 and HALO_BOTTOM rows of band b + 1 (the zero border where the image ends), and
 // it writes, beside its own rows, its first SEND_FIRST rows for band b - 1 and its last SEND_LAST rows for band
 // b + 1 of the next layer. Each of those is a buffer of its own with one reader, shared wherever both ends reach it.
-// A band that reads a halo assembles its window in a frame of its own; the compute core is unchanged.
+// A band's own rows arrive in the middle of its window, where its producer band writes them; the band fills the halo
+// rows around them in place, and the unchanged compute core reads the window.
 
 #pragma once
 #include <adf.h>
@@ -42,8 +43,6 @@ protected:
 
 private:
   static constexpr bool READS = ConfigT::HALO_TOP + ConfigT::HALO_BOTTOM > 0;
-  // The window a reading band assembles. A member, not a static: under x86 simulation every band is a thread.
-  alignas(32) data_t frame[READS ? ConfigT::IN_ELEMENTS : 32];
 };
 
 // ADF reads a kernel's ports from its run() signature, so each count of halo inputs and sent edges is a class:

@@ -32,7 +32,7 @@ public:
   static constexpr int last_port(int b) { return BANDS + b * OUT_PAIR; }
 
   // Elements of the rows of one channel-blocked frame row, times rows.
-  static constexpr int IN_ROW = ConfigT::OWN_ELEMENTS / ConfigT::OWN_ROWS;
+  static constexpr int IN_ROW = ConfigT::IN_ELEMENTS / ConfigT::IN_ROWS;
   static constexpr int OUT_ROW = ConfigT::OUT_ELEMENTS / ConfigT::OUT_ROWS;
 
   input_port in1[IN_PORTS];
@@ -61,7 +61,7 @@ private:
     source(kk[B]) = "conv2d_halo.cpp";
     runtime<ratio>(kk[B]) = 1.0;
     connect<>(in1[B], kk[B].in[0]);
-    dimensions(kk[B].in[0]) = { ConfigT::OWN_ELEMENTS };
+    dimensions(kk[B].in[0]) = { ConfigT::IN_ELEMENTS };
     if constexpr (role::TOP) {
       connect<>(in1[top_port(B)], kk[B].in[1]);
       dimensions(kk[B].in[1]) = { HT * IN_ROW };

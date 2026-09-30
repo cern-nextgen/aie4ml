@@ -76,17 +76,6 @@ def frame_view(
     )
 
 
-def row_band_view(frame: TensorView, bands: int) -> TensorView:
-    """`frame` cut into `bands` row bands that each own their rows of the image and no border: what one band of
-    a row-split producer writes, and what the band that reads it with its neighbours' rows receives."""
-    return _rows_view(frame, int(frame.logical[1]) // int(bands))
-
-
-def _rows_view(frame: TensorView, rows: int) -> TensorView:
-    tile = (int(frame.tile[0]), int(rows), *(int(x) for x in frame.tile[2:]))
-    return dataclasses.replace(frame, tile=tile, tile_raw=tile)
-
-
 class HaloPort(NamedTuple):
     """Rows one band writes for a neighbour's window: `rows` rows of band `band`, from its row `first`, which band
     `reader` reads."""
@@ -112,11 +101,18 @@ def halo_ports(bands: int, band_rows: int, top: int, bottom: int) -> Tuple[HaloP
 
 
 def describe_band_staging(frame: TensorView, access: str, band_rows: int, port: int, halo: Tuple[HaloPort, ...]):
-    """Staging of port `port` of a row-banded frame: a band's own rows, or a halo port's rows (see `halo_ports`)."""
+    """Staging of port `port` of a frame split into row bands (`frame` cut into overlapping windows, as
+    `frame_view` cuts it): a band's window -- its own rows, which its producer band writes, and around them the
+    halo its reader fills -- or a halo port's rows (see `halo_ports`)."""
     bands = int(frame.logical[1]) // int(band_rows)
-    band, first, rows = (port, 0, band_rows) if port < bands else halo[port - bands][:3]
+    if port < bands:
+        return describe_frame_staging(frame, access, 0, row_slice=port, row_step=band_rows)
+    band, first, rows, _ = halo[port - bands]
+    tile = (int(frame.tile[0]), int(rows), *(int(x) for x in frame.tile[2:]))
     row = int(frame.origin[1]) + int(band) * int(band_rows) + int(first)
-    return describe_frame_staging(_rows_view(frame, rows), access, 0, row_step=int(rows), row_base=row)
+    return describe_frame_staging(
+        dataclasses.replace(frame, tile=tile, tile_raw=tile), access, 0, row_step=int(rows), row_base=row
+    )
 
 
 def describe_logical_staging(view: TensorView, access: str, *, transfer_bytes: int = 0, rows=None, channels=None):

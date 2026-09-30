@@ -43,12 +43,12 @@ struct {{L.struct_name}} {
   static constexpr int FLAT_K_PADDED = {{P.flat_k_padded}};
   static constexpr int IN_ELEMENTS = {{P.in_elements}}, OUT_ELEMENTS = {{P.out_elements}};
 {% if P.halo_top is defined %}
-  // A halo band (conv2d_halo.h): its window is HALO_TOP rows of the band above, its OWN_ROWS rows (the OWN_ELEMENTS
-  // its input port carries) and HALO_BOTTOM rows of the band below; it sends its first SEND_FIRST output rows to the
-  // band above and its last SEND_LAST to the band below.
+  // A halo band (conv2d_halo.h): its window is HALO_TOP rows of the band above, its OWN_ROWS rows and HALO_BOTTOM rows
+  // of the band below; it sends its first SEND_FIRST output rows to the band above and its last SEND_LAST to the band
+  // below.
   static constexpr int HALO_TOP = {{P.halo_top}}, HALO_BOTTOM = {{P.halo_bottom}};
   static constexpr int SEND_FIRST = {{P.send_first}}, SEND_LAST = {{P.send_last}};
-  static constexpr int OWN_ROWS = {{P.own_rows}}, OWN_ELEMENTS = {{P.own_elements}};
+  static constexpr int OWN_ROWS = {{P.own_rows}};
 {% endif %}
   static constexpr int WN = {{P.weight_count}}, BN = {{P.bias_count}};
   static constexpr bool DEPTHWISE_CORE = {{ 'true' if P.depthwise_core else 'false' }};

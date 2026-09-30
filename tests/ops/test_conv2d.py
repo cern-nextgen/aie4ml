@@ -522,7 +522,7 @@ def test_row_bands_hand_their_neighbours_their_halo(tmp_path, part, shared):
     b, d = ctx.ir.execution.get('b_aie'), ctx.ir.execution.get('d_aie')
     assert b.variant.variant_id == d.variant.variant_id == 'conv2d.b.r.halo.v1'
     tensor = b.node.outputs[0].name
-    assert b.config.io_views[tensor] == d.config.io_views[tensor] and d.config.io_views[tensor].tile[1] == H // 2
+    assert b.config.io_views[tensor] == d.config.io_views[tensor] and d.config.io_views[tensor].tile[1] == H // 2 + 2
     sent = b.variant.kernel_params(b.node, b.config)
     assert (sent['halo_top'], sent['halo_bottom'], sent['send_first'], sent['send_last']) == (0, 0, 1, 1)
     params = d.variant.kernel_params(d.node, d.config)
@@ -600,13 +600,16 @@ def test_row_bands_placed_apart_plan_their_halo_as_dma(tmp_path):
 def test_row_bands_refuse_a_halo_they_cannot_exchange(tmp_path):
     with pytest.raises(ConfigRefused, match='cannot feed a consumer whose window reads'):
         lower(_padded_pair_model(pad=0), tmp_path / 'valid', HALO_SPLIT)
-    with pytest.raises(ConfigRefused, match='changes the image height'):
+    # A window that changes the height or strides: its producer's bands are not its own, so they send it nothing.
+    with pytest.raises(ConfigRefused, match='cannot feed a consumer whose window reads'):
         lower(_padded_pair_model(k=5, pad=1), tmp_path / 'height', HALO_SPLIT)
-    with pytest.raises(ConfigRefused, match='exchange their halo at stride 1'):
+    with pytest.raises(ConfigRefused, match='cannot feed a consumer whose window reads'):
         lower(_padded_pair_model(stride=2), tmp_path / 'strided', HALO_SPLIT)
     with pytest.raises(ConfigRefused, match='does not split 8 output rows'):
         odd = {name: {'parallelism': {'contract': 'outer', 'cas_num': 3}} for name in ('b', 'd')}
         lower(_padded_pair_model(), tmp_path / 'odd', odd)
+    with pytest.raises(ConfigRefused, match='window and output need 16512 B of bank 0 and 3'):
+        lower(_padded_pair_model(size=24), tmp_path / 'bank', HALO_SPLIT)
     with pytest.raises(ConfigRefused, match='reads 2 rows past each of its bands of 1 rows'):
         ones = {name: {'parallelism': {'contract': 'outer', 'cas_num': 8}} for name in ('b', 'd')}
         lower(_padded_pair_model(k=5, pad=2), tmp_path / 'deep', ones)
