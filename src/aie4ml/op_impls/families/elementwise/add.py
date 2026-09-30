@@ -161,9 +161,11 @@ class AddOpImplVariant(OpImplVariant):
             )
 
         # The DMA walks a transposed operand's grid in view order; the kernel does the block.
+        fused = node.traits.get('fused_activation')
         flags = AddFlags(
             transpose_lhs=io_views[lhs_tensor.name].is_transposed,
             transpose_rhs=io_views[rhs_tensor.name].is_transposed,
+            use_relu=fused is not None and fused.data['activation'] == 'relu',
         )
         microtile = io_views[lhs_tensor.name].microtile
         if (flags.transpose_lhs or flags.transpose_rhs) and microtile is not None:

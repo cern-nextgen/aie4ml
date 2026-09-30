@@ -10,6 +10,7 @@ from ...utils.precision import resolve_exact_storage_dtype
 @family_resolver('add')
 class AddFamilyResolver(FamilyResolver):
     op_type = 'add'
+    supported_fusions = frozenset({'relu'})
 
     def validate_structure(self, node, _device) -> None:
         lhs_tensor = input_tensor_for_role(node, 'lhs')

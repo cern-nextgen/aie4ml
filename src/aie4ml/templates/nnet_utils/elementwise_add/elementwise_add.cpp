@@ -38,8 +38,11 @@ void elementwise_add_kernel<ConfigT>::run(
       vb = aie::transpose(vb, MT_INNER, MT_OUTER);
     rhs_ptr += VEC;
     auto acc = aie::add(aie::from_vector<acc_scalar_t>(va), vb);
+    auto sum = aie::to_vector<result_t>(acc, ConfigT::SHIFT);
+    if constexpr (ConfigT::USE_RELU)
+      sum = aie::max(sum, aie::zeros<result_t, VEC>());
 
-    aie::store_v(out_ptr, aie::to_vector<result_t>(acc, ConfigT::SHIFT));
+    aie::store_v(out_ptr, sum);
     out_ptr += VEC;
   }
 }

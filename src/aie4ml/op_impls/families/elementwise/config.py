@@ -10,6 +10,7 @@ from ...utils import MicrotileShape, ParallelismConfig, TensorView
 class AddFlags:
     transpose_lhs: bool
     transpose_rhs: bool
+    use_relu: bool = False
 
 
 @dataclass(frozen=True)

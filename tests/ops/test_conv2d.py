@@ -500,7 +500,8 @@ def test_frame_readers_with_other_windows_read_through_a_memory_tile(tmp_path):
 
 def _downsampling_block_model():
     """A ResNet downsampling block: the stem's output is read by a padded stride-2 3x3 and a stride-2 1x1 conv, each
-    behind a retiler that takes it through a memory tile; the branches meet in an Add, then a 1x1 conv and a Dense."""
+    behind a retiler that takes it through a memory tile; the branches meet in an Add and its Relu, then a 1x1 conv and
+    a Dense."""
     nodes: list = []
     inits: list = []
     _start(nodes, inits)
@@ -509,8 +510,9 @@ def _downsampling_block_model():
     _conv(nodes, inits, 'a', 'b', 'mid', C3, C3, 3, pad=1, relu=False, seed=42)
     _conv(nodes, inits, 's', 'k', 'skip', C3, C3, 1, pad=0, stride=2, relu=False, seed=43)
     nodes.append(helper.make_node('Add', ['b', 'k'], ['sum'], name='sum'))
+    nodes.append(helper.make_node('Relu', ['sum'], ['sum_relu'], name='sum_relu'))
     inits += _qparams('sumo', frac=FRAC)
-    qdq(nodes, 'sum', 'r', 'sumo')
+    qdq(nodes, 'sum_relu', 'r', 'sumo')
     _conv(nodes, inits, 'r', 'p', 'proj', C3, C3, 1, pad=0, relu=False, seed=44)
     _head(nodes, inits, 'p', H // 2 * W // 2 * C3, seed=45)
     return _model('conv_downsampling', nodes, inits)
@@ -519,8 +521,8 @@ def _downsampling_block_model():
 @pytest.mark.requires_vitis
 @pytest.mark.parametrize('part', [PART, MLV2_PART], ids=['aie-ml', 'aie-mlv2'])
 def test_tensor_readers_with_other_windows_match_onnx(tmp_path, part):
-    """Four iterations of distinct inputs through aiesim, exact: memory tiles lay one tensor out for two retilers,
-    two conv frames out for an Add and its sum for the next conv."""
+    """Four iterations of distinct inputs through aiesim, exact: memory tiles lay one tensor out for two retilers, and
+    the Add, with its Relu fused, takes the conv frames directly and hands its sum on to the next conv."""
     feeds = np.random.default_rng(17).integers(-40, 40, size=(4, 1, H, W, CIN), dtype=np.int8)
     assert_aie_matches_onnx(
         _downsampling_block_model(),

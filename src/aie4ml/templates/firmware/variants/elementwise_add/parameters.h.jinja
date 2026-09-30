@@ -14,6 +14,7 @@ struct {{L.struct_name}} {
 {{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
   static constexpr bool TRANSPOSE_LHS = {{ 'true' if P.flags.transpose_lhs else 'false' }};
   static constexpr bool TRANSPOSE_RHS = {{ 'true' if P.flags.transpose_rhs else 'false' }};
+  static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
   static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
   static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
   static constexpr int SHIFT = {{P.shift}};
