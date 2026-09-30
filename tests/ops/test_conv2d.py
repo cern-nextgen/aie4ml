@@ -444,6 +444,25 @@ def test_conv_rejects_partitions_it_cannot_cut(conv_model, tmp_path):
         lower(conv_model, tmp_path, split, part=AIE1_PART)
 
 
+def test_conv_refuses_a_split_taller_than_the_array(tmp_path):
+    """Eight channel chains stack on eight rows, and the AIE-MLv2 part has four: refused when resolved, so a design
+    search moves on instead of failing in placement."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'c', CIN, 64, 1, pad=0, relu=True, seed=5)
+    nodes.append(helper.make_node('Transpose', ['a'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    model = make_model(
+        'conv_tall',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, H, W, 64])],
+        initializers=inits,
+    )
+    with pytest.raises(ConfigRefused, match=r'spans 1x8 tiles .* beyond the 35x4 tiles'):
+        lower(model, tmp_path, {'c': {'parallelism': {'cas_num': 8}}}, part=MLV2_PART)
+
+
 def test_frame_refuses_consumers_that_read_different_windows(tmp_path):
     """One padded frame serves one window: a fanout whose branches pad differently needs a
     per-consumer view, which transport does not materialize, so it is refused up front."""

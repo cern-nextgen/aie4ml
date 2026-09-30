@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..errors import ConfigRefused
 from ..ir import get_backend_context
 from ..ir.graph import (
     ExecutionInput,
@@ -48,6 +49,7 @@ def resolve_instance(node, device, input_contracts, parallelism=None) -> Executi
     )
     _check_transposed_views(node, config, variant)
     variant.validate_config(node, config, device)
+    _check_fits_array(node, variant.footprint(node, config), device)
     ports = variant.build_ports(node, config)
     variant.validate_ports(node, ports, device)
 
@@ -66,6 +68,16 @@ def resolve_instance(node, device, input_contracts, parallelism=None) -> Executi
         inputs=inputs,
         outputs=outputs,
     )
+
+
+def _check_fits_array(node, footprint, device) -> None:
+    """A kernel graph larger than the array placement searches can never be placed."""
+    columns, rows = int(device.columns) - int(device.column_start), int(device.rows) - int(device.row_start)
+    if footprint.width > columns or footprint.height > rows:
+        raise ConfigRefused(
+            f'{node.name}: its kernel graph spans {footprint.width}x{footprint.height} tiles (columns x rows), beyond '
+            f'the {columns}x{rows} tiles of the {device.platform} array; split it the other way.'
+        )
 
 
 def _check_transposed_views(node, config, variant) -> None:
