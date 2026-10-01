@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dense_bias_relu_stream.h"
-#include "stored_operand.h"
 #include <type_traits>
 using namespace adf;
 
@@ -77,7 +76,6 @@ struct dense_stream_traits {
   static constexpr int BAND_ROWS = 2 * M;
 
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
-  using AOp = stored_operand<data_t, M, K, rowA, colA, false, ConfigT::A_ROWS>;
 
   // Streams move 128-bit chunks; a microtile row is either whole chunks or half of one.
   static constexpr int CHUNK_BYTES = 16;
@@ -285,7 +283,7 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
 
   for (unsigned j = 0; j < colB / N; j += 2) {
     const data_t*   __restrict pA1 = pA;
-    const data_t*   __restrict pA2 = pA + T::AOp::OUTER_STEP;
+    const data_t*   __restrict pA2 = pA + (colA / K) * MMUL::size_A;
     const weight_t* __restrict pB1 = pB + j * MMUL::size_B;
     const weight_t* __restrict pB2 = pB + (j + 1) * MMUL::size_B;
 
@@ -305,8 +303,8 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
     aie::vector<data_t, MMUL::size_A> A0, A1;
     aie::vector<weight_t, MMUL::size_B> B0, B1;
     auto load_step = [&]() {
-      A0 = T::AOp::load(pA1); pA1 += T::AOp::INNER_STEP;
-      A1 = T::AOp::load(pA2); pA2 += T::AOp::INNER_STEP;
+      A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
+      A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
       B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
     };
@@ -386,7 +384,6 @@ static inline void dense_stream_rows(input_stream<typename ConfigT::data_t>* __r
                                      typename ConfigT::result_t* __restrict tiles)
 {
   using T = dense_stream_traits<ConfigT>;
-  static_assert(!STREAM_A || ConfigT::A_ROWS == ConfigT::M, "a re-tiled band holds whole microtiles");
   constexpr unsigned NB = T::rowA / T::BAND_ROWS;
   constexpr unsigned CHUNKS_IN = T::BAND_ROWS * T::colA / T::CHUNK_A;
   constexpr unsigned CHUNKS_OUT = T::BAND_ROWS * T::colB / T::CHUNK_C;

@@ -746,7 +746,7 @@ def test_aie1_direct_buffer_fanout_keeps_each_compatible_leg(tmp_path):
 
 
 def test_aie1_staging_mismatch_requires_an_explicit_relayout(tmp_path):
-    with pytest.raises(ConfigRefused, match=r'no supported microtiling reads producer output microtile'):
+    with pytest.raises(ConfigRefused, match=r'no supported microtiling accepts producer output microtile'):
         _run_pipeline(
             _fanout_dense_model(),
             tmp_path,

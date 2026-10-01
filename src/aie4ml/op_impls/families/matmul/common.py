@@ -1,24 +1,22 @@
 from __future__ import annotations
 
-import dataclasses
 from typing import Dict, List, Tuple
 
 import numpy as np
 
 from ....aie_types import FLOAT_FORMATS, FloatIntent
+from ....errors import ConfigRefused
 from ....ir.graph import STAGING_CONTRACTS, input_tensor_for_role
 from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 from ...utils import (
     STORAGE_LAYOUT_LINEAR,
     AxisPlan,
-    MicrotileShape,
     TensorView,
     build_staging_descriptor,
     canonical_buffer_axes,
     ordered_view_shape,
 )
-from ...utils.precision import element_bytes, resolve_exact_storage_dtype
-from ...utils.tensor_view import microtile_from_staging
+from ...utils.precision import resolve_exact_storage_dtype
 
 # Keys are canonical format-string pairs (lhs_format, rhs_format).
 # Integer formats: 'int8', 'int16' (sign-agnostic — both int8_t and uint8_t map here).
@@ -48,6 +46,24 @@ MICROTILE_OPTIONS: Dict[str, Dict[Tuple[str, str], List[Tuple[int, int, int]]]] 
         ('fp8_e4m3', 'fp8_e4m3'): [(8, 8, 8)],
     },
 }
+
+# Generations whose cores transpose an mmul operand in vector registers. AIE1's AIE API has no vector transpose for
+# 8- and 16-bit types, and its scalar fallback is far slower (a 16x16x16 int8 Dense reading its input transposed:
+# 3992 cc a call against 944), so there a transposed operand is refused: transposing it in the PL is future work.
+REGISTER_TRANSPOSE = frozenset({'AIE-ML', 'AIE-MLV2'})
+
+
+def check_register_transpose(node, io_views, device) -> None:
+    """Refuse an operand read transposed on a generation that cannot transpose it at vector speed."""
+    if select_generation_key(device.generation) in REGISTER_TRANSPOSE:
+        return
+    for role in ('lhs', 'rhs'):
+        tensor = input_tensor_for_role(node, role)
+        if tensor.name in io_views and io_views[tensor.name].is_transposed:
+            raise ConfigRefused(
+                f'{node.name}: reads {tensor.name!r} transposed, which {device.generation} cores cannot do at vector '
+                'speed; transpose it before the AIE.'
+            )
 
 
 def select_generation_key(generation: str) -> str:
@@ -112,7 +128,7 @@ def describe_inner_lhs_staging(view: TensorView, port: int):
     microtile_k = int(view.microtile.inner)
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
-    inner_dim, outer_dim, _ = canonical_buffer_axes(view)
+    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
     k_start, k_held = _slice(view.logical_inner, in_slice, view.tile_raw_inner, port)
     return build_staging_descriptor(
         view,
@@ -121,7 +137,7 @@ def describe_inner_lhs_staging(view: TensorView, port: int):
             inner_dim: AxisPlan(microtile_k, microtile_k, in_slice // microtile_k, port * in_slice),
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
         },
-        order=list(range(view.rank)),
+        order=traversal_dims,
         logical_origin={inner_dim: k_start},
         io_tiling_overrides={inner_dim: k_held},
         boundary_shape='logical',
@@ -155,7 +171,7 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int):
     microtile_k = int(view.microtile.inner)
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
-    inner_dim, outer_dim, _ = canonical_buffer_axes(view)
+    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
 
     cas_length = max(1, int(parallelism.cas_length))
     row_group = int(port) // cas_length
@@ -171,7 +187,7 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int):
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, row_group * outer_slice),
         },
         logical_origin={inner_dim: k_start, outer_dim: row_start},
-        order=list(range(view.rank)),
+        order=traversal_dims,
         io_tiling_overrides={inner_dim: k_held, outer_dim: rows_held},
         slice_dim=outer_dim,
         boundary_shape='logical',
@@ -237,56 +253,9 @@ def describe_stream_staging(view: TensorView, port: int, access: str, contract: 
     )
 
 
-def adopts_blocks(microtile: MicrotileShape, transposed: bool, producer: MicrotileShape, element_size: int) -> bool:
-    """Whether an operand read in `microtile`s of its view can read the blocks its producer stores: they hold the
-    columns of one microtile of the stored tensor (the view, or its transpose) and divide its rows, each at least
-    one 16-byte vector load."""
-    rows, cols = (microtile.inner, microtile.outer) if transposed else (microtile.outer, microtile.inner)
-    return (
-        int(producer.inner) == int(cols)
-        and int(rows) % int(producer.outer) == 0
-        and int(producer.outer) * int(cols) * int(element_size) % 16 == 0
-    )
-
-
-def stored_block(microtile: MicrotileShape, transposed: bool, producer: MicrotileShape | None, element_size: int):
-    """The blocks a kernel reads an mmul operand in, in its view's axes (see stored_operand.h): the producer's where
-    it can read them, so the hand-over needs no re-layout, else the microtile's own."""
-    if producer is None or not adopts_blocks(microtile, transposed, producer, element_size):
-        return microtile
-    if transposed:
-        return MicrotileShape(outer=int(microtile.outer), inner=int(producer.outer))
-    return MicrotileShape(outer=int(producer.outer), inner=int(microtile.inner))
-
-
-def stored_block_rows(view: TensorView) -> int:
-    """Rows of the stored tensor in one block of an operand view (stored_operand.h's BLOCK_ROWS)."""
-    return int(view.microtile.inner if view.is_transposed else view.microtile.outer)
-
-
-def producer_blocks(tensor, input_contracts) -> MicrotileShape | None:
-    """The microtile blocks the producer of `tensor` stores it in, or None (no producer, or not microtiled)."""
-    contract = input_contracts.get(tensor.name)
-    return None if contract is None else microtile_from_staging(contract.port_staging[0])
-
-
-def read_as_stored(node, io_views: Dict[str, TensorView], input_contracts, precision) -> Dict[str, TensorView]:
-    """`io_views` with each activation operand read in its producer's blocks where it can be (see stored_block)."""
-    views = dict(io_views)
-    for role in ('lhs', 'rhs'):
-        tensor = input_tensor_for_role(node, role)
-        if tensor.is_parameter:
-            continue
-        producer = producer_blocks(tensor, input_contracts)
-        view = views[tensor.name]
-        block = stored_block(view.microtile, view.is_transposed, producer, element_bytes(precision[role]))
-        views[tensor.name] = dataclasses.replace(view, microtile=block)
-    return views
-
-
 def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
     """RHS staging for the 'outer' contract: the port selects a K-chain; every row group shares it. Its blocks are in
-    the tensor's own order, transposed or not (see `stored_block`)."""
+    the tensor's own order, transposed or not: the kernel transposes a transposed one in registers."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
     k_slice = view.tile_outer
@@ -312,7 +281,7 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
 
 def describe_inner_rhs_staging(view: TensorView, parallelism, port: int):
     """RHS staging for the 'inner' contract: the port selects an (N-slice, K-chain) tile, its blocks in the tensor's
-    own order (see `stored_block`)."""
+    own order, transposed or not: the kernel transposes a transposed one in registers."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
     # The rhs view encodes both K and N slices: outer dim = K, inner dim = N.

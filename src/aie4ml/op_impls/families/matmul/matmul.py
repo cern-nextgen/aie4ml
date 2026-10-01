@@ -13,6 +13,7 @@ from ...utils.precision import (
     resolve_output_scale_shift,
 )
 from .common import (
+    check_register_transpose,
     bitwidths_supported,
     describe_inner_lhs_staging,
     describe_inner_output_staging,
@@ -20,10 +21,7 @@ from .common import (
     describe_outer_lhs_staging,
     describe_outer_output_staging,
     describe_outer_rhs_staging,
-    producer_blocks,
-    read_as_stored,
     requested_contract,
-    stored_block_rows,
 )
 from .config import MatmulConfig, MatmulFlags
 from .dense import _BaseDenseMatmulVariant
@@ -46,12 +44,10 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
     def resolve(self, node: OpNode, device, directives, input_contracts) -> MatmulConfig:
         io_route, parallel_cfg = parse_directives(directives)
         precision, accumulator_tag = resolve_operand_precision(node, device)
-        lhs_producer = producer_blocks(input_tensor_for_role(node, 'lhs'), input_contracts)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], lhs_producer=lhs_producer)
+        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
         tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract, parallel_cfg)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
-
-        io_views = read_as_stored(node, io_views, input_contracts, precision)
+        check_register_transpose(node, io_views, device)
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
@@ -81,10 +77,6 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
                 transpose_rhs=io_views[rhs_tensor.name].is_transposed,
             ),
         )
-
-    def kernel_params(self, node, config):
-        rhs_view = config.io_views[input_tensor_for_role(node, 'rhs').name]
-        return {**super().kernel_params(node, config), 'rhs_block_rows': stored_block_rows(rhs_view)}
 
     def validate_config(self, node: OpNode, config: MatmulConfig, _device) -> None:
         rhs_tensor = input_tensor_for_role(node, 'rhs')

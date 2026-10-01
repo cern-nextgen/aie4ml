@@ -13,7 +13,6 @@ struct {{L.struct_name}} {
   static constexpr bool USE_BIAS = {{ 'true' if P.flags.use_bias else 'false' }};
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
   static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.flags.transpose_lhs else 'false' }};
-  static constexpr int A_ROWS = {{P.lhs_block_rows}};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr int BANK_BYTES = {{P.bank_mem_bytes}};
   static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};

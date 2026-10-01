@@ -12,9 +12,9 @@ from ....ir import input_role, input_tensor_for_role
 from ....ir.graph import STAGING_CONTRACTS
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
-from ...utils.io import view_layout, view_shape
+from ...utils.io import view_shape
 from ...utils.precision import element_bytes, resolve_operand_precision
-from .common import MICROTILE_OPTIONS, adopts_blocks, select_generation_key
+from .common import MICROTILE_OPTIONS, select_generation_key
 from .config import MatmulMicrotileConfig
 
 
@@ -79,12 +79,16 @@ def _supported_microtile_options(generation: str, lhs_dtype, rhs_dtype):
 
 
 def _resolve_tile_cfg(
-    node, device, lhs_dtype, rhs_dtype, lhs_producer=None, require_lhs_producer=False, fewest_rows=False
+    node, device, lhs_dtype, rhs_dtype, required_lhs_microtile=None, preferred_lhs_microtile=None, fewest_rows=False
 ) -> MatmulMicrotileConfig:
-    """The microtile a directive pins, else the first -- or, `fewest_rows`, the fewest rows among those whose output
-    a Dense of the same microtile reads directly (K == N) -- of those whose LHS reads the blocks its producer stores
-    (`lhs_producer`, see adopts_blocks), which keeps the hand-over direct: all of them where any does, unless
-    `require_lhs_producer`."""
+    """The microtile a directive pins, else one the producer's must match (`required_lhs_microtile`), else the
+    producer's where the part offers it (`preferred_lhs_microtile`), else the first -- or, `fewest_rows`, the fewest
+    rows among those whose output a Dense of the same microtile reads directly (K == N).
+
+    The first is the generation's default; others can be slower (int8 Dense on AIE-ML at 64x64x64: 8x8x4 took 2234
+    cc against 4x8x8's 1122). Operands are read in whole microtiles, and a hand-over whose producer writes other
+    blocks goes through a memory tile: stacking the producer's smaller blocks into one operand instead kept it direct
+    but ran 3x to 8x slower (8x8x8 reading 4x8 blocks: 127 cc against 38 at 16x16x16, 8484 against 1050 at 64^3)."""
     microtiling_cfg = node.directives.get('microtiling')
     if microtiling_cfg is not None and len(microtiling_cfg) != 3:
         raise ValueError(f'{node.name}: microtiling needs microtile_m, microtile_k and microtile_n.')
@@ -95,13 +99,6 @@ def _resolve_tile_cfg(
             f'(input={lhs_dtype.format!r}, weight={rhs_dtype.format!r}).'
         )
 
-    perm = view_layout(node, input_tensor_for_role(node, 'lhs'), 'inputs').get('perm')
-    transposed = perm is not None and int(perm[-1]) != len(perm) - 1
-
-    def reads_producer(option) -> bool:
-        lhs_block = MicrotileShape(outer=int(option[0]), inner=int(option[1]))
-        return adopts_blocks(lhs_block, transposed, lhs_producer, element_bytes(lhs_dtype))
-
     if microtiling_cfg is not None:
         candidate = tuple(microtiling_cfg[key] for key in ('microtile_m', 'microtile_k', 'microtile_n'))
         if candidate not in options:
@@ -109,21 +106,28 @@ def _resolve_tile_cfg(
                 f'{node.name}: microtiling {candidate} not supported for Generation={device.generation} and '
                 f'(input={lhs_dtype.format!r}, weight={rhs_dtype.format!r}). Allowed: {options}'
             )
-        if require_lhs_producer and not reads_producer(candidate):
+        if required_lhs_microtile is not None and candidate[:2] != (
+            int(required_lhs_microtile.outer),
+            int(required_lhs_microtile.inner),
+        ):
             raise ConfigRefused(
-                f'{node.name}: microtiling {candidate} cannot read the producer output microtile '
-                f'({lhs_producer.outer}, {lhs_producer.inner}).'
+                f'{node.name}: microtiling {candidate} does not match the producer output microtile '
+                f'({required_lhs_microtile.outer}, {required_lhs_microtile.inner}).'
             )
         return MatmulMicrotileConfig(microtile_m=candidate[0], microtile_k=candidate[1], microtile_n=candidate[2])
 
-    if lhs_producer is not None:
-        reading = [option for option in options if reads_producer(option)]
-        if require_lhs_producer and not reading:
+    if required_lhs_microtile is not None:
+        required = (int(required_lhs_microtile.outer), int(required_lhs_microtile.inner))
+        options = [option for option in options if option[:2] == required]
+        if not options:
             raise ConfigRefused(
-                f'{node.name}: no supported microtiling reads producer output microtile '
-                f'({lhs_producer.outer}, {lhs_producer.inner}) for Generation={device.generation}.'
+                f'{node.name}: no supported microtiling accepts producer output microtile {required} for '
+                f'Generation={device.generation}.'
             )
-        options = reading or options
+
+    if preferred_lhs_microtile is not None:
+        preferred = (int(preferred_lhs_microtile.outer), int(preferred_lhs_microtile.inner))
+        options = [option for option in options if option[:2] == preferred] or options
     if fewest_rows:
         chaining = [option for option in options if option[1] == option[2]] or options
         default_m, default_k, default_n = min(chaining, key=lambda option: option[0])

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from aie4ml.errors import ConfigRefused
-from helpers import PART, TensorProto, dq, helper, lower, make_model, numpy_helper, qdq, qparams
+from helpers import TensorProto, dq, helper, lower, make_model, numpy_helper, qdq, qparams
 
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
 
@@ -279,59 +279,6 @@ def _transposed_concat_model(*, second_transposed: bool = True):
         outputs=[(output, TensorProto.FLOAT, [rows, 16])],
         initializers=initializers,
     )
-
-
-def _transposed_dense_model(*, seed=None):
-    """root [16, 16] read transposed by tail: tail's rows are root's features."""
-    nodes, initializers = [], []
-    graph_input = _input(nodes, initializers, 'x', 16)
-    root = _dense(nodes, initializers, 'x', 'root', seed=seed)
-    output = _dense(
-        nodes, initializers, _transposed(nodes, root, 'root_t'), 'tail', seed=None if seed is None else seed + 1
-    )
-    return make_model(
-        'transposed_dense',
-        nodes=nodes,
-        inputs=[graph_input],
-        outputs=[(output, TensorProto.FLOAT, [16, 16])],
-        initializers=initializers,
-    )
-
-
-# AIE1 takes the input on a stream (a PLIO re-tiled by DMA needs more BDs than a tile has), and 4x8x4 mmuls, whose
-# output blocks hold the columns of a transposed 4x8 input microtile.
-TRANSPOSED_DENSE = {
-    'aie-ml': (PART, {}),
-    'aie-mlv2': ('xc2ve3858-ssva2112-2MP-e-S', {}),
-    'aie1': (
-        AIE1_PART,
-        {
-            'root': {
-                'ports': {'inputs': 'stream'},
-                'microtiling': {'microtile_m': 4, 'microtile_k': 8, 'microtile_n': 4},
-            },
-            'tail': {'microtiling': {'microtile_m': 4, 'microtile_k': 8, 'microtile_n': 4}},
-        },
-    ),
-}
-
-
-@pytest.mark.parametrize('case', TRANSPOSED_DENSE)
-def test_a_dense_reads_a_transposed_input_in_shared_memory(case, tmp_path):
-    part, directives = TRANSPOSED_DENSE[case]
-    ctx = lower(_transposed_dense_model(), tmp_path, directives, part=part)
-    edges = [e for e in ctx.ir.physical.plan['direct_edges'] if e['source'].startswith('root_aie')]
-    assert [(e['target'], e['realization']) for e in edges] == [('tail_aie.in1[0]', 'shared_memory')]
-
-
-@pytest.mark.requires_vitis
-@pytest.mark.parametrize('case', TRANSPOSED_DENSE)
-def test_a_dense_reading_a_transposed_input_matches_onnx(case, tmp_path):
-    from helpers import assert_x86_matches_onnx
-
-    part, directives = TRANSPOSED_DENSE[case]
-    feeds = {'x_q': np.random.default_rng(5).integers(-8, 8, size=(16, 16), dtype=np.int8)}
-    assert_x86_matches_onnx(_transposed_dense_model(seed=21), feeds, directives, tmp_path, max_code_diff=0, part=part)
 
 
 def _view(ctx, op_type):

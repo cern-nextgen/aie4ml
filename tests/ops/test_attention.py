@@ -1,12 +1,13 @@
 """One attention head: Q/K/V projections, Q·Kᵀ, ·V and the output projection.
 
-The matmul reads K transposed, and V, as their projections store them, so both hand over with no memory tile.
+The matmul reads K transposed, and V, as their projections store them: on AIE-MLv2 both hand over with no memory tile.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
+from aie4ml.errors import ConfigRefused
 from helpers import (
     TensorProto,
     assert_x86_matches_onnx,
@@ -58,30 +59,33 @@ def _head(tokens: int, features: int, head_dim: int):
     )
 
 
-# Q and K split by head dimension feed a two-stage cascade; V, split likewise, feeds two chains.
+# Q and K split by head dimension feed a two-stage cascade; V, split likewise, feeds two chains, which o cascades.
 SPLIT = {
     'q': parallelism(2),
     'k': parallelism(2),
     'scores': parallelism(1, cas_length=2),
     'v': parallelism(2),
     'ctx': parallelism(2),
+    'o': parallelism(1, cas_length=2),
 }
-# (part, tokens, features, head dimension, directives). AIE1 takes 8 features: its PLIO re-tiles a wider input
-# with more BDs than a tile has.
+# (part, tokens, features, head dimension, directives)
 CASES = {
-    'aie1': (AIE1, 16, 8, 16, {}),
     'aie-ml': (AIE_ML, 16, 16, 16, {}),
     'aie-mlv2': (AIE_MLV2, 16, 16, 16, {}),
-    'aie1-split': (AIE1, 16, 8, 32, SPLIT),
+    'aie-mlv2-split': (AIE_MLV2, 16, 16, 32, SPLIT),
 }
+# The projections write K and V in the blocks the matmuls read them in: AIE-MLv2's 8x8 microtiles. AIE-ML's 4x8x8
+# writes 4-row blocks that its 8-row reads would have to stack, so a memory tile re-tiles them.
+THROUGH_MEMTILES = {'aie-ml': {'k_mm', 'v_mm'}, 'aie-mlv2': set(), 'aie-mlv2-split': set()}
 
 
 @pytest.mark.parametrize('case', CASES)
-def test_attention_hands_k_and_v_over_directly(case, tmp_path):
+def test_attention_hands_k_and_v_over_in_the_blocks_their_microtiles_read(case, tmp_path):
     part, tokens, features, head_dim, directives = CASES[case]
     ctx = lower(_head(tokens, features, head_dim), tmp_path, directives, part=part)
-    assert not memtiles(ctx)
-    assert {('k_aie', 'scores_aie'), ('v_aie', 'ctx_aie')} <= direct_edges(ctx)
+    assert memtiles(ctx) == THROUGH_MEMTILES[case]
+    if not THROUGH_MEMTILES[case]:
+        assert {('k_aie', 'scores_aie'), ('v_aie', 'ctx_aie')} <= direct_edges(ctx)
 
 
 @pytest.mark.requires_vitis
@@ -93,8 +97,14 @@ def test_attention_matches_onnx(case, tmp_path):
     assert_x86_matches_onnx(model, feeds, directives, tmp_path, frac=FRAC_OUT, max_code_diff=0, part=part)
 
 
+def test_aie1_refuses_reading_k_transposed(tmp_path):
+    """AIE1 cores have no vector transpose for 8-bit operands."""
+    with pytest.raises(ConfigRefused, match="reads 'k_mm' transposed"):
+        lower(_head(16, 8, 16), tmp_path, part=AIE1)
+
+
 def test_a_long_sequence_crosses_the_boundary_through_memory_tiles(tmp_path):
     """128 tokens re-tiled at the PLIO would need more BDs than a tile has; the core still hands over directly."""
-    ctx = lower(_head(128, 16, 16), tmp_path, part=AIE_ML)
+    ctx = lower(_head(128, 16, 16), tmp_path, part=AIE_MLV2)
     assert memtiles(ctx) == {'x_q', 'o'}
     assert {('k_aie', 'scores_aie'), ('v_aie', 'ctx_aie')} <= direct_edges(ctx)

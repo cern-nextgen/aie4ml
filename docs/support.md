@@ -12,9 +12,12 @@ Quantization is static and per tensor. Scales are powers of two, so rescaling is
 Each compute kernel that is not fused (Dense/MatMul, Conv2D, etc.) can span several AI Engine tiles. The compiler chooses every layer's split for the whole model at once, keeping the hand-overs between layers direct where it can and falling back to a memory tile
 where it must (`AIEConfig`):
 
-- `Optimize: 'resource'` (default) uses the fewest tiles that fit.
-- `Optimize: 'performance'` splits the layers with the most multiply-accumulates per tile first, within
-  `MaxTiles` (default: the whole array). Multiply-accumulates are a proxy for time, not a timing model.
+- `Optimize: 'resource'` (default) uses the fewest tiles that fit, then the lowest latency.
+- `Optimize: 'performance'` takes the lowest latency among the designs whose interval is within 10% of the best,
+  within `MaxTiles` (default: the whole array).
+
+Both rank designs by a rough estimate in cycles, not a timing model: each kernel's multiply-accumulates or loads,
+plus each hand-over's bytes (none where two kernels share a buffer, twice through a memory tile).
 
 A layer's split can be fixed per layer (`LayerDirectives` in the ONNX config, or the hls4ml layer config); the
 compiler keeps what is given and chooses the rest:
@@ -22,7 +25,8 @@ compiler keeps what is given and chooses the rest:
 - `parallelism: {cas_length: L}` splits the reduction (input features or channels) over a chain of `L` tiles.
 - `parallelism: {cas_num: C}` runs `C` chains side by side, each computing a share of the output features or
   channels (`contract: 'inner'`) or of the rows (`contract: 'outer'`).
-- `ports: 'stream'`(exp) moves a Dense or a Conv2D over streams instead of memory buffers.
+- `ports: 'stream'`(exp) moves a Dense or a Conv2D over streams instead of memory buffers; a Dense also takes one
+  side alone (`ports: {inputs: 'stream'}` or `{outputs: 'stream'}`).
 
 The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml.report` summary.
 
@@ -32,6 +36,11 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
   and bfloat16 on AIE-ML and AIE-MLv2; FP8 E4M3 on AIE-MLv2. int8 × int16 is refused on every generation.
 - **Dense** has constant weights, an optional bias and a fused ReLU. **MatMul** multiplies two activations; its
   right operand is 2-D and may be broadcast across the left operand's leading axes. A batched right operand is refused.
+- **Transposed operands**: an activation operand read through a Transpose of its last two axes (a Dense or MatMul
+  input, a MatMul's right operand such as Kᵀ in Q·Kᵀ) is read as its producer stores it, a microtile at a time, and
+  transposed in registers. It hands over without a memory tile where the producer writes the consumer's microtiles
+  (AIE-MLv2's 8×8 ones); otherwise a memory tile re-tiles it (AIE-ML). AIE1 refuses it: its cores transpose 8- and
+  16-bit values at scalar speed.
 - **Parallelism**: `cas_length` splits the reduction over a cascade chain; `cas_num` runs parallel chains over the
   output features (`contract: 'inner'`) or the rows (`'outer'`). What a directive leaves open, the compiler chooses for
   the whole model (`AIEConfig.Optimize`, see the README).
@@ -41,6 +50,9 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
   block instead of two, on the fewest-row microtile a following Dense reads directly (2 rows on AIE1 and AIE-ML, 4
   on AIE-MLv2), or on its producer's microtile where the generation offers it.
 - **Ports**: buffers by default; `ports: 'stream'` moves each tile's padded block over core streams, for any split.
+  A stream end on one side only, the other a buffer, lets a Dense at the graph boundary take its input or emit its
+  output in row order without DMA descriptors (AIE1 inputs wider than 8 bytes a row, or long sequences); a stream
+  costs core cycles at 32 bits per cycle, so buffers stay faster where they fit.
 - **Batch**: the leading axis of the model's input (ONNX: its input shape; hls4ml: `batch_size`, default 1). Its
   rows are padded to whole microtiles; the host pads the input and trims the output.
 
@@ -101,7 +113,7 @@ These never become kernels of their own:
   BatchNormalization (PyTorch in eval mode, onnxruntime `quant_pre_process`). An unfolded BatchNormalization is
   refused, because its per-channel scale folds exactly only into float weights.
 - **Flatten / Reshape** of one sample to `[1, K]` between a Conv2D and a Dense.
-- **Transpose** of the last two axes.
+- **Transpose** of the last two axes, into a Dense or MatMul (see above); not on AIE1.
 - **Slice, Split and Concat** along the boundaries of the producing layer's tiles. A slice that cuts through a tile,
   or chained slices, are refused.
 
@@ -109,6 +121,9 @@ These never become kernels of their own:
 
 - Layers hand data over directly, tile to tile, when both sides agree on the layout. On AIE-ML and AIE-MLv2 a memory
   tile reorders it otherwise (one stage). AIE1 has no memory tile, so a layout mismatch there is refused.
+- A tile's DMA has 16 buffer descriptors; the compiler counts them on every generation and refuses a design that needs
+  more, before the AIE compiler runs. A graph input or output whose direct walk would need more goes through a memory
+  tile on AIE-ML and AIE-MLv2; on AIE1, give the boundary Dense a stream end.
 - An output may feed several layers (branches, residual Adds); each consumer is planned separately.
 - The graph input and output move over PLIO ports, split to match the first and last layers' tiles.
 - Placement starts at the device's first column with PL interfaces, next to the PLIOs, and spreads into the columns
@@ -123,4 +138,6 @@ These never become kernels of their own:
   int16 QuantizeLinear.
 - **hls4ml**: Keras 3 and QKeras v3 through hls4ml 1.4 (or the upstream commit in the README). Supported layers:
   Dense, Conv2D, DepthwiseConv2D, QConv2DBatchnorm, MaxPooling2D, Flatten, ReLU activations and LayerNormalization.
-  A SeparableConv2D must be split into its depthwise and pointwise layers.
+  A SeparableConv2D must be split into its depthwise and pointwise layers. Convert with `bit_exact=True`, as without
+  it hls4ml drops a trailing quantizer. (e.g., hls4ml rewrites a Dense on a rank-3 input into a PointwiseConv1D that loses
+  its weight quantizer under `bit_exact`); use the ONNX frontend for such models.
