@@ -217,7 +217,7 @@ class _Search:
             try:
                 legs = [leg for kernel in kernels for leg in collector.input_connections(kernel)]
                 legs += collector.output_connections(kernels[-1], self.last_read)
-                decisions = [classify_connection(leg, execution, self.ctx.device.has_memtile) for leg in legs]
+                decisions = [classify_connection(leg, execution, self.ctx.device) for leg in legs]
                 self._memtile_legs[key] = sum(decision.realization == 'memtile' for decision in decisions)
             except ConfigRefused as refusal:
                 self.refusals[node.name][str(refusal)] += 1

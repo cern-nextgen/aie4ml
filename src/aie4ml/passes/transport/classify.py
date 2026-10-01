@@ -6,7 +6,8 @@ from ...ir.graph import ROUTE_MODES
 from ...op_impls.utils.tensor_view import staging_tile_shape
 from ..base import AIEPass
 from .boundary import direct_boundary_access
-from .descriptors import rebase_descriptor_offset
+from .descriptors import describes_natural_order, rebase_descriptor_offset
+from .dma_resources import KERNEL_BUFFERS, tile_port_bds
 from .legality import direct_transport_failure, memtile_staging_failure, uses_stream
 from .model import Connection, TransportDecision
 
@@ -24,7 +25,7 @@ class ClassifyTransportEntries(AIEPass):
         for entry in entries:
             self._validate_entry(entry)
             leg = entry.consumers[0] if entry.consumers else Connection(entry.logical_tensor, entry.producer, None)
-            decision = classify_connection(leg, ctx.ir.execution, ctx.device.has_memtile)
+            decision = classify_connection(leg, ctx.ir.execution, ctx.device)
             changed = changed or entry.decision != decision
             entry.decision = decision
         return changed
@@ -43,7 +44,7 @@ class ClassifyTransportEntries(AIEPass):
             raise RuntimeError(f'{entry.logical_tensor}: internal transport entry has no consumer.')
 
 
-def classify_connection(leg: Connection, execution, has_memtile) -> TransportDecision:
+def classify_connection(leg: Connection, execution, device) -> TransportDecision:
     """How one transport leg is realised; `leg.consumer` is None for a graph output. Reads only the resolved
     instances and contracts in `execution`, so the parallelism search decides every leg by this rule too."""
     tensor, producer, consumer = leg.logical_tensor, leg.producer, leg.consumer
@@ -54,7 +55,7 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
         )
     route = _route_policy(leg, execution)
     is_boundary = producer.node is None or consumer is None
-    has_memtile = bool(has_memtile)
+    has_memtile = bool(device.has_memtile)
 
     restage_failure = memtile_staging_failure(execution, leg.endpoints())
     if route == 'memtile' and restage_failure is not None:
@@ -80,7 +81,7 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
         elif route == 'memtile':
             realization = 'memtile'
         else:  # a memory tile adds a stage and streams the padding it zero-fills; take it only where it must
-            realization = 'direct' if _direct_boundary_failure(leg, execution) is None else 'memtile'
+            realization = 'direct' if _direct_boundary_failure(leg, execution, device) is None else 'memtile'
         return TransportDecision(realization, True if realization == 'direct' else None)
 
     direct_failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer)
@@ -110,10 +111,11 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
     return TransportDecision(realization, staging_compatible)
 
 
-def _direct_boundary_failure(leg: Connection, execution) -> str | None:
+def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
     """Why a PLIO cannot feed or drain this graph-boundary leg's kernel ports through the tile's own DMA, or None.
     That DMA writes only the logical elements: padding rows may hold anything, since no row reads another, but an
-    input padded along its inner axis is summed across it, so only a memory tile, which zero-fills, may feed it."""
+    input padded along its inner axis is summed across it, so only a memory tile, which zero-fills, may feed it.
+    Nor may one port's walk need more BDs than a tile has."""
     output = leg.consumer is None
     endpoint = leg.producer if output else leg.consumer
     inst = execution.get(endpoint.node.name)
@@ -132,9 +134,18 @@ def _direct_boundary_failure(leg: Connection, execution) -> str | None:
             if int(staging['io_tiling_dimension'][inner]) < staging_tile_shape(staging)[inner]:
                 return f'{endpoint.node.name}.{endpoint.group} pads its inner axis'
         try:
-            direct_boundary_access(staging, staging['io_tiling_dimension'], element_bits=element.width, output=output)
+            access, _ = direct_boundary_access(
+                staging, staging['io_tiling_dimension'], element_bits=element.width, output=output
+            )
         except ConfigRefused as refusal:
             return str(refusal)
+        walk = None if describes_natural_order(access) else access
+        bds = tile_port_bds(walk, KERNEL_BUFFERS, device.tile_dma, device.generation, element.width)
+        if bds > device.tile_dma.bds:
+            return (
+                f'{endpoint.node.name}.{endpoint.group}[{port}] walks its layout with {bds} BDs, past a tile of '
+                f'{device.tile_dma.bds}'
+            )
     return None
 
 

@@ -16,10 +16,8 @@ from ..ir import get_backend_context
 from ..op_impls.common_types import PORT_KIND_BUFFER
 from .base import AIEPass
 from .shared_buffer import SHARED_MEMORY, location_problem, pinned_locations, static_problem
-from .transport.dma_resources import memtile_port_bds, pool_use, tile_port_bds
+from .transport.dma_resources import KERNEL_BUFFERS, memtile_port_bds, pool_use, tile_port_bds
 from .utils import sanitize_identifier
-
-KERNEL_BUFFERS = 2  # a kernel's DMA-fed buffer port is double-buffered
 
 _PORT = re.compile(r'^(?P<graph>\w+)\.(?P<group>\w+)\[(?P<port>\d+)\]$')
 

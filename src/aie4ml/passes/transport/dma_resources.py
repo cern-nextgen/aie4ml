@@ -14,6 +14,8 @@ from typing import Any, Dict, Optional, Sequence
 from ...errors import ConfigRefused
 from ...ir.context import DmaSpec
 
+KERNEL_BUFFERS = 2  # a kernel's DMA-fed buffer port is double-buffered
+
 # Generations whose AIE compiler (Vitis 2026.1.1) gives a kernel output's chunk of one 32-bit word no BD dimension of
 # its own, so its BD walks one loop more; measured on AIE1 only (its inputs do not).
 WORD_CHUNK_FOLDS = frozenset({'AIE'})

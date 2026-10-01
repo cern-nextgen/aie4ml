@@ -91,3 +91,10 @@ def test_attention_matches_onnx(case, tmp_path):
     feeds = {'x_q': np.random.default_rng(5).integers(-40, 40, size=(tokens, features), dtype=np.int8)}
     model = _head(tokens, features, head_dim)
     assert_x86_matches_onnx(model, feeds, directives, tmp_path, frac=FRAC_OUT, max_code_diff=0, part=part)
+
+
+def test_a_long_sequence_crosses_the_boundary_through_memory_tiles(tmp_path):
+    """128 tokens re-tiled at the PLIO would need more BDs than a tile has; the core still hands over directly."""
+    ctx = lower(_head(128, 16, 16), tmp_path, part=AIE_ML)
+    assert memtiles(ctx) == {'x_q', 'o'}
+    assert {('k_aie', 'scores_aie'), ('v_aie', 'ctx_aie')} <= direct_edges(ctx)
