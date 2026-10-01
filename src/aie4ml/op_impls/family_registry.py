@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 from ..errors import ConfigRefused
-from .utils import requested_port_kind
+from .utils import requested_port_kinds
 
 if TYPE_CHECKING:
     from .base import OpImplVariant
@@ -65,11 +65,12 @@ class FamilyResolver:
         self._check_output_view(node)
         self._check_fused_activation(node)
         self.validate_structure(node, device)
-        ports = requested_port_kind(node)
+        ports = requested_port_kinds(node)
         matching = [
             variant
             for variant in get_op_impl_registry().candidates(self.op_type)
-            if variant.port_kind == ports and variant.matches(node, device, directives)
+            if (variant.input_port_kind, variant.output_port_kind) == ports
+            and variant.matches(node, device, directives)
         ]
         if not matching:
             raise ConfigRefused(

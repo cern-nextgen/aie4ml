@@ -8,7 +8,8 @@ struct {{L.struct_name}} {
   static constexpr int IN_FEAT = {{L.n_in}}; static constexpr int OUT_FEAT = {{L.n_out}};
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
   static constexpr bool PARALLELISM_CONTRACT_OUTER = {{ 'true' if P.parallelism.contract == 'outer' else 'false' }};
-  static constexpr bool STREAM_IO = {{ 'true' if P.stream_io else 'false' }};
+  static constexpr bool STREAM_IN = {{ 'true' if P.stream_in else 'false' }};
+  static constexpr bool STREAM_OUT = {{ 'true' if P.stream_out else 'false' }};
   static constexpr bool USE_BIAS = {{ 'true' if P.flags.use_bias else 'false' }};
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
   static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.flags.transpose_lhs else 'false' }};

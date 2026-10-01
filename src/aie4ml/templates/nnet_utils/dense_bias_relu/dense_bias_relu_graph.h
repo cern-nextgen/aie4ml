@@ -48,7 +48,9 @@ public:
   // (chain, column) tile its own row slice, so the port array is per-tile.
   static constexpr bool PARALLELISM_CONTRACT_OUTER = ConfigT::PARALLELISM_CONTRACT_OUTER;
   static constexpr unsigned LHS_PORTS = PARALLELISM_CONTRACT_OUTER ? CAS_NUM * CAS_LENGTH : CAS_LENGTH;
-  static constexpr bool STREAM_IO = ConfigT::STREAM_IO;
+  // The LHS arrives, and the output leaves, on a stream (in row order) or in a buffer (in microtiles).
+  static constexpr bool STREAM_IN = ConfigT::STREAM_IN;
+  static constexpr bool STREAM_OUT = ConfigT::STREAM_OUT;
   using BufferKernels = dense_buffer_kernels<ConfigT, ConfigT::ROW_BLOCKS>;
 
   input_port  in1[LHS_PORTS];
@@ -70,7 +72,7 @@ void place_graph(int COL_START, int ROW_START)
 
     adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
 
-    if constexpr (!STREAM_IO) {
+    if constexpr (!STREAM_IN) {
       const auto inputLocation = ConfigT::IN1_BUFFER_LOCATIONS[idx];
       if (inputLocation.bank_count == 1) {
         adf::location<adf::buffer>(kk[idx].in[0]) = adf::bank(
@@ -90,7 +92,7 @@ void place_graph(int COL_START, int ROW_START)
     }
 
     if (is_last) {
-      if constexpr (!STREAM_IO) {
+      if constexpr (!STREAM_OUT) {
         const auto outputLocation = ConfigT::OUT1_BUFFER_LOCATIONS[idx / CAS_LENGTH];
         if (outputLocation.bank_count == 1) {
           adf::location<adf::buffer>(kk[idx].out[0]) = adf::bank(
@@ -110,37 +112,38 @@ void place_graph(int COL_START, int ROW_START)
   {
 
     for (int chain = 0; chain < CAS_NUM; ++chain) {
-        if constexpr (CAS_LENGTH == 1) {
-            if constexpr (STREAM_IO) {
-                kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_single_stream<ConfigT>>();
-            } else {
-                kk[chain * CAS_LENGTH + 0] = kernel::create_object<typename BufferKernels::single>();
-            }
-        }
-        else if constexpr (STREAM_IO) {
-            kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_first_stream<ConfigT>>();
-            if constexpr (CAS_LENGTH > 2) {
-                for (int c = 1; c < CAS_LENGTH - 1; ++c) {
+        // A stream end at either side runs dense_bias_relu_stream.cpp; a chain's first and middle kernels see
+        // only its input.
+        if constexpr (CAS_LENGTH > 1) {
+            if constexpr (STREAM_IN) {
+                kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_first_stream<ConfigT>>();
+                for (int c = 1; c < CAS_LENGTH - 1; ++c)
                     kk[chain * CAS_LENGTH + c] = kernel::create_object<dense_middle_stream<ConfigT>>();
-                }
-            }
-            kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<dense_last_stream<ConfigT>>();
-        }
-        else {
-            kk[chain * CAS_LENGTH + 0] = kernel::create_object<typename BufferKernels::first>();
-            if constexpr (CAS_LENGTH > 2) {
-                for (int c = 1; c < CAS_LENGTH - 1; ++c) {
+            } else {
+                kk[chain * CAS_LENGTH + 0] = kernel::create_object<typename BufferKernels::first>();
+                for (int c = 1; c < CAS_LENGTH - 1; ++c)
                     kk[chain * CAS_LENGTH + c] = kernel::create_object<typename BufferKernels::middle>();
-                }
             }
-            kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<typename BufferKernels::last>();
+        }
+        kernel& last = kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)];
+        if constexpr (CAS_LENGTH == 1) {
+            if constexpr (STREAM_IN && STREAM_OUT) last = kernel::create_object<dense_single_stream<ConfigT>>();
+            else if constexpr (STREAM_IN) last = kernel::create_object<dense_single_stream_in<ConfigT>>();
+            else if constexpr (STREAM_OUT) last = kernel::create_object<dense_single_stream_out<ConfigT>>();
+            else last = kernel::create_object<typename BufferKernels::single>();
+        } else {
+            if constexpr (STREAM_IN && STREAM_OUT) last = kernel::create_object<dense_last_stream<ConfigT>>();
+            else if constexpr (STREAM_IN) last = kernel::create_object<dense_last_stream_in<ConfigT>>();
+            else if constexpr (STREAM_OUT) last = kernel::create_object<dense_last_stream_out<ConfigT>>();
+            else last = kernel::create_object<typename BufferKernels::last>();
         }
     }
 
     for (int idx = 0; idx < CAS_LENGTH * CAS_NUM; ++idx) {
         int col = idx % CAS_LENGTH;
         int row = idx / CAS_LENGTH;
-        source(kk[idx])        = STREAM_IO ? "dense_bias_relu_stream.cpp" : BufferKernels::source;
+        const bool stream_core = STREAM_IN || (STREAM_OUT && col == CAS_LENGTH - 1);
+        source(kk[idx])        = stream_core ? "dense_bias_relu_stream.cpp" : BufferKernels::source;
         runtime<ratio>(kk[idx]) = 1.0;
         single_buffer(kk[idx].in[1]);
         connect<parameter>(wts[idx], async(kk[idx].in[1]));
@@ -155,7 +158,7 @@ void place_graph(int COL_START, int ROW_START)
       for (unsigned ch = 0; ch < CAS_NUM; ++ch) {
         int idx = ch*CAS_LENGTH + col;
         connect<>( in1[PARALLELISM_CONTRACT_OUTER ? idx : col], kk[idx].in[0] );
-        if constexpr (!STREAM_IO) {
+        if constexpr (!STREAM_IN) {
           dimensions( kk[idx].in[0] ) = { padded_independent_extent * IN_FEAT_SLICE };
         }
       }
@@ -164,7 +167,7 @@ void place_graph(int COL_START, int ROW_START)
     for (int chain = 0; chain < CAS_NUM; ++chain) {
         const int last_idx = chain * CAS_LENGTH + (CAS_LENGTH - 1);
         connect<>( kk[last_idx].out[0], out1[chain] );
-        if constexpr (!STREAM_IO) {
+        if constexpr (!STREAM_OUT) {
           dimensions( kk[last_idx].out[0] ) = { padded_independent_extent * OUT_FEAT_SLICE };
         }
     }

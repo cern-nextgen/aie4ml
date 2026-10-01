@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from ..ir.graph import ROUTE_MODES, STAGING_CONTRACTS, TENSOR_LAYOUTS
-from ..op_impls.common_types import PORT_KINDS
+from ..op_impls.common_types import PORT_KIND_BUFFER, PORT_KINDS
 
 _DIRECTIVE_FIELDS = {
     'placement': ('col', 'row'),
@@ -71,9 +71,14 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
         directives['layout'] = layout
 
     if 'ports' in raw:
-        ports = str(raw['ports'])
-        if ports not in PORT_KINDS:
-            raise ValueError(f'{name}: unknown ports {ports!r}; expected one of {sorted(PORT_KINDS)}.')
+        # One kind for both directions, or one per direction; the default is a buffer.
+        asked = raw['ports'] if isinstance(raw['ports'], dict) else {'inputs': raw['ports'], 'outputs': raw['ports']}
+        ports = {direction: str(asked.get(direction, PORT_KIND_BUFFER)) for direction in ('inputs', 'outputs')}
+        if set(asked) - set(ports) or set(ports.values()) - PORT_KINDS:
+            raise ValueError(
+                f'{name}: unknown ports {raw["ports"]!r}; expected one of {sorted(PORT_KINDS)}, or one per direction '
+                "as {'inputs': ..., 'outputs': ...}."
+            )
         directives['ports'] = ports
 
     if 'approximation' in raw:

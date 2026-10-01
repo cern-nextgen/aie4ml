@@ -155,7 +155,7 @@ def test_stream_dense_emits_stream_graph(stream_dense_model, tmp_path):
     out = ctx.project_config.output_dir / 'src'
 
     parameters = (out / 'parameters.h').read_text()
-    assert parameters.count('STREAM_IO = true') == 3
+    assert parameters.count('STREAM_IN = true') == parameters.count('STREAM_OUT = true') == 3
     assert 'BUFFER_LOCATIONS' not in parameters
 
     graph_plan = (out / 'graph_plan.h').read_text()
@@ -206,4 +206,65 @@ def test_stream_dense_matches_onnx(stream_dense_model, tmp_path, part):
         project='stream_dense',
         part=part,
         max_code_diff=1,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# one stream end: stream in, buffer out, and buffer in, stream out
+# --------------------------------------------------------------------------- #
+
+
+MIXED_IN = 32  # two whole cascade slices
+
+
+@pytest.fixture
+def mixed_dense_model():
+    nodes: list = []
+    inits: list = [*_qparams('x', frac=FRAC)]
+    nodes.append(helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'))
+    _dense(nodes, inits, 'x', 'h', 'a', MIXED_IN, HIDDEN, relu=True, seed=4)
+    _dense(nodes, inits, 'h', 'y_cascade', 'b', HIDDEN, OUT_FEAT, relu=False, seed=5)
+    _dense(nodes, inits, 'x', 'g', 'c', MIXED_IN, HIDDEN, relu=True, seed=6)
+    _dense(nodes, inits, 'g', 'y_single', 'd', HIDDEN, OUT_FEAT, relu=False, seed=7)
+    return make_model(
+        'mixed_dense',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [ROWS, MIXED_IN])],
+        outputs=[('y_cascade', TensorProto.FLOAT, [ROWS, OUT_FEAT]), ('y_single', TensorProto.FLOAT, [ROWS, OUT_FEAT])],
+        initializers=inits,
+    )
+
+
+# Cascades of two stages (first and last kernels) and single kernels, each with one stream end.
+MIXED = {
+    'a': {'ports': {'inputs': 'stream'}, 'parallelism': {'cas_num': 2, 'cas_length': 2}},
+    'b': {'ports': {'outputs': 'stream'}, 'parallelism': {'cas_num': 1, 'cas_length': 2}},
+    'c': {'ports': {'inputs': 'stream'}, 'parallelism': {'cas_num': 1, 'cas_length': 1}},
+    'd': {'ports': {'outputs': 'stream'}, 'parallelism': {'cas_num': 1, 'cas_length': 1}},
+}
+
+
+def test_one_stream_end_moves_the_boundary_without_dma(mixed_dense_model, tmp_path):
+    ctx = lower(mixed_dense_model, tmp_path, MIXED, part=AIE1_PART)
+    kinds = {}
+    for name in 'abcd':
+        inst = ctx.ir.execution.get(f'{name}_aie')
+        (inputs,), (outputs,) = inst.ports.inputs.values(), inst.ports.outputs.values()
+        kinds[name] = (inst.variant.variant_id, inputs.kind, outputs.kind)
+    assert kinds == {
+        'a': ('dense.b.r.stream_in.v1', 'stream', 'buffer'),
+        'b': ('dense.b.r.stream_out.v1', 'buffer', 'stream'),
+        'c': ('dense.b.r.stream_in.v1', 'stream', 'buffer'),
+        'd': ('dense.b.r.stream_out.v1', 'buffer', 'stream'),
+    }
+    plan = ctx.ir.physical.plan
+    assert plan['buffers'] == [] and plan['kernel_read_accesses'] == [] and plan['kernel_write_accesses'] == []
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
+def test_one_stream_end_matches_onnx(mixed_dense_model, tmp_path, part):
+    feed = np.random.default_rng(12).integers(-40, 40, size=(ROWS, MIXED_IN), dtype=np.int8)
+    assert_x86_matches_onnx(
+        mixed_dense_model, {'x_q': feed}, MIXED, tmp_path, project='mixed_dense', part=part, max_code_diff=1
     )

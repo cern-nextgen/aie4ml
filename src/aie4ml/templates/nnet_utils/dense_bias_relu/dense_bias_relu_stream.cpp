@@ -220,14 +220,28 @@ static inline void store_tile_pair(typename ConfigT::result_t* __restrict band, 
   }
 }
 
+// One finished 2x2 block of tiles -> the band's microtiles in an output buffer, (row group g, tile j) at
+// (g * colB/N + j) * size_C.
+template<typename ConfigT, typename MMUL>
+static inline void store_tiles(typename ConfigT::result_t* __restrict tiles, unsigned j,
+                               MMUL& C00, MMUL& C01, MMUL& C10, MMUL& C11)
+{
+  constexpr int GROUP = ConfigT::OUT_FEAT_SLICE / ConfigT::N * MMUL::size_C;
+  aie::store_v(tiles + j * MMUL::size_C, finalize_tile<ConfigT>(C00));
+  aie::store_v(tiles + (j + 1) * MMUL::size_C, finalize_tile<ConfigT>(C01));
+  aie::store_v(tiles + GROUP + j * MMUL::size_C, finalize_tile<ConfigT>(C10));
+  aie::store_v(tiles + GROUP + (j + 1) * MMUL::size_C, finalize_tile<ConfigT>(C11));
+}
+
 // ---------------------------------------------------------------------------
 // Band core: the 2x2 blocked mmul loop of dense_bias_relu.cpp over one band. With
 // READ the raw chunks of the next band are read, with WRITE the row chunks of the
 // previous band are written, from inside the K loop: a fixed number per tile-pair
-// iteration so every loop keeps a constant trip count.
+// iteration so every loop keeps a constant trip count. With TILED the band's tiles go straight to
+// the output buffer `band_c` points into.
 // The first kernel of a chain, or a single one, seeds its accumulators with the bias.
 // ---------------------------------------------------------------------------
-template<typename ConfigT, bool CASC_IN, bool CASC_OUT, bool BIAS, bool READ, bool WRITE>
+template<typename ConfigT, bool CASC_IN, bool CASC_OUT, bool TILED, bool BIAS, bool READ, bool WRITE>
 static inline void dense_stream_band(const typename ConfigT::data_t* __restrict pA,
                                      const typename ConfigT::weight_t* __restrict pB,
                                      const typename ConfigT::bias_t* __restrict pBias,
@@ -335,6 +349,8 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
       writeincr(outCascade, C01.to_accum());
       writeincr(outCascade, C10.to_accum());
       writeincr(outCascade, C11.to_accum());
+    } else if constexpr (TILED) {
+      store_tiles<ConfigT>(band_c, j, C00, C01, C10, C11);
     } else {
       store_tile_pair<ConfigT>(band_c, 0, j, C00, C01);
       store_tile_pair<ConfigT>(band_c, 1, j, C10, C11);
@@ -354,31 +370,39 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
 }
 
 // Bands of one inference: the first band is read up front and the last band is emitted
-// at the end; every other read and write overlaps a neighbouring band's compute.
-template<typename ConfigT, bool CASC_IN, bool CASC_OUT, bool BIAS>
+// at the end; every other read and write overlaps a neighbouring band's compute. Without
+// STREAM_A the bands are read in place from the microtiles `a_tiles`; with TILED they are
+// stored in `tiles` instead of emitted.
+template<typename ConfigT, bool STREAM_A, bool CASC_IN, bool CASC_OUT, bool TILED, bool BIAS>
 static inline void dense_stream_rows(input_stream<typename ConfigT::data_t>* __restrict in,
+                                     const typename ConfigT::data_t* __restrict a_tiles,
                                      const typename ConfigT::weight_t* __restrict pB,
                                      const typename ConfigT::bias_t* __restrict pBias,
                                      input_cascade<typename ConfigT::acc_scalar_t>* inCascade,
                                      output_cascade<typename ConfigT::acc_scalar_t>* outCascade,
-                                     output_stream<typename ConfigT::result_t>* __restrict out)
+                                     output_stream<typename ConfigT::result_t>* __restrict out,
+                                     typename ConfigT::result_t* __restrict tiles)
 {
   using T = dense_stream_traits<ConfigT>;
   constexpr unsigned NB = T::rowA / T::BAND_ROWS;
   constexpr unsigned CHUNKS_IN = T::BAND_ROWS * T::colA / T::CHUNK_A;
   constexpr unsigned CHUNKS_OUT = T::BAND_ROWS * T::colB / T::CHUNK_C;
-  alignas(32) static typename T::data_t   raw[2][T::BAND_ROWS * T::colA];
-  alignas(32) static typename T::data_t   band_a[T::BAND_ROWS * T::colA];
-  alignas(32) static typename T::result_t band_c[2][CASC_OUT ? T::CHUNK_C : T::BAND_ROWS * T::colB];
+  constexpr unsigned A_BAND = STREAM_A ? T::BAND_ROWS * T::colA : T::CHUNK_A;
+  alignas(32) static typename T::data_t   raw[2][A_BAND];
+  alignas(32) static typename T::data_t   band_a[A_BAND];
+  constexpr bool EMIT = !CASC_OUT && !TILED;
+  alignas(32) static typename T::result_t band_c[2][EMIT ? T::BAND_ROWS * T::colB : T::CHUNK_C];
 
   auto band_at = [&](unsigned band, auto read, auto write) {
-    retile_band<ConfigT>(raw[band & 1], band_a);
-    dense_stream_band<ConfigT, CASC_IN, CASC_OUT, BIAS, decltype(read)::value, !CASC_OUT && decltype(write)::value>(
-        band_a, pB, pBias, inCascade, outCascade, band_c[band & 1],
+    if constexpr (STREAM_A) retile_band<ConfigT>(raw[band & 1], band_a);
+    dense_stream_band<ConfigT, CASC_IN, CASC_OUT, TILED, BIAS, STREAM_A && decltype(read)::value,
+                      EMIT && decltype(write)::value>(
+        STREAM_A ? band_a : a_tiles + band * T::BAND_ROWS * T::colA, pB, pBias, inCascade, outCascade,
+        TILED ? tiles + band * T::BAND_ROWS * T::colB : band_c[band & 1],
         in, raw[(band + 1) & 1], out, band_c[(band + 1) & 1]);
   };
 
-  read_chunks<ConfigT>(in, raw[0], 0, CHUNKS_IN);
+  if constexpr (STREAM_A) read_chunks<ConfigT>(in, raw[0], 0, CHUNKS_IN);
   if constexpr (NB == 1) {
     band_at(0, std::false_type{}, std::false_type{});
   } else {
@@ -388,7 +412,7 @@ static inline void dense_stream_rows(input_stream<typename ConfigT::data_t>* __r
     }
     band_at(NB - 1, std::false_type{}, std::true_type{});
   }
-  if constexpr (!CASC_OUT) {
+  if constexpr (EMIT) {
     write_chunks<ConfigT>(out, band_c[(NB - 1) & 1], 0, CHUNKS_OUT, true);
   }
 }
@@ -403,7 +427,8 @@ void dense_single_stream<ConfigT>::run(input_stream<data_t>* ifm,
                                        const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
                                        output_stream<result_t>* ofm)
 {
-  dense_stream_rows<ConfigT, false, false, ConfigT::USE_BIAS>(ifm, wts, bias, nullptr, nullptr, ofm);
+  dense_stream_rows<ConfigT, true, false, false, false, ConfigT::USE_BIAS>(
+      ifm, nullptr, wts, bias, nullptr, nullptr, ofm, nullptr);
 }
 
 template<typename ConfigT>
@@ -412,7 +437,8 @@ void dense_first_stream<ConfigT>::run(input_stream<data_t>* ifm,
                                       const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
                                       output_cascade<acc_scalar_t>* outCascade)
 {
-  dense_stream_rows<ConfigT, false, true, ConfigT::USE_BIAS>(ifm, wts, bias, nullptr, outCascade, nullptr);
+  dense_stream_rows<ConfigT, true, false, true, false, ConfigT::USE_BIAS>(
+      ifm, nullptr, wts, bias, nullptr, outCascade, nullptr, nullptr);
 }
 
 template<typename ConfigT>
@@ -421,7 +447,8 @@ void dense_middle_stream<ConfigT>::run(input_stream<data_t>* ifm,
                                        input_cascade<acc_scalar_t>* inCascade,
                                        output_cascade<acc_scalar_t>* outCascade)
 {
-  dense_stream_rows<ConfigT, true, true, false>(ifm, wts, nullptr, inCascade, outCascade, nullptr);
+  dense_stream_rows<ConfigT, true, true, true, false, false>(
+      ifm, nullptr, wts, nullptr, inCascade, outCascade, nullptr, nullptr);
 }
 
 template<typename ConfigT>
@@ -430,5 +457,46 @@ void dense_last_stream<ConfigT>::run(input_stream<data_t>* ifm,
                                      input_cascade<acc_scalar_t>* inCascade,
                                      output_stream<result_t>* ofm)
 {
-  dense_stream_rows<ConfigT, true, false, false>(ifm, wts, nullptr, inCascade, nullptr, ofm);
+  dense_stream_rows<ConfigT, true, true, false, false, false>(
+      ifm, nullptr, wts, nullptr, inCascade, nullptr, ofm, nullptr);
+}
+
+template<typename ConfigT>
+void dense_single_stream_in<ConfigT>::run(input_stream<data_t>* ifm,
+                                          const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+                                          const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
+                                          output_buffer<result_t>& ofm)
+{
+  dense_stream_rows<ConfigT, true, false, false, true, ConfigT::USE_BIAS>(
+      ifm, nullptr, wts, bias, nullptr, nullptr, nullptr, ofm.data());
+}
+
+template<typename ConfigT>
+void dense_last_stream_in<ConfigT>::run(input_stream<data_t>* ifm,
+                                        const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+                                        input_cascade<acc_scalar_t>* inCascade,
+                                        output_buffer<result_t>& ofm)
+{
+  dense_stream_rows<ConfigT, true, true, false, true, false>(
+      ifm, nullptr, wts, nullptr, inCascade, nullptr, nullptr, ofm.data());
+}
+
+template<typename ConfigT>
+void dense_single_stream_out<ConfigT>::run(input_buffer<data_t>& ifm,
+                                           const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+                                           const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
+                                           output_stream<result_t>* ofm)
+{
+  dense_stream_rows<ConfigT, false, false, false, false, ConfigT::USE_BIAS>(
+      nullptr, ifm.data(), wts, bias, nullptr, nullptr, ofm, nullptr);
+}
+
+template<typename ConfigT>
+void dense_last_stream_out<ConfigT>::run(input_buffer<data_t>& ifm,
+                                         const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+                                         input_cascade<acc_scalar_t>* inCascade,
+                                         output_stream<result_t>* ofm)
+{
+  dense_stream_rows<ConfigT, false, true, false, false, false>(
+      nullptr, ifm.data(), wts, nullptr, inCascade, nullptr, ofm, nullptr);
 }

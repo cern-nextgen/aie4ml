@@ -26,7 +26,7 @@ from .tiling import (
     layout_variant_matches,
     parse_directives,
     requested_layout,
-    requested_port_kind,
+    requested_port_kinds,
 )
 
 __all__ = [
@@ -58,6 +58,6 @@ __all__ = [
     'parse_directives',
     'require_power_of_two',
     'requested_layout',
-    'requested_port_kind',
+    'requested_port_kinds',
     'staging_tile_shape',
 ]

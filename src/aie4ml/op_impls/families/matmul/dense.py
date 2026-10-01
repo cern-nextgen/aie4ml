@@ -65,7 +65,8 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             tile_inner_lhs_raw=lhs_view.tile_raw_inner,
             tile_inner_rhs_raw=output_view.tile_raw_inner,
         )
-        params['stream_io'] = self.port_kind == PORT_KIND_STREAM
+        params['stream_in'] = self.input_port_kind == PORT_KIND_STREAM
+        params['stream_out'] = self.output_port_kind == PORT_KIND_STREAM
         params['row_blocks'] = self.row_blocks
         return params
 
@@ -99,7 +100,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         producer_contract = input_contracts.get(lhs_tensor.name)
         # A hand-off with no memory tile to re-shard it (AIE1, or any stream port) takes the
         # producer's port count as its cas_length and, for buffers, inherits its microtile.
-        direct_only = not device.has_memtile or self.port_kind == PORT_KIND_STREAM
+        direct_only = not device.has_memtile or self.input_port_kind == PORT_KIND_STREAM
         if direct_only and self.contract == 'inner' and producer_contract is not None:
             if producer_contract.contract != 'inner':
                 raise ConfigRefused(
@@ -301,8 +302,8 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         out_endpoints = tuple((f'kk[{chain * cas_length + cas_length - 1}].out[0]',) for chain in range(cas_num))
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         return PortMap(
-            inputs={lhs_tensor.name: PortBinding('in1', len(lhs_endpoints), self.port_kind, lhs_endpoints)},
-            outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.port_kind, out_endpoints)},
+            inputs={lhs_tensor.name: PortBinding('in1', len(lhs_endpoints), self.input_port_kind, lhs_endpoints)},
+            outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.output_port_kind, out_endpoints)},
         )
 
 
@@ -427,47 +428,62 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
         return {'packed_weights': packed_W, 'packed_bias': packed_B}
 
 
-class _StreamDenseMixin:
-    """Stream-port flavour of a dense variant."""
+def _check_stream_rows(node, config: DenseConfig, axes) -> None:
+    """The stream kernels read the LHS untransposed and move a stream in 128-bit chunks, re-tiling a row band in
+    registers: a microtile row of each streamed operand must be whole chunks, or half a chunk zipped from an even
+    number of rows."""
+    if config.flags.transpose_lhs:
+        raise ValueError(f'{node.name}: the stream kernels read the LHS in row order; they cannot transpose it.')
+    m = int(config.microtiling.microtile_m)
+    for axis, extent, spec in axes:
+        row_bytes = int(extent) * element_bytes(spec)
+        if row_bytes == 8 and m % 2 == 0:
+            continue
+        if row_bytes >= 16 and row_bytes % 16 == 0:
+            continue
+        raise ValueError(
+            f'{node.name}: microtile {axis}={extent} of {element_bytes(spec)}-byte elements ({row_bytes} B '
+            f'per row, M={m}) cannot be staged from a stream; a row must be a multiple of 16 B, '
+            'or 8 B with an even M.'
+        )
 
-    port_kind: ClassVar[str] = PORT_KIND_STREAM
 
-    def buffer_locations(self, _node, _config, _anchor_row):
-        return ()
+class _StreamInputDenseMixin:
+    """Dense whose LHS arrives on a core stream in row order, re-tiled in registers instead of by a DMA."""
 
-    def footprint(self, _node, config) -> OpImplFootprint:
-        return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
+    input_port_kind: ClassVar[str] = PORT_KIND_STREAM
+
+    def buffer_locations(self, node, config, anchor_row):
+        return tuple(loc for loc in super().buffer_locations(node, config, anchor_row) if loc.port_group != 'in1')
 
     def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
         return describe_stream_staging(
             config.io_views[tensor_name], port, 'read', self.contract, config.parallelism.cas_length
         )
 
+    def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
+        super().validate_config(node, config, device)
+        _check_stream_rows(node, config, [('K', config.microtiling.microtile_k, config.precision['lhs'])])
+
+
+class _StreamOutputDenseMixin:
+    """Dense whose output leaves on a core stream in row order, emitted band by band as it is computed."""
+
+    output_port_kind: ClassVar[str] = PORT_KIND_STREAM
+
+    def buffer_locations(self, node, config, anchor_row):
+        return tuple(loc for loc in super().buffer_locations(node, config, anchor_row) if loc.port_group != 'out1')
+
     def describe_output_staging(self, _node, config, tensor_name, port):
         return describe_stream_staging(config.io_views[tensor_name], port, 'write', self.contract)
 
     def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
         super().validate_config(node, config, device)
-        if config.flags.transpose_lhs:
-            raise ValueError(f'{node.name}: a stream port carries the tensor in linear order; it cannot transpose it.')
-        # The kernel reads and writes the stream in 128-bit chunks and re-tiles a row band in
-        # registers: a microtile row must be one or more whole chunks, or half a chunk zipped
-        # from an even number of rows.
-        m = int(config.microtiling.microtile_m)
-        for axis, extent, spec in (
-            ('K', int(config.microtiling.microtile_k), config.precision['lhs']),
-            ('N', int(config.microtiling.microtile_n), config.precision['output']),
-        ):
-            row_bytes = extent * element_bytes(spec)
-            if row_bytes == 8 and m % 2 == 0:
-                continue
-            if row_bytes >= 16 and row_bytes % 16 == 0:
-                continue
-            raise ValueError(
-                f'{node.name}: microtile {axis}={extent} of {element_bytes(spec)}-byte elements ({row_bytes} B '
-                f'per row, M={m}) cannot be staged from a stream; a row must be a multiple of 16 B, '
-                'or 8 B with an even M.'
-            )
+        _check_stream_rows(node, config, [('N', config.microtiling.microtile_n, config.precision['output'])])
+
+
+class _StreamDenseMixin(_StreamInputDenseMixin, _StreamOutputDenseMixin):
+    """Stream-port flavour of a dense variant."""
 
 
 @register_variant
@@ -478,3 +494,23 @@ class DenseStreamOpImplVariant(_StreamDenseMixin, DenseOpImplVariant):
 @register_variant
 class DenseRowWiseStreamOpImplVariant(_StreamDenseMixin, DenseRowWiseOpImplVariant):
     variant_id = 'dense.b.r.row.stream.v1'
+
+
+@register_variant
+class DenseStreamInputOpImplVariant(_StreamInputDenseMixin, DenseOpImplVariant):
+    variant_id = 'dense.b.r.stream_in.v1'
+
+
+@register_variant
+class DenseRowWiseStreamInputOpImplVariant(_StreamInputDenseMixin, DenseRowWiseOpImplVariant):
+    variant_id = 'dense.b.r.row.stream_in.v1'
+
+
+@register_variant
+class DenseStreamOutputOpImplVariant(_StreamOutputDenseMixin, DenseOpImplVariant):
+    variant_id = 'dense.b.r.stream_out.v1'
+
+
+@register_variant
+class DenseRowWiseStreamOutputOpImplVariant(_StreamOutputDenseMixin, DenseRowWiseOpImplVariant):
+    variant_id = 'dense.b.r.row.stream_out.v1'

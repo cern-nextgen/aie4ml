@@ -350,7 +350,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 f'{node.name}: the kernel reads {read_span} columns of each of {stride_w} column '
                 f'class(es) but the padded frame holds {params["in_cols"]} columns.'
             )
-        if self.port_kind == PORT_KIND_BUFFER:
+        if self.input_port_kind == PORT_KIND_BUFFER:
             # Dense's bank schedule: one frame copy per bank (0 and 3) wherever the op contract puts it,
             # the weights in bank 2 of the kernel's tile, stack and bias in bank 1.
             bank = int(config.bank_mem_bytes)
@@ -409,7 +409,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         lhs = input_tensor_for_role(node, 'lhs')
         widths = tuple(int(config.precision[role].width) for role in ('lhs', 'rhs', 'output'))
         return (
-            self.port_kind == PORT_KIND_BUFFER
+            self.input_port_kind == PORT_KIND_BUFFER
             and config.microtiling.microtile_m > 2
             and int(config.groups) == int(lhs.shape[-1]) == int(input_tensor_for_role(node, 'rhs').shape[-1])
             and widths == (8, 8, 8)
@@ -427,7 +427,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         boundary carries the tensor in plain order, and a producing kernel writes whole register
         tiles, which span several groups. The stream variant refuses stride altogether.
         """
-        return self.port_kind == PORT_KIND_BUFFER and int(config.spatial.strides[1]) > 1
+        return self.input_port_kind == PORT_KIND_BUFFER and int(config.spatial.strides[1]) > 1
 
     @staticmethod
     def retiled_frame(node) -> str:
@@ -506,7 +506,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         stream kernel walks the image in bands, keeping only a window of it."""
         lhs = input_tensor_for_role(node, 'lhs')
         out_rows = config.spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
-        if self.port_kind == PORT_KIND_BUFFER:
+        if self.input_port_kind == PORT_KIND_BUFFER:
             return out_rows // int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else out_rows
         band = min(STREAM_BAND_ROWS, out_rows)
         while out_rows % band:
@@ -535,7 +535,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         wrote; the host delivers it with the padded window at the boundary, the stream wrapper keeps it in
         a frame it owns, and a retiler builds the whole frame."""
         producer = input_tensor_for_role(node, 'lhs').producer
-        return producer is not None and self.port_kind == PORT_KIND_BUFFER and not self.retiles_input(config)
+        return producer is not None and self.input_port_kind == PORT_KIND_BUFFER and not self.retiles_input(config)
 
     def kernel_params(self, node, config: Conv2dConfig):
         lhs = input_tensor_for_role(node, 'lhs')
@@ -549,7 +549,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         in_blocks, out_blocks, out_h, out_w, out_w_computed = self._tile_extent(node, config)
         out_blocks_padded = _padded_blocks(out_blocks)
         band = self.band_rows(node, config)
-        streamed = self.port_kind == PORT_KIND_STREAM
+        streamed = self.input_port_kind == PORT_KIND_STREAM
         depthwise = self.uses_depthwise_core(node, config)
         # A band's window starts mid-image, so the image no longer sits at the frame's origin.
         whole_image = not outer
@@ -581,7 +581,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             ),
             bias_count=out_blocks_padded * CHANNEL_BLOCK,
             depthwise_core=depthwise,
-            stream_io=self.port_kind == PORT_KIND_STREAM,
+            stream_io=self.input_port_kind == PORT_KIND_STREAM,
             # aie_api's int16 x int8 mmul of 8-channel blocks accumulates in 64 bits whatever it is asked for
             cascade_accumulator_tag='acc64' if int(config.precision['lhs'].width) == 16 else config.accumulator_tag,
         )
@@ -650,7 +650,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         return self._rows_per_chain(node, config) * int(config.spatial.strides[0])
 
     def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
-        if self.port_kind == PORT_KIND_STREAM:
+        if self.input_port_kind == PORT_KIND_STREAM:
             return describe_logical_staging(config.io_views[tensor_name], 'read')
         # 'inner': the port is a channel slice every chain reads. 'outer': the port belongs to one
         # (row slice, channel slice) tile, so it selects both. A retiled frame is the same frame, its
@@ -670,7 +670,7 @@ class Conv2dOpImplVariant(OpImplVariant):
 
     def describe_output_staging(self, node, config, tensor_name, port):
         view = config.io_views[tensor_name]
-        if self.port_kind == PORT_KIND_STREAM:
+        if self.output_port_kind == PORT_KIND_STREAM:
             return describe_logical_staging(view, 'write')
         if config.flags.emit_flattened:
             return describe_inner_output_staging(view, port)
@@ -701,8 +701,8 @@ class Conv2dOpImplVariant(OpImplVariant):
             )
         out_endpoints = tuple((f'kk[{chain * cas_length + cas_length - 1}].out[0]',) for chain in range(cas_num))
         return PortMap(
-            inputs={in_tensor: PortBinding('in1', len(lhs_endpoints), self.port_kind, lhs_endpoints)},
-            outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.port_kind, out_endpoints)},
+            inputs={in_tensor: PortBinding('in1', len(lhs_endpoints), self.input_port_kind, lhs_endpoints)},
+            outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.output_port_kind, out_endpoints)},
         )
 
     def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
@@ -827,7 +827,7 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
     """
 
     variant_id = 'conv2d.s.r.v1'
-    port_kind = PORT_KIND_STREAM
+    input_port_kind = output_port_kind = PORT_KIND_STREAM
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> Conv2dConfig:
         config = super().resolve(node, device, directives, input_contracts)

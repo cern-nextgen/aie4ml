@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Tuple
 
 from ...errors import ConfigRefused
 from ...ir.graph import TENSOR_LAYOUTS
-from ..common_types import PORT_KIND_BUFFER, PORT_KINDS
+from ..common_types import PORT_KIND_BUFFER
 from .tensor_view import microtile_from_staging
 
 
@@ -55,12 +55,10 @@ def requested_layout(node) -> str:
     return layout
 
 
-def requested_port_kind(node) -> str:
-    """The ADF port kind asked of this node's data ports (``buffer`` when omitted)."""
-    kind = str(node.directives.get('ports', PORT_KIND_BUFFER))
-    if kind not in PORT_KINDS:
-        raise ValueError(f'{node.name}: unknown ports directive {kind!r}; expected one of {sorted(PORT_KINDS)}.')
-    return kind
+def requested_port_kinds(node) -> Tuple[str, str]:
+    """The ADF port kinds (inputs, outputs) asked of this node's activation ports (buffers when omitted)."""
+    ports = node.directives.get('ports', {})
+    return tuple(ports.get(direction, PORT_KIND_BUFFER) for direction in ('inputs', 'outputs'))
 
 
 def layout_variant_matches(node, layout: str) -> bool:

@@ -92,7 +92,8 @@ class OpImplVariant:
     param_template: ClassVar[str] = ''
     plevel: ClassVar[int] = 10  # higher value = higher selection priority
     kernel_transposes_microtile: ClassVar[bool] = False
-    port_kind: ClassVar[str] = PORT_KIND_BUFFER  # what the `ports` directive selects on
+    input_port_kind: ClassVar[str] = PORT_KIND_BUFFER
+    output_port_kind: ClassVar[str] = PORT_KIND_BUFFER
     # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
     supported_directives: ClassVar[frozenset] = frozenset()
 
