@@ -676,6 +676,11 @@ def collect_report(model_or_path) -> 'Report':
     missing = []
     if not kernels:
         missing.append("per-kernel cycles: run 'make profile' (plain 'make aiesim' does not profile)")
+    elif unprofiled := sorted({e['node'] for e in doc.get('execution', [])} - {k.get('op') for k in kernels}):
+        missing.append(
+            f'per-kernel cycles of {", ".join(unprofiled)}: aiesim left no profile of their cores, so the '
+            'critical path and the compute / data-movement split leave them out'
+        )
     if not report['throughput_plio']:
         missing.append("PLIO throughput: run 'make aiesim' or 'make profile'")
     if not report['memory']:

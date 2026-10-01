@@ -244,3 +244,33 @@ def test_a_kernel_whose_run_was_inlined_is_charged_its_costliest_member(tmp_path
     )
     (kernel,) = _kernel_cycles(tmp_path, {'aie_tile_row_start': 3})
     assert (kernel['op'], kernel['kernel'], kernel['cycles_per_call']) == ('c2_aie', 'conv2d_halo_base', 1257)
+
+
+def test_a_kernel_without_a_profile_is_named_not_dropped(tmp_path):
+    """aiesim can leave a core unprofiled; the report says so rather than show the design without that stage."""
+    (tmp_path / 'aie_pipeline.json').write_text(
+        json.dumps(
+            {
+                'physical': {'placements': {'c1_aie': {'col': 7, 'row': 0}, 'fc_aie': {'col': 8, 'row': 0}}},
+                'execution': [
+                    {'node': name, 'config': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}
+                    for name in ('c1_aie', 'fc_aie')
+                ],
+            }
+        )
+    )
+    profiles = tmp_path / 'aiesimulator_output'
+    profiles.mkdir()
+    (profiles / 'profile_funct_7_0.txt').write_text(
+        'Function profiling report information for ::tl.aie_logical.aie_xtlm.math_engine'
+        '.array.tile_7_1.cm.proc.iss\n'
+        '  6  7374  76.88%  1229  1229  1229  7374  76.88%  1229  1229  1229  704  1245  0'
+        ' run _ZN13conv2d_singleI5L1Cfg\n'
+    )
+    compiler_report = tmp_path / 'Work' / 'reports' / 'compiler_report.json'
+    compiler_report.parent.mkdir(parents=True)
+    compiler_report.write_text(json.dumps({'aie_driver_config': {'aie_tile_row_start': 1}}))
+    from aie4ml.report import report
+
+    missing = report(tmp_path)['missing']
+    assert any(item.startswith('per-kernel cycles of fc_aie:') for item in missing)
