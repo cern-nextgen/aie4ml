@@ -41,6 +41,7 @@ void matmul_single<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int SHIFT = ConfigT::SHIFT;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
+  using BOp  = matmul_b_operand<ConfigT>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
@@ -53,8 +54,8 @@ void matmul_single<ConfigT>::run(input_buffer<a_t>& A,
     for (unsigned j = 0; j < colB / N; j += 2) {
       const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const b_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
 
       aie::vector<a_t, MMUL::size_A> A0, A1;
       if constexpr (ConfigT::TRANSPOSE_A) {
@@ -66,16 +67,9 @@ void matmul_single<ConfigT>::run(input_buffer<a_t>& A,
       }
       pA1 += MMUL::size_A; pA2 += MMUL::size_A;
 
-      aie::vector<b_t, MMUL::size_B> B0, B1;
-      if constexpr (ConfigT::TRANSPOSE_B) {
-        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-      } else {
-        B0 = aie::load_v<MMUL::size_B>(pB1);
-        B1 = aie::load_v<MMUL::size_B>(pB2);
-      }
-      pB1 += MMUL::size_B * (colB / N);
-      pB2 += MMUL::size_B * (colB / N);
+      aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
+      pB1 += BOp::K_STEP;
+      pB2 += BOp::K_STEP;
 
       MMUL C00; C00.mul(A0, B0);
       MMUL C01; C01.mul(A0, B1);
@@ -93,15 +87,10 @@ void matmul_single<ConfigT>::run(input_buffer<a_t>& A,
           A1 = aie::load_v<MMUL::size_A>(pA2);
         }
         pA1 += MMUL::size_A; pA2 += MMUL::size_A;
-        if constexpr (ConfigT::TRANSPOSE_B) {
-          B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-          B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-        } else {
-          B0 = aie::load_v<MMUL::size_B>(pB1);
-          B1 = aie::load_v<MMUL::size_B>(pB2);
-        }
-        pB1 += MMUL::size_B * (colB / N);
-        pB2 += MMUL::size_B * (colB / N);
+        B0 = BOp::load(pB1);
+        B1 = BOp::load(pB2);
+        pB1 += BOp::K_STEP;
+        pB2 += BOp::K_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);
@@ -129,6 +118,7 @@ void matmul_first<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int N    = ConfigT::N;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
+  using BOp  = matmul_b_operand<ConfigT>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
@@ -137,8 +127,8 @@ void matmul_first<ConfigT>::run(input_buffer<a_t>& A,
     for (unsigned j = 0; j < colB / N; j += 2) {
       const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const b_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
 
       aie::vector<a_t, MMUL::size_A> A0, A1;
       if constexpr (ConfigT::TRANSPOSE_A) {
@@ -150,16 +140,9 @@ void matmul_first<ConfigT>::run(input_buffer<a_t>& A,
       }
       pA1 += MMUL::size_A; pA2 += MMUL::size_A;
 
-      aie::vector<b_t, MMUL::size_B> B0, B1;
-      if constexpr (ConfigT::TRANSPOSE_B) {
-        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-      } else {
-        B0 = aie::load_v<MMUL::size_B>(pB1);
-        B1 = aie::load_v<MMUL::size_B>(pB2);
-      }
-      pB1 += MMUL::size_B * (colB / N);
-      pB2 += MMUL::size_B * (colB / N);
+      aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
+      pB1 += BOp::K_STEP;
+      pB2 += BOp::K_STEP;
 
       MMUL C00; C00.mul(A0, B0);
       MMUL C01; C01.mul(A0, B1);
@@ -177,15 +160,10 @@ void matmul_first<ConfigT>::run(input_buffer<a_t>& A,
           A1 = aie::load_v<MMUL::size_A>(pA2);
         }
         pA1 += MMUL::size_A; pA2 += MMUL::size_A;
-        if constexpr (ConfigT::TRANSPOSE_B) {
-          B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-          B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-        } else {
-          B0 = aie::load_v<MMUL::size_B>(pB1);
-          B1 = aie::load_v<MMUL::size_B>(pB2);
-        }
-        pB1 += MMUL::size_B * (colB / N);
-        pB2 += MMUL::size_B * (colB / N);
+        B0 = BOp::load(pB1);
+        B1 = BOp::load(pB2);
+        pB1 += BOp::K_STEP;
+        pB2 += BOp::K_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);
@@ -214,6 +192,7 @@ void matmul_middle<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int N    = ConfigT::N;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
+  using BOp  = matmul_b_operand<ConfigT>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
@@ -232,8 +211,8 @@ void matmul_middle<ConfigT>::run(input_buffer<a_t>& A,
 
       const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const b_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
 
       aie::vector<a_t, MMUL::size_A> A0, A1;
       if constexpr (ConfigT::TRANSPOSE_A) {
@@ -245,16 +224,9 @@ void matmul_middle<ConfigT>::run(input_buffer<a_t>& A,
       }
       pA1 += MMUL::size_A; pA2 += MMUL::size_A;
 
-      aie::vector<b_t, MMUL::size_B> B0, B1;
-      if constexpr (ConfigT::TRANSPOSE_B) {
-        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-      } else {
-        B0 = aie::load_v<MMUL::size_B>(pB1);
-        B1 = aie::load_v<MMUL::size_B>(pB2);
-      }
-      pB1 += MMUL::size_B * (colB / N);
-      pB2 += MMUL::size_B * (colB / N);
+      aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
+      pB1 += BOp::K_STEP;
+      pB2 += BOp::K_STEP;
 
       C00.mac(A0, B0);
       C01.mac(A0, B1);
@@ -272,15 +244,10 @@ void matmul_middle<ConfigT>::run(input_buffer<a_t>& A,
           A1 = aie::load_v<MMUL::size_A>(pA2);
         }
         pA1 += MMUL::size_A; pA2 += MMUL::size_A;
-        if constexpr (ConfigT::TRANSPOSE_B) {
-          B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-          B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-        } else {
-          B0 = aie::load_v<MMUL::size_B>(pB1);
-          B1 = aie::load_v<MMUL::size_B>(pB2);
-        }
-        pB1 += MMUL::size_B * (colB / N);
-        pB2 += MMUL::size_B * (colB / N);
+        B0 = BOp::load(pB1);
+        B1 = BOp::load(pB2);
+        pB1 += BOp::K_STEP;
+        pB2 += BOp::K_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);
@@ -310,6 +277,7 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int SHIFT = ConfigT::SHIFT;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
+  using BOp  = matmul_b_operand<ConfigT>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
@@ -322,8 +290,8 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
     for (unsigned j = 0; j < colB / N; j += 2) {
       const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const b_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
 
       MMUL C00(readincr_v<MMUL::size_C>(inCascade));
       MMUL C01(readincr_v<MMUL::size_C>(inCascade));
@@ -340,16 +308,9 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
       }
       pA1 += MMUL::size_A; pA2 += MMUL::size_A;
 
-      aie::vector<b_t, MMUL::size_B> B0, B1;
-      if constexpr (ConfigT::TRANSPOSE_B) {
-        B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-        B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-      } else {
-        B0 = aie::load_v<MMUL::size_B>(pB1);
-        B1 = aie::load_v<MMUL::size_B>(pB2);
-      }
-      pB1 += MMUL::size_B * (colB / N);
-      pB2 += MMUL::size_B * (colB / N);
+      aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
+      pB1 += BOp::K_STEP;
+      pB2 += BOp::K_STEP;
 
       C00.mac(A0, B0);  C01.mac(A0, B1);
       C10.mac(A1, B0);  C11.mac(A1, B1);
@@ -365,15 +326,10 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
           A1 = aie::load_v<MMUL::size_A>(pA2);
         }
         pA1 += MMUL::size_A; pA2 += MMUL::size_A;
-        if constexpr (ConfigT::TRANSPOSE_B) {
-          B0 = aie::transpose(aie::load_v<MMUL::size_B>(pB1), N, K);
-          B1 = aie::transpose(aie::load_v<MMUL::size_B>(pB2), N, K);
-        } else {
-          B0 = aie::load_v<MMUL::size_B>(pB1);
-          B1 = aie::load_v<MMUL::size_B>(pB2);
-        }
-        pB1 += MMUL::size_B * (colB / N);
-        pB2 += MMUL::size_B * (colB / N);
+        B0 = BOp::load(pB1);
+        B1 = BOp::load(pB2);
+        pB1 += BOp::K_STEP;
+        pB2 += BOp::K_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);

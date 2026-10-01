@@ -10,6 +10,7 @@ from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 from ...utils import (
     STORAGE_LAYOUT_LINEAR,
     AxisPlan,
+    MicrotileShape,
     TensorView,
     build_staging_descriptor,
     canonical_buffer_axes,
@@ -234,13 +235,34 @@ def describe_stream_staging(view: TensorView, port: int, access: str, contract: 
     )
 
 
+def rhs_storage_block(microtiling, transposed: bool, producer: MicrotileShape | None, element_bytes: int):
+    """The blocks a matmul reads its rhs in, in the rhs view's axes.
+
+    The kernel reads the tensor as stored -- B, or B transposed -- in blocks of one microtile's columns, stacks a
+    microtile's rows of them into one mmul operand and transposes it in registers when the view is transposed. The
+    blocks are the microtile's own, or the producer's where they have its columns and divide its rows, so the
+    hand-over needs no re-layout; a block is at least one 16-byte vector load.
+    """
+    k, n = int(microtiling.microtile_k), int(microtiling.microtile_n)
+    rows, cols = (n, k) if transposed else (k, n)
+    if (
+        producer is not None
+        and int(producer.inner) == cols
+        and rows % int(producer.outer) == 0
+        and int(producer.outer) * cols * int(element_bytes) % 16 == 0
+    ):
+        rows = int(producer.outer)
+    return MicrotileShape(outer=cols, inner=rows) if transposed else MicrotileShape(outer=rows, inner=cols)
+
+
 def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
-    """RHS staging for the 'outer' contract: the port selects a K-chain; every row group shares it."""
+    """RHS staging for the 'outer' contract: the port selects a K-chain; every row group shares it. Its blocks are in
+    the tensor's own order, transposed or not (see `rhs_storage_block`)."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
     k_slice = view.tile_outer
     n_slice = view.tile_inner
-    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    inner_dim, outer_dim, _ = canonical_buffer_axes(view)
 
     k_chain = int(port) % max(1, int(parallelism.cas_length))
     k_start, k_held = _slice(view.logical_outer, k_slice, view.tile_raw_outer, k_chain)
@@ -253,25 +275,21 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
             outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), k_chain * k_slice),
         },
         logical_origin={outer_dim: k_start},
-        order=traversal_dims,
+        order=list(range(view.rank)),
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: k_held},
         boundary_shape='logical',
-        extras={
-            'packing': 'mmul_rhs',
-            'packing_microtile_k': microtile_k,
-            'packing_microtile_n': microtile_n,
-        },
     )
 
 
 def describe_inner_rhs_staging(view: TensorView, parallelism, port: int):
-    """RHS staging for the 'inner' contract: the port selects an (N-slice, K-chain) tile."""
+    """RHS staging for the 'inner' contract: the port selects an (N-slice, K-chain) tile, its blocks in the tensor's
+    own order (see `rhs_storage_block`)."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
     # The rhs view encodes both K and N slices: outer dim = K, inner dim = N.
     k_slice = view.tile_outer
     n_slice = view.tile_inner
-    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    inner_dim, outer_dim, _ = canonical_buffer_axes(view)
 
     row = int(port) // int(parallelism.cas_length)
     col = int(port) % int(parallelism.cas_length)
@@ -286,14 +304,9 @@ def describe_inner_rhs_staging(view: TensorView, parallelism, port: int):
             outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), col * k_slice),
         },
         logical_origin={inner_dim: n_start, outer_dim: k_start},
-        order=traversal_dims,
+        order=list(range(view.rank)),
         io_tiling_overrides={inner_dim: n_held, outer_dim: k_held},
         boundary_shape='logical',
-        extras={
-            'packing': 'mmul_rhs',
-            'packing_microtile_k': microtile_k,
-            'packing_microtile_n': microtile_n,
-        },
     )
 
 

@@ -16,6 +16,7 @@ struct {{L.struct_name}} {
   static constexpr bool PARALLELISM_CONTRACT_OUTER = {{ 'true' if P.parallelism.contract == 'outer' else 'false' }};
   static constexpr bool TRANSPOSE_A = {{ 'true' if P.flags.transpose_lhs else 'false' }};
   static constexpr bool TRANSPOSE_B = {{ 'true' if P.flags.transpose_rhs else 'false' }};
+  static constexpr int B_ROWS = {{P.rhs_block_rows}};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr int M = {{P.microtiling.microtile_m}}, K = {{P.microtiling.microtile_k}}, N = {{P.microtiling.microtile_n}};
   static constexpr int col_placement = {{L.placement.col}};

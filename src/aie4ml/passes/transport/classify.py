@@ -67,7 +67,7 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
         if route == 'memtile':
             raise ConfigRefused(f'{tensor}: io_route=memtile requested on a stream port.')
         if not is_boundary:
-            failure = _direct_failure(leg, execution)
+            failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer)
             if failure is not None:
                 raise ConfigRefused(f'{tensor}: point-to-point ports cannot connect directly: {failure}.')
         return TransportDecision('direct', True)
@@ -83,7 +83,7 @@ def classify_connection(leg: Connection, execution, has_memtile) -> TransportDec
             realization = 'direct' if _direct_boundary_failure(leg, execution) is None else 'memtile'
         return TransportDecision(realization, True if realization == 'direct' else None)
 
-    direct_failure = _direct_failure(leg, execution)
+    direct_failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer)
     staging_compatible = direct_failure is None
     if route == 'direct':
         if not staging_compatible:
@@ -153,13 +153,6 @@ def _inner_shards_failure(leg: Connection, execution) -> str | None:
     if inst.variant.input_inner_shards(inst.node, inst.config, leg.consumer.tensor) != shards:
         return f'{leg.consumer.node.name} reads it in logical order'
     return None
-
-
-def _direct_failure(leg: Connection, execution) -> str | None:
-    consumer = leg.consumer
-    if execution.get(consumer.node.name).port_views[consumer.tensor].perm is not None:
-        return f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
-    return direct_transport_failure(execution, leg.logical_tensor, leg.producer, consumer)
 
 
 def _route_policy(leg: Connection, execution) -> str:

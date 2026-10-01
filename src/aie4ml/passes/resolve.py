@@ -101,8 +101,8 @@ def _check_port_frames(node, config, variant, ports) -> None:
 
 
 def _check_transposed_views(node, config, variant) -> None:
-    """A folded transpose needs both halves: the DMA walks the microtile grid in view order and
-    the kernel transposes each block on load. Refuse rather than feed a kernel permuted data.
+    """A transposed view holds each block in the tensor's order, not the view's: only a kernel that transposes the
+    blocks it loads may read one, and only in blocks. Refuse rather than feed a kernel permuted data.
     """
 
     for name, view in (getattr(config, 'io_views', None) or {}).items():
