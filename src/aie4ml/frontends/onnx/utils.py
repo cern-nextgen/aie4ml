@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import ml_dtypes
 import numpy as np
 
 from ...aie_types import FloatFormat, FloatIntent, QuantIntent, RoundingMode, SaturationMode
@@ -83,8 +84,20 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
     return ctx
 
 
+# ONNX bfloat16 and float8 e4m3fn, decoded here: onnx < 1.18 returns their raw bits, and reads a bfloat16 tensor's
+# `int32_data` even when it holds `raw_data`, leaving the array uninitialized.
+_NARROW_FLOATS = {16: (np.uint16, ml_dtypes.bfloat16), 17: (np.uint8, ml_dtypes.float8_e4m3fn)}
+
+
 def initializer_map(graph, numpy_helper) -> Dict[str, np.ndarray]:
-    return {init.name: np.asarray(numpy_helper.to_array(init)) for init in graph.initializer}
+    def values(init) -> np.ndarray:
+        if init.data_type not in _NARROW_FLOATS:
+            return np.asarray(numpy_helper.to_array(init))
+        bits, dtype = _NARROW_FLOATS[init.data_type]
+        stored = np.frombuffer(init.raw_data, np.dtype(bits).newbyteorder('<')) if init.raw_data else init.int32_data
+        return np.asarray(stored, dtype=bits).view(dtype).reshape(tuple(init.dims))
+
+    return {init.name: values(init) for init in graph.initializer}
 
 
 def input_maps(graph, initializer_names) -> Tuple[Dict[str, Tuple[int, ...]], Dict[str, int]]:
@@ -148,25 +161,13 @@ def dequantize_data(
     return (np.asarray(data, dtype=np.float64) - float(zero)) * scale
 
 
-def _narrow_float_name(dtype) -> str:
-    """Name of a sub-fp32 float dtype, across both onnx representations.
-
-    onnx >= 1.18 returns real ml_dtypes scalars ('bfloat16', 'float8_e4m3fn'); older onnx
-    returns a structured view over the raw integer, whose single field carries the name
-    ('bfloat16', 'e4m3fn').
-    """
-
-    return dtype.names[0] if dtype.names else str(dtype)
-
-
 def intent_from_initializer(data: np.ndarray, node_name: str):
     dtype = np.asarray(data).dtype
     if dtype == np.dtype(np.float32):
         return FloatIntent(width=32, format=FloatFormat.FP32)
-    name = _narrow_float_name(dtype)
-    if name == 'bfloat16':
+    if dtype == np.dtype(ml_dtypes.bfloat16):
         return FloatIntent(width=16, format=FloatFormat.BF16)
-    if name in ('float8_e4m3fn', 'e4m3fn'):
+    if dtype == np.dtype(ml_dtypes.float8_e4m3fn):
         return FloatIntent(width=8, format=FloatFormat.FP8_E4M3)
     raise ValueError(
         f'{node_name}: direct initializer inputs must be float32/bfloat16/fp8_e4m3, '

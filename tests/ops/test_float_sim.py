@@ -642,6 +642,19 @@ def test_fp8_combined_mlp_pipeline(tmp_path):
         assert fmt == 'fp8_e4m3', f'expected fp8_e4m3 precision, got {fmt!r}'
 
 
+@pytest.mark.parametrize('mode', ['bf16', 'fp8'])
+def test_narrow_float_weights_import_as_their_values(mode):
+    """Whatever the onnx version: onnx < 1.18 returns raw bits, and garbage for a bfloat16 `raw_data`."""
+    pytest.importorskip('onnx')
+    from aie4ml.frontends.onnx.utils import initializer_map
+    from onnx import TensorProto, helper, numpy_helper
+
+    spec = _float_like_mode_spec(TensorProto, mode)
+    weights = spec['round'](np.linspace(-0.5, 0.5, 48, dtype=np.float32).reshape(6, 8))
+    graph = helper.make_graph([], 'g', [], [], initializer=[spec['weight_init'](TensorProto, 'w', weights)])
+    assert np.array_equal(np.asarray(initializer_map(graph, numpy_helper)['w'], dtype=np.float32), weights)
+
+
 # ---------------------------------------------------------------------------
 # x86 bit-exact simulation tests (requires Vitis)
 # ---------------------------------------------------------------------------
