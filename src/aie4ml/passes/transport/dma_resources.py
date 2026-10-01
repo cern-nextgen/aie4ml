@@ -14,14 +14,29 @@ from typing import Any, Dict, Optional, Sequence
 from ...errors import ConfigRefused
 from ...ir.context import DmaSpec
 
+# Generations whose AIE compiler (Vitis 2026.1.1) gives a kernel output's chunk of one 32-bit word no BD dimension of
+# its own, so its BD walks one loop more; measured on AIE1 only (its inputs do not).
+WORD_CHUNK_FOLDS = frozenset({'AIE'})
 
-def tile_port_bds(descriptor: Optional[Dict[str, Any]], buffers: int, dma: DmaSpec) -> int:
+
+def tile_port_bds(
+    descriptor: Optional[Dict[str, Any]], buffers: int, dma: DmaSpec, generation: str, element_bits: int
+) -> int:
     """BDs a compute tile's DMA spends on one kernel buffer port, per buffer: one BD walks the contiguous chunk and
-    `dma.dimensions - 1` loops more (the walked axes that repeat), and every loop beyond those repeats that BD.
-    A linear transfer (`descriptor` None) is one BD. Measured on AIE-ML and AIE-MLv2."""
-    wraps = [int(step['wrap']) for step in (descriptor or {}).get('tile_traversal') or ()]
-    loops = [wrap for wrap in wraps if wrap > 1]
-    return buffers * prod(loops[dma.dimensions - 1 :])
+    `dma.dimensions - 1` loops more (the walked axes that repeat), or one more for a word chunk that folds (see
+    WORD_CHUNK_FOLDS), and every loop beyond those repeats that BD. A linear transfer (`descriptor` None) is one BD.
+    Measured on AIE1, AIE-ML and AIE-MLv2."""
+    if descriptor is None:
+        return buffers
+    loops = [int(step['wrap']) for step in descriptor.get('tile_traversal') or () if int(step['wrap']) > 1]
+    walked = dma.dimensions - 1
+    if (
+        generation in WORD_CHUNK_FOLDS
+        and descriptor['access'] == 'write'
+        and prod(int(x) for x in descriptor['tiling_dimension']) * int(element_bits) <= 32
+    ):
+        walked += 1
+    return buffers * prod(loops[walked:])
 
 
 def pool_use(port_bds: Sequence[int], dma: DmaSpec) -> list[int]:

@@ -122,8 +122,6 @@ def verify_dma_resources(ctx) -> None:
             shared |= {edge['source'], edge['target']}
     verify_tile_dma_channels(ctx, graphs, shared)
 
-    if device.tile_dma.dimensions < 3:
-        return  # AIE1's 2-D BDs fold loops by offset and increment in ways not modelled yet
     accesses = {
         a['endpoint']: a['descriptor']
         for key in ('kernel_read_accesses', 'kernel_write_accesses')
@@ -132,9 +130,14 @@ def verify_dma_resources(ctx) -> None:
     used = defaultdict(int)
     for name, inst in graphs.items():
         for direction in ('inputs', 'outputs'):
-            for binding in getattr(inst.ports, direction).values():
+            for tensor, binding in getattr(inst.ports, direction).items():
                 if binding.kind != PORT_KIND_BUFFER:
                     continue
+                element = (
+                    inst.variant.output_precision(inst.config)
+                    if direction == 'outputs'
+                    else inst.variant.input_precision(inst.config, inst.input(tensor).role)
+                )
                 for port, endpoints in enumerate(binding.endpoints):
                     if f'{name}.{binding.group}[{port}]' in shared:
                         continue
@@ -142,7 +145,9 @@ def verify_dma_resources(ctx) -> None:
                     for index, endpoint in enumerate(endpoints):
                         where = f'{name}.{endpoint}'
                         owner = owners[0] if len(owners) == 1 else owners[index]
-                        used[owner] += tile_port_bds(accesses.get(where), KERNEL_BUFFERS, device.tile_dma)
+                        used[owner] += tile_port_bds(
+                            accesses.get(where), KERNEL_BUFFERS, device.tile_dma, device.generation, element.width
+                        )
     for owner, bds in used.items():
         if bds > device.tile_dma.bds:
             raise ConfigRefused(f'tile {owner}: its DMA needs {bds} BDs, beyond its {device.tile_dma.bds}.')

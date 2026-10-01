@@ -78,6 +78,27 @@ def test_a_compute_tile_port_repeats_its_bd_for_every_loop_past_the_dma_dimensio
     def walk(*wraps):
         return {'tile_traversal': [{'dimension': d, 'stride': 1, 'wrap': w} for d, w in enumerate(wraps)]}
 
-    assert tile_port_bds(None, 2, dma) == 2  # linear
-    assert tile_port_bds(walk(8, 4, 1), 2, dma) == 2  # the chunk and two loops: one BD per buffer (measured)
-    assert tile_port_bds(walk(8, 4, 2), 2, dma) == 4  # a third loop of 2 repeats it (measured)
+    assert tile_port_bds(None, 2, dma, AIE_ML, 8) == 2  # linear
+    assert tile_port_bds(walk(8, 4, 1), 2, dma, AIE_ML, 8) == 2  # the chunk and two loops: one BD per buffer (measured)
+    assert tile_port_bds(walk(8, 4, 2), 2, dma, AIE_ML, 8) == 4  # a third loop of 2 repeats it (measured)
+
+
+# (access, chunk of int8 elements, loops innermost first, BDs the AIE1 compiler allocated for the port's two buffers)
+AIE1_MEASURED = [
+    ('read', 8, (16, 2, 4), 16),  # the chunk and one loop per BD
+    ('write', 8, (2, 2, 4), 16),
+    ('write', 8, (1, 2, 4), 8),
+    ('read', 4, (8, 4, 1), 8),  # an input's one-word chunk still takes a dimension
+    ('write', 4, (16, 4, 1), 2),  # an output's does not: its BD walks both loops
+]
+
+
+@pytest.mark.parametrize('access, chunk, wraps, bds', AIE1_MEASURED)
+def test_an_aie1_tile_port_walks_one_loop_per_bd_but_an_output_word_walks_two(access, chunk, wraps, bds):
+    dma = resolve_device('xcvp2802-vsva5601-2MHP-e-S', {})[0].tile_dma
+    walk = {
+        'access': access,
+        'tiling_dimension': [chunk, 1, 1],
+        'tile_traversal': [{'dimension': d, 'stride': 1, 'wrap': w} for d, w in enumerate(wraps)],
+    }
+    assert tile_port_bds(walk, 2, dma, 'AIE', 8) == bds
