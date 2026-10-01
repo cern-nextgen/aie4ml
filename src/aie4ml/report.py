@@ -712,11 +712,11 @@ def format_report(report: Dict[str, Any]) -> str:
     add(f'  AIE clock: {clock} GHz' if clock else '  AIE clock: unknown (cycles omitted)')
     chosen = report.get('optimizer')
     if chosen:
-        work = chosen.get('work_per_tile')
+        estimate = chosen['estimate']
         add(
             f'  Design search ({chosen["mode"]}): {chosen["tiles"]} tiles of {chosen["max_tiles"]}, '
-            f'{chosen["memtile_legs"]} legs through a memory tile'
-            + (f', busiest tile {work:,} MACs (proxy)' if work is not None else '')
+            f'{chosen["memtile_legs"]} legs through a memory tile, estimated interval '
+            f'{estimate["interval_cc"]:,} cc and latency {estimate["latency_cc"]:,} cc'
         )
 
     latency = (report.get('latency') or {}).get('global') or {}

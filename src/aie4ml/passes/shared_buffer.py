@@ -31,7 +31,7 @@ STREAM = 'stream'
 """A direct stream edge: the kernels exchange data on core streams, with no buffer to share or copy."""
 
 
-def _port_problem(inst, group: str, port: int, direction: str) -> Optional[str]:
+def port_problem(inst, group: str, port: int, direction: str) -> Optional[str]:
     for binding in getattr(inst.ports, direction).values():
         if binding.group != group:
             continue
@@ -49,7 +49,7 @@ def static_problem(
     """Why no placement could let these ports share one buffer, or None."""
     execution = ctx.ir.execution
     for inst, group, port, direction in ((producer, p_group, p_port, 'outputs'), (consumer, c_group, c_port, 'inputs')):
-        problem = _port_problem(inst, group, port, direction)
+        problem = port_problem(inst, group, port, direction)
         if problem:
             return problem
     readers = [inst.name for inst in execution if any(item.tensor == tensor for item in inst.inputs)]

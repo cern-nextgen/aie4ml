@@ -67,12 +67,13 @@ def _splits(ctx) -> dict:
 def test_resource_splits_only_what_does_not_fit_and_keeps_every_edge_direct(tmp_path):
     ctx = lower(_wide_model(), tmp_path, part=AIE1_PART, aie_config={'Optimize': 'resource'})
     chosen = ctx.ir.optimizer
-    # The 3x3 takes two tiles and its neighbour matches the split: no hand-over needs a memory tile (AIE1 has none).
+    # The 3x3 cascades over two tiles and the 1x1 before it matches the split: every hand-over shares a buffer,
+    # where splitting the 3x3's output channels would copy the 1x1's output to both chains.
     assert (chosen['tiles'], chosen['memtile_legs']) == (5, 0) == (_placed_tiles(ctx), 0)
-    assert {name: p.cas_num * p.cas_length for name, p in _splits(ctx).items()} == {
-        'c0_aie': 1,
-        'c1_aie': 2,
-        'c2_aie': 2,
+    assert {name: (p.cas_num, p.cas_length) for name, p in _splits(ctx).items()} == {
+        'c0_aie': (2, 1),
+        'c1_aie': (1, 2),
+        'c2_aie': (1, 1),
     }
     # Where everything fits, one tile per layer.
     ctx = lower(_wide_model(), tmp_path / 'ml', part=PART, aie_config={'Optimize': 'resource'})
@@ -84,8 +85,7 @@ def test_performance_splits_the_busiest_layers_within_max_tiles(tmp_path, part):
     base = lower(_wide_model(), tmp_path / 'base', part=part, aie_config={'Optimize': 'resource'})
     ctx = lower(_wide_model(), tmp_path, part=part, aie_config={'Optimize': 'performance', 'MaxTiles': 8})
     chosen = ctx.ir.optimizer
-    busiest = max(inst.variant.work(inst.node, inst.config) for inst in base.ir.execution)
-    assert chosen['work_per_tile'] < busiest
+    assert chosen['estimate']['interval_cc'] < base.ir.optimizer['estimate']['interval_cc']
     assert chosen['tiles'] == _placed_tiles(ctx) <= 8 and chosen['memtile_legs'] == 0
     assert chosen['parallelism'] == {name: vars(p) for name, p in _splits(ctx).items()}
 

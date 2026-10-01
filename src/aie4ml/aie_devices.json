@@ -2,6 +2,7 @@
   "generations": {
     "AIE": {
       "VectorBytes": 32,
+      "Int8MacsPerCycle": 128,
       "TileMemBytes": 32768,
       "BankCount": 4,
       "Memory": {
@@ -25,6 +26,7 @@
     },
     "AIE-ML": {
       "VectorBytes": 64,
+      "Int8MacsPerCycle": 256,
       "TileMemBytes": 65536,
       "BankCount": 4,
       "Memory": {
@@ -49,6 +51,7 @@
     },
     "AIE-MLV2": {
       "VectorBytes": 64,
+      "Int8MacsPerCycle": 512,
       "TileMemBytes": 65536,
       "BankCount": 4,
       "Memory": {

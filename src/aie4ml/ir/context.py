@@ -73,6 +73,7 @@ class DeviceSpec:
     max_mem_in_ports: int
     max_mem_out_ports: int
     vector_bytes: int
+    int8_macs_per_cycle: int  # a core's peak multiply-accumulates per cycle on 8-bit operands
     has_memtile: bool
     bank_count: int
     tile_mem_bytes: int
@@ -143,6 +144,7 @@ class DeviceSpec:
             max_mem_in_ports=int(require(cfg, 'MaxMemTileInPorts')),
             max_mem_out_ports=int(require(cfg, 'MaxMemTileOutPorts')),
             vector_bytes=int(require(cfg, 'VectorBytes')),
+            int8_macs_per_cycle=int(require(cfg, 'Int8MacsPerCycle')),
             has_memtile=bool(require(cfg, 'HasMemTile')),
             bank_count=int(require(cfg, 'BankCount')),
             tile_mem_bytes=int(require(cfg, 'TileMemBytes')),

@@ -1,8 +1,10 @@
 """Choose every layer's parallelism for the whole graph at once (AIEConfig `Optimize`), before resolution.
 
 Resolution and the transport classifier stay the only judges of legality; user directives are constraints and are
-never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Work is
-multiply-accumulates per tile, a proxy for time: a cost model replaces `_work` and `_legs`.
+never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Designs are ranked by
+an estimate of their interval (the slowest kernel or leg) and latency (the critical path), in cycles (`estimate`):
+'performance' takes the lowest latency among the designs whose interval is within INTERVAL_TOLERANCE of the best,
+'resource' the fewest tiles, then the lowest latency.
 
 The search is bounded, not exhaustive: it keeps KEEP designs per state and tile count and builds at most
 MAX_PLACEMENT_TRIALS, so it reports a search limit unless it discarded nothing.
@@ -22,6 +24,7 @@ from ..ir import get_backend_context
 from ..ir.graph import ExecutionIR, ExecutionValue, OpNode
 from ..op_impls import get_family_resolver_registry
 from .base import AIEPass, run_aie_passes
+from .estimate import kernel_cycles, leg_cycles, shareable
 from .legalize_layouts import convert_inputs
 from .resolve import logical_values, output_contracts, resolve_instance
 from .transport.classify import classify_connection
@@ -33,6 +36,7 @@ MODES = ('performance', 'resource')
 KEEP = 4  # designs kept per state and tile count, so the next ones are at hand when placement refuses one
 MAX_PARTIALS = 50_000
 MAX_PLACEMENT_TRIALS = 16
+INTERVAL_TOLERANCE = 0.1  # intervals the estimate cannot tell apart
 
 
 @dataclass(frozen=True)
@@ -42,9 +46,11 @@ class _Design:
 
     memtile: int
     tiles: int
-    work: int
+    interval: int  # estimated cycles: the slowest kernel or leg so far
+    latency: int  # estimated cycles: the last kernel or graph output so far to finish
     chosen: Tuple[Tuple[str, Any], ...]  # (layer, instance)
     live: Tuple[Tuple[str, Any], ...]  # (tensor, producing instance)
+    ready: Tuple[Tuple[str, int], ...]  # (live tensor, estimated cycle it is written by)
 
 
 class ChooseParallelism(AIEPass):
@@ -76,7 +82,7 @@ class ChooseParallelism(AIEPass):
             'max_tiles': max_tiles,
             'tiles': design.tiles,
             'memtile_legs': design.memtile,
-            'work_per_tile': design.work if mode == 'performance' else None,  # proxy: multiply-accumulates
+            'estimate': {'interval_cc': design.interval, 'latency_cc': design.latency},
             'designs_tried': trials,
             'parallelism': search.parallelism(design),
             # The trial already placed the design: pinning its places spares the placer a second search.
@@ -126,10 +132,16 @@ class _Search:
                 source for name, view in zip(inputs, views) for source in (view.sources if view else (name,))
             )
             self.last_read.update({tensor: position for tensor in self.reads[node.name]})
+        # how many layers read each tensor: a tensor more than one reads is copied to each, never shared
+        self.readers: Dict[str, int] = defaultdict(int)
+        for tensors in self.reads.values():
+            for tensor in set(tensors):
+                self.readers[tensor] += 1
         self.refusals: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.intervals: set = set()  # every layer's estimated interval met, the bounds a performance search tries
         self.truncated = False  # whether the program has discarded a design since last reset
         self._resolved: Dict[Any, Any] = {}
-        self._memtile_legs: Dict[Any, Optional[int]] = {}
+        self._legs_cache: Dict[Any, Any] = {}
         self.compared = 0  # distinct complete designs within the budget that best_buildable ranked
         self._contracts: Dict[int, Dict[str, Any]] = {}
         self._signatures: Dict[Tuple[int, str], str] = {}
@@ -168,8 +180,8 @@ class _Search:
     # -- one layer and its legs ----------------------------------------------------------------------
 
     def _resolve(self, node: OpNode, option, live: Dict[str, Any]):
-        """(kernels, tiles, work) for `node` under `option` -- the layout converters it needs, then its own
-        instance -- or None when resolution refuses it; per input arrival."""
+        """(kernels, tiles, cycles) for `node` under `option` -- the layout converters it needs, then its own
+        instance, and each one's estimated cycles -- or None when resolution refuses it; per input arrival."""
         inputs = {t.name: live[t.name] for t in node.inputs if t.name in live}
         arrival = tuple((t, self._signature(i, t)) for t, i in inputs.items())
         key = (node.name, json.dumps(option, sort_keys=True), arrival)
@@ -185,7 +197,9 @@ class _Search:
                 target = converter.outputs[0]
                 self.values.setdefault(target, ExecutionValue(target, producer=converter.name))
             tiles = sum(self._area(kernel.variant.footprint(kernel.node, kernel.config)) for kernel in kernels)
-            resolved = (tuple(kernels), tiles, self._work(inst) if node.name in self.choosing else 0)
+            work = inst.variant.work(node, inst.config) if node.name in self.choosing else None
+            cycles = tuple(kernel_cycles(k, work if k is inst else None, self.ctx.device) for k in kernels)
+            resolved = (tuple(kernels), tiles, cycles)
         except ConfigRefused as refusal:
             self.refusals[node.name][str(refusal)] += 1
             resolved = None
@@ -196,15 +210,13 @@ class _Search:
     def _area(footprint) -> int:
         return footprint.width * footprint.height
 
-    def _work(self, inst) -> int:
-        return inst.variant.work(inst.node, inst.config) if self.mode == 'performance' else 0
-
-    def _legs(self, node: OpNode, kernels, live: Dict[str, Any]) -> Optional[int]:
-        """How many legs into and out of `node`'s kernels a memory tile carries, or None when the transport
-        classifier refuses one."""
+    def _legs(self, node: OpNode, kernels, live: Dict[str, Any]):
+        """(memtile, arrivals, departure) for `node`'s kernels: how many of their legs a memory tile carries, the
+        (source tensor, latency, interval) legs into each kernel, and the (latency, interval) its graph-boundary
+        outputs take to leave -- or None when the transport classifier refuses a leg."""
         producers = {id(live[t]): live[t] for t in self.reads[node.name] if t in live}
         key = (id(kernels[-1]), tuple(sorted(producers)))
-        if key not in self._memtile_legs:
+        if key not in self._legs_cache:
             instances = [*producers.values(), *kernels]
             execution = ExecutionIR(
                 instances={inst.name: inst for inst in instances},
@@ -214,32 +226,47 @@ class _Search:
                 graph_outputs=self.graph_outputs,
             )
             collector = TransportCollector(execution)
+            memtile = 0
+
+            def cost(leg):
+                nonlocal memtile
+                realization = classify_connection(leg, execution, self.ctx.device).realization
+                memtile += realization == 'memtile'
+                readers = self.readers.get(leg.producer.tensor, 0)
+                shared = shareable(leg, realization, execution, readers)
+                return (leg.producer.tensor, *leg_cycles(leg, realization, shared, execution, self.ctx.device))
+
             try:
-                legs = [leg for kernel in kernels for leg in collector.input_connections(kernel)]
-                legs += collector.output_connections(kernels[-1], self.last_read)
-                decisions = [classify_connection(leg, execution, self.ctx.device) for leg in legs]
-                self._memtile_legs[key] = sum(decision.realization == 'memtile' for decision in decisions)
+                arrivals = tuple(tuple(cost(leg) for leg in collector.input_connections(kernel)) for kernel in kernels)
+                leaving = [cost(leg)[1:] for leg in collector.output_connections(kernels[-1], self.last_read)]
+                departure = tuple(max(cc, default=0) for cc in zip(*leaving)) or (0, 0)
+                self._legs_cache[key] = (memtile, arrivals, departure)
             except ConfigRefused as refusal:
                 self.refusals[node.name][str(refusal)] += 1
-                self._memtile_legs[key] = None
-        return self._memtile_legs[key]
+                self._legs_cache[key] = None
+        return self._legs_cache[key]
 
     # -- the dynamic program ------------------------------------------------------------------------
 
-    def designs(self, work_bound: Optional[int]) -> List[_Design]:
-        """The complete designs whose busiest chosen tile stays within `work_bound`, as the program keeps them."""
-        frontier = {((), 0): [_Design(0, 0, 0, (), ())]}
+    def designs(self, bound: Optional[int]) -> List[_Design]:
+        """The complete designs whose estimated interval stays within `bound`, as the program keeps them."""
+        frontier = {((), 0): [_Design(0, 0, 0, 0, (), (), ())]}
         for position, node in enumerate(self.layers):
             grown: Dict[Any, List[_Design]] = defaultdict(list)
             for designs in frontier.values():
                 live = dict(designs[0].live)  # every design of a state sees the same arrivals
                 for option in self.options[node.name]:
                     resolved = self._resolve(node, option, live)
-                    if resolved is None or (work_bound is not None and resolved[2] > work_bound):
+                    if resolved is None:
                         continue
-                    kernels, tiles, work = resolved
-                    memtile = self._legs(node, kernels, live)
-                    if memtile is None:
+                    kernels, tiles, cycles = resolved
+                    legs = self._legs(node, kernels, live)
+                    if legs is None:
+                        continue
+                    memtile, arrivals, departure = legs
+                    slowest = max(*cycles, *(cc for legs_in in arrivals for *_, cc in legs_in), departure[1])
+                    self.intervals.add(slowest)
+                    if bound is not None and slowest > bound:
                         continue
                     inst = kernels[-1]
                     kept = {t: i for t, i in live.items() if self.last_read[t] > position}
@@ -247,20 +274,30 @@ class _Search:
                     state = tuple(sorted((t, self._signature(i, t)) for t, i in kept.items()))
                     for design in designs:
                         total = design.tiles + tiles
-                        if total <= self.max_tiles:
-                            grown[(state, total)].append(
-                                _Design(
-                                    design.memtile + memtile,
-                                    total,
-                                    max(design.work, work),
-                                    design.chosen + ((node.name, inst),),
-                                    tuple(kept.items()),
-                                )
+                        if total > self.max_tiles:
+                            continue
+                        ready = dict(design.ready)
+                        for kernel, legs_in, kernel_cc in zip(kernels, arrivals, cycles):
+                            start = max(
+                                (0 if src in self.graph_inputs else ready[src]) + cc for src, cc, _ in legs_in
                             )
+                            ready.update({t: start + kernel_cc for t in kernel.outputs})
+                        finish = max(ready[t] for t in inst.outputs)
+                        grown[(state, total)].append(
+                            _Design(
+                                design.memtile + memtile,
+                                total,
+                                max(design.interval, slowest),
+                                max(design.latency, finish + departure[0]),
+                                design.chosen + ((node.name, inst),),
+                                tuple(kept.items()),
+                                tuple((t, ready[t]) for t in kept),
+                            )
+                        )
             # Designs sharing a state and tile count have the same futures: keeping KEEP of them loses alternatives
             # for placement, never feasibility, so an empty result still proves no design resolves.
             self.truncated |= any(len(found) > KEEP for found in grown.values())
-            frontier = {key: sorted(found, key=lambda d: (d.memtile, d.work))[:KEEP] for key, found in grown.items()}
+            frontier = {key: sorted(found, key=self._rank)[:KEEP] for key, found in grown.items()}
             if sum(len(found) for found in frontier.values()) > MAX_PARTIALS:
                 raise RuntimeError(
                     f'choose_parallelism: over {MAX_PARTIALS} partial designs at {node.name}; give some layers a '
@@ -270,22 +307,25 @@ class _Search:
 
     def _rank(self, design: _Design) -> tuple:
         if self.mode == 'resource':
-            return (design.tiles, design.memtile)
-        return (design.work, design.memtile, design.tiles)
+            return (design.tiles, design.latency, design.interval)
+        return (design.latency, design.interval, design.tiles)
 
     def best_buildable(self) -> Tuple[_Design, Any, int]:
         """The best-ranked design the rest of the pipeline builds, the context it was built in, and how many
         designs were tried."""
         bounds: List[Optional[int]] = [None]
-        complete = self.designs(None)  # resolves every option, so each one's work is known
+        complete = self.designs(None)  # resolves every option, so each one's interval is known
         self.compared = len({json.dumps(self.parallelism(design), sort_keys=True) for design in complete})
         if self.mode == 'performance':
-            bounds = sorted({resolved[2] for resolved in self._resolved.values() if resolved is not None})
+            bounds = sorted(self.intervals)
             low, high = 0, len(bounds)  # designs exist from some bound on
             while low < high:
                 middle = (low + high) // 2
                 low, high = (low, middle) if self.designs(bounds[middle]) else (middle + 1, high)
-            bounds = bounds[low:]
+            # the lowest latency among the designs within the tolerance of the best interval, then the next
+            # bounds up, should placement refuse them all
+            within = [i for i in bounds[low:] if i <= bounds[low] * (1 + INTERVAL_TOLERANCE)]
+            bounds = bounds[low + len(within) - 1 :] if within else []
         tried, unbuilt = set(), defaultdict(int)
         self.truncated = False
         for bound in bounds:
