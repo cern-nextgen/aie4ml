@@ -66,6 +66,8 @@ def shareable(leg: Connection, realization: str, execution, readers: int) -> boo
     source, sink = execution.get(producer.node.name), execution.get(consumer.node.name)
     written = producer.selected_ports(source.ports.outputs[producer.tensor].count)
     read = consumer.selected_ports(sink.ports.inputs[consumer.tensor].count)
-    return len(written) == len(read) and not any(
-        port_problem(source, producer.group, port, 'outputs') for port in written
-    ) and not any(port_problem(sink, consumer.group, port, 'inputs') for port in read)
+    return (
+        len(written) == len(read)
+        and not any(port_problem(source, producer.group, port, 'outputs') for port in written)
+        and not any(port_problem(sink, consumer.group, port, 'inputs') for port in read)
+    )

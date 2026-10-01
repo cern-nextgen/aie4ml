@@ -57,7 +57,6 @@ class DeviceSpec:
     platform: str
     part: str  # the device part the platform, or the part named, resolves to
     generation: str
-    aie_clock_mhz: float  # the AIE array clock the compiler builds the part at
     pl_clock_mhz: float
     columns: int
     rows: int
@@ -125,7 +124,6 @@ class DeviceSpec:
             platform=platform,
             part=str(require(cfg, 'Part')),
             generation=generation,
-            aie_clock_mhz=float(require(cfg, 'AIEClockFreqMHz')),
             pl_clock_mhz=float(require(cfg, 'PLClockFreqMHz')),
             columns=int(require(cfg, 'Columns')),
             rows=int(require(cfg, 'Rows')),

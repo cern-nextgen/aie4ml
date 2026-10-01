@@ -22,8 +22,8 @@ from ...utils.precision import (
     resolve_output_scale_shift,
 )
 from .common import (
-    check_register_transpose,
     bitwidths_supported,
+    check_register_transpose,
     describe_inner_lhs_staging,
     describe_inner_output_staging,
     describe_outer_lhs_staging,

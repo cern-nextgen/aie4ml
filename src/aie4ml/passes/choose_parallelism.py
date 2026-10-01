@@ -277,9 +277,7 @@ class _Search:
                             continue
                         ready = dict(design.ready)
                         for kernel, legs_in, kernel_cc in zip(kernels, arrivals, cycles):
-                            start = max(
-                                (0 if src in self.graph_inputs else ready[src]) + cc for src, cc, _ in legs_in
-                            )
+                            start = max((0 if src in self.graph_inputs else ready[src]) + cc for src, cc, _ in legs_in)
                             ready.update({t: start + kernel_cc for t in kernel.outputs})
                         finish = max(ready[t] for t in inst.outputs)
                         grown[(state, total)].append(

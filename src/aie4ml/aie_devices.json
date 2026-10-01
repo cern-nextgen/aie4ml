@@ -83,8 +83,7 @@
       "Rows": 8,
       "PLColumnStart": 6,
       "RowStart": 0,
-      "PLClockFreqMHz": 312.5,
-      "AIEClockFreqMHz": 1250
+      "PLClockFreqMHz": 312.5
     },
     "xcvp2802-vsva5601-2mhp-e-s": {
       "DeviceName": "VP2802",
@@ -93,8 +92,7 @@
       "Rows": 8,
       "PLColumnStart": 6,
       "RowStart": 0,
-      "PLClockFreqMHz": 312.5,
-      "AIEClockFreqMHz": 1250
+      "PLClockFreqMHz": 312.5
     },
     "xcve2802-vsvh1760-2mp-e-s": {
       "DeviceName": "VE2802",
@@ -113,8 +111,7 @@
         "Blocks": 264,
         "Depth": 4096,
         "WidthBits": 72
-      },
-      "AIEClockFreqMHz": 1000
+      }
     },
     "xc2ve3858-ssva2112-2mp-e-s": {
       "DeviceName": "2VE3858",
@@ -123,8 +120,7 @@
       "Rows": 4,
       "PLColumnStart": 4,
       "RowStart": 0,
-      "PLClockFreqMHz": 312.5,
-      "AIEClockFreqMHz": 1250
+      "PLClockFreqMHz": 312.5
     }
   },
   "platforms": {
