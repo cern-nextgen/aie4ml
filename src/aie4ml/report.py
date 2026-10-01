@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional
 
 # Itanium mangling prefixes each identifier with its length (_ZN12dense_singleI... ->
 # 12 chars of 'dense_single'), which is how the class name is recovered from the symbol.
-_KERNEL_RE = re.compile(r'run _ZN(\d+)([A-Za-z_][A-Za-z0-9_]*)')
+_KERNEL_RE = re.compile(r' _ZN(\d+)([A-Za-z_][A-Za-z0-9_]*)')  # a kernel class's member function
 _TILE_RE = re.compile(r'array\.tile_(\d+)_(\d+)')  # a profile's tile, by absolute array row
 _PLIO_RE = re.compile(r'\|\s*(?:plio)?\s*\|?\s*(PLIO_\w+)\s*\|\s*(IN|OUT)\s*\|\s*([\d.]+)')
 _CORE_RE = re.compile(r'^Core (\S+)', re.M)
@@ -375,22 +375,21 @@ def _kernel_cycles(project: Path, vitis: Dict[str, Any]) -> List[Dict[str, Any]]
     rows = []
     for path in sorted(project.glob('aiesimulator_output/profile_funct_*.txt')):
         text = path.read_text(errors='ignore')
-        run = next((ln for ln in text.splitlines() if 'run _ZN' in ln), None)
         named = _TILE_RE.search(text)
-        if run is None or named is None:
-            continue
-        fields = run.split()
-        try:
-            calls, total = int(fields[0]), int(fields[6])
-        except (IndexError, ValueError):
-            continue
-        match = _KERNEL_RE.search(run)
-        kernel = match.group(2)[: int(match.group(1))] if match else '?'
         # Columns come in two groups of six: the function alone, then the function with its
         # callees. A kernel that moves its data through helper functions does that work too, so
         # the second group is the kernel's cost -- reading the first would charge its callees to
-        # nobody and leave the difference looking like time blocked on a port.
-        busy = fields[7].rstrip('%') if len(fields) > 7 else ''
+        # nobody and leave the difference looking like time blocked on a port. The kernel is its
+        # class's costliest member function: `run`, or what the compiler left of it once inlined.
+        members = []
+        for line in text.split('Cycle count details', 1)[0].splitlines():
+            fields, match = line.split(), _KERNEL_RE.search(line)
+            if match and len(fields) > 7 and fields[0].isdigit() and fields[6].isdigit():
+                members.append((int(fields[6]), int(fields[0]), fields[7].rstrip('%'), match))
+        if not members or named is None:
+            continue
+        total, calls, busy, match = max(members, key=lambda member: member[0])
+        kernel = match.group(2)[: int(match.group(1))]
         tile = f'{named.group(1)}_{int(named.group(2)) - int(row_start)}'
         rows.append(
             {
@@ -712,11 +711,9 @@ def format_report(report: Dict[str, Any]) -> str:
     add(f'  AIE clock: {clock} GHz' if clock else '  AIE clock: unknown (cycles omitted)')
     chosen = report.get('optimizer')
     if chosen:
-        estimate = chosen['estimate']
         add(
             f'  Design search ({chosen["mode"]}): {chosen["tiles"]} tiles of {chosen["max_tiles"]}, '
-            f'{chosen["memtile_legs"]} legs through a memory tile, estimated interval '
-            f'{estimate["interval_cc"]:,} cc and latency {estimate["latency_cc"]:,} cc'
+            f'{chosen["memtile_legs"]} legs through a memory tile'
         )
 
     latency = (report.get('latency') or {}).get('global') or {}

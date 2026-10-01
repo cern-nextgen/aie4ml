@@ -219,3 +219,28 @@ def test_a_profile_is_charged_to_the_core_its_tile_names(tmp_path):
     )
     (kernel,) = _kernel_cycles(tmp_path, {'aie_tile_row_start': 3})
     assert (kernel['tile'], kernel['op'], kernel['cycles_per_call']) == ('7_0', 'c1_aie', 1229)
+
+
+def test_a_kernel_whose_run_was_inlined_is_charged_its_costliest_member(tmp_path):
+    """With `run` inlined, the profile names only the helper doing the work, beside the startup functions."""
+    from aie4ml.report import _kernel_cycles
+
+    (tmp_path / 'aie_pipeline.json').write_text(
+        json.dumps(
+            {
+                'physical': {'placements': {'c2_aie': {'col': 4, 'row': 1}}},
+                'execution': [{'node': 'c2_aie', 'config': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}],
+            }
+        )
+    )
+    profiles = tmp_path / 'aiesimulator_output'
+    profiles.mkdir()
+    (profiles / 'profile_funct_4_3.txt').write_text(
+        'Function profiling report information for ::tl.aie_logical.aie_xtlm.math_engine'
+        '.array.tile_4_4.cm.proc.iss\n'
+        '  1  3450  31.25%  3450  3450  3450  10991  99.57%  10991  10991  10991  192  717  192 main _main\n'
+        '  6  7541  68.31%  1253  1256  1265  7541  68.31%  1253  1256  1265  720  3413  64'
+        ' compute _ZN16conv2d_halo_baseI5L3CfgLi0EE7computeEPKh\n'
+    )
+    (kernel,) = _kernel_cycles(tmp_path, {'aie_tile_row_start': 3})
+    assert (kernel['op'], kernel['kernel'], kernel['cycles_per_call']) == ('c2_aie', 'conv2d_halo_base', 1257)
