@@ -85,7 +85,8 @@ def test_performance_splits_the_busiest_layers_within_max_tiles(tmp_path, part):
     base = lower(_wide_model(), tmp_path / 'base', part=part, aie_config={'Optimize': 'resource'})
     ctx = lower(_wide_model(), tmp_path, part=part, aie_config={'Optimize': 'performance', 'MaxTiles': 8})
     chosen = ctx.ir.optimizer
-    assert chosen['estimate']['interval_cc'] < base.ir.optimizer['estimate']['interval_cc']
+    busiest = max(inst.variant.work(inst.node, inst.config) for inst in base.ir.execution)
+    assert max(inst.variant.work(inst.node, inst.config) for inst in ctx.ir.execution) < busiest
     assert chosen['tiles'] == _placed_tiles(ctx) <= 8 and chosen['memtile_legs'] == 0
     assert chosen['parallelism'] == {name: vars(p) for name, p in _splits(ctx).items()}
 

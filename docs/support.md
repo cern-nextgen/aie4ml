@@ -16,7 +16,7 @@ where it must (`AIEConfig`):
 - `Optimize: 'performance'` takes the lowest latency among the designs whose interval is within 10% of the best,
   within `MaxTiles` (default: the whole array).
 
-Both rank designs by a rough estimate in cycles, not a timing model: each kernel's multiply-accumulates or loads,
+Both rank designs by a rough, relative estimate of cycles, not a timing model: each kernel's multiply-accumulates or loads,
 plus each hand-over's bytes (none where two kernels share a buffer, twice through a memory tile).
 
 A layer's split can be fixed per layer (`LayerDirectives` in the ONNX config, or the hls4ml layer config); the

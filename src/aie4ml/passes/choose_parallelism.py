@@ -82,7 +82,6 @@ class ChooseParallelism(AIEPass):
             'max_tiles': max_tiles,
             'tiles': design.tiles,
             'memtile_legs': design.memtile,
-            'estimate': {'interval_cc': design.interval, 'latency_cc': design.latency},
             'designs_tried': trials,
             'parallelism': search.parallelism(design),
             # The trial already placed the design: pinning its places spares the placer a second search.
