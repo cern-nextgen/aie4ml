@@ -905,7 +905,9 @@ def _validate_and_preplace_anchors(
 
         p = Placed(name=name, x=spec.anchor[0], y=spec.anchor[1], rect=spec.rect)
         if not _feasible(p, placed, graph, W, H):
-            raise ValueError(f'Invalid fixed anchor for {name}: out of bounds or conflicts with another anchor.')
+            raise PlacementInfeasibleError(
+                f'Invalid fixed anchor for {name}: out of bounds or conflicts with another anchor.'
+            )
         placed[name] = p
 
     return placed

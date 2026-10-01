@@ -490,7 +490,7 @@ def test_replanning_a_context_matches_planning_a_fresh_one(tmp_path):
     reused = _run_pipeline(
         _dense_stack_model(), tmp_path, directives=split({'cas_num': 4, 'cas_length': 2}, {'cas_num': 2})
     )
-    with pytest.raises(ValueError, match='Invalid fixed anchor'):
+    with pytest.raises(ConfigRefused, match='Invalid fixed anchor'):
         replan(reused, split({'cas_num': 2, 'cas_length': 2}, {'cas_num': 1}, placement={'col': 999, 'row': 0}))
     replan(reused, target)
     assert to_plain(reused.context.ir.physical.to_dict()) == to_plain(fresh.context.ir.physical.to_dict())

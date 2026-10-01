@@ -924,7 +924,7 @@ def test_shared_edge_needs_room_for_one_buffer(tmp_path):
     producer's tile, where no buffer of theirs is shared, and leaves no tile for the retiler whose
     frame it must share: placement refuses rather than accept a DMA hop."""
     directives = {'first': {'placement': {'col': 7, 'row': 0}}, 'second': {'placement': {'col': 8, 'row': 0}}}
-    with pytest.raises(ValueError, match='conflicts with another anchor'):
+    with pytest.raises(ConfigRefused, match='conflicts with another anchor'):
         lower(_strided_chain_model(), tmp_path, directives, part=AIE1_PART)
 
 
