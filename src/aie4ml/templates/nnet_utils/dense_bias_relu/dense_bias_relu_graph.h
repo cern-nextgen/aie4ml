@@ -111,31 +111,45 @@ void place_graph(int COL_START, int ROW_START)
   dense_bias_relu_graph( void )
   {
 
+    // A stream end at either side runs dense_bias_relu_stream.cpp; a chain's first and middle kernels see only its
+    // input. Every create_object stays braced and guarded: the graph front end instantiates each one it sees.
     for (int chain = 0; chain < CAS_NUM; ++chain) {
-        // A stream end at either side runs dense_bias_relu_stream.cpp; a chain's first and middle kernels see
-        // only its input.
-        if constexpr (CAS_LENGTH > 1) {
+        const int last = chain * CAS_LENGTH + (CAS_LENGTH - 1);
+        if constexpr (CAS_LENGTH == 1) {
+            if constexpr (STREAM_IN && STREAM_OUT) {
+                kk[last] = kernel::create_object<dense_single_stream<ConfigT>>();
+            } else if constexpr (STREAM_IN) {
+                kk[last] = kernel::create_object<dense_single_stream_in<ConfigT>>();
+            } else if constexpr (STREAM_OUT) {
+                kk[last] = kernel::create_object<dense_single_stream_out<ConfigT>>();
+            } else {
+                kk[last] = kernel::create_object<typename BufferKernels::single>();
+            }
+        } else {
             if constexpr (STREAM_IN) {
                 kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_first_stream<ConfigT>>();
-                for (int c = 1; c < CAS_LENGTH - 1; ++c)
-                    kk[chain * CAS_LENGTH + c] = kernel::create_object<dense_middle_stream<ConfigT>>();
+                if constexpr (CAS_LENGTH > 2) {
+                    for (int c = 1; c < CAS_LENGTH - 1; ++c) {
+                        kk[chain * CAS_LENGTH + c] = kernel::create_object<dense_middle_stream<ConfigT>>();
+                    }
+                }
             } else {
                 kk[chain * CAS_LENGTH + 0] = kernel::create_object<typename BufferKernels::first>();
-                for (int c = 1; c < CAS_LENGTH - 1; ++c)
-                    kk[chain * CAS_LENGTH + c] = kernel::create_object<typename BufferKernels::middle>();
+                if constexpr (CAS_LENGTH > 2) {
+                    for (int c = 1; c < CAS_LENGTH - 1; ++c) {
+                        kk[chain * CAS_LENGTH + c] = kernel::create_object<typename BufferKernels::middle>();
+                    }
+                }
             }
-        }
-        kernel& last = kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)];
-        if constexpr (CAS_LENGTH == 1) {
-            if constexpr (STREAM_IN && STREAM_OUT) last = kernel::create_object<dense_single_stream<ConfigT>>();
-            else if constexpr (STREAM_IN) last = kernel::create_object<dense_single_stream_in<ConfigT>>();
-            else if constexpr (STREAM_OUT) last = kernel::create_object<dense_single_stream_out<ConfigT>>();
-            else last = kernel::create_object<typename BufferKernels::single>();
-        } else {
-            if constexpr (STREAM_IN && STREAM_OUT) last = kernel::create_object<dense_last_stream<ConfigT>>();
-            else if constexpr (STREAM_IN) last = kernel::create_object<dense_last_stream_in<ConfigT>>();
-            else if constexpr (STREAM_OUT) last = kernel::create_object<dense_last_stream_out<ConfigT>>();
-            else last = kernel::create_object<typename BufferKernels::last>();
+            if constexpr (STREAM_IN && STREAM_OUT) {
+                kk[last] = kernel::create_object<dense_last_stream<ConfigT>>();
+            } else if constexpr (STREAM_IN) {
+                kk[last] = kernel::create_object<dense_last_stream_in<ConfigT>>();
+            } else if constexpr (STREAM_OUT) {
+                kk[last] = kernel::create_object<dense_last_stream_out<ConfigT>>();
+            } else {
+                kk[last] = kernel::create_object<typename BufferKernels::last>();
+            }
         }
     }
 
