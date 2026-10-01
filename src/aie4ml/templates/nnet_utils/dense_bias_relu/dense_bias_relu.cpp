@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dense_bias_relu.h"
+#include "stored_operand.h"
 using namespace adf;
 
 template<typename ConfigT>
@@ -79,6 +80,7 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
   static constexpr int SHIFT = ConfigT::SHIFT;
 
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
+  using AOp  = stored_operand<data_t, M, K, rowA, colA, ConfigT::TRANSPOSE_INPUT, ConfigT::A_ROWS>;
 
   const data_t*      pA    = ifm.data();
   const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
@@ -90,21 +92,16 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
     result_t* __restrict pC2 = pC + ((z + 1) * (colB / N) + 0) * MMUL::size_C;
 
     for (unsigned j = 0; j < colB / N; j += 2) {
-      const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
+      const data_t*   __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const data_t*   __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
       const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
       const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       aie::vector<data_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_INPUT) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      }else{
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A;
-      pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP;
+      pA2 += AOp::INNER_STEP;
 
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
@@ -132,15 +129,10 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_INPUT) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A;
-        pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP;
+        pA2 += AOp::INNER_STEP;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -180,6 +172,7 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
   static constexpr int N    = ConfigT::N;
 
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
+  using AOp  = stored_operand<data_t, M, K, rowA, colA, ConfigT::TRANSPOSE_INPUT, ConfigT::A_ROWS>;
 
   const data_t*   pA = ifm.data();
   const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
@@ -187,21 +180,16 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
 
   for (unsigned z = 0; z < rowA / M; z += 2) {
     for (unsigned j = 0; j < colB / N; j += 2) {
-      const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
+      const data_t*   __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const data_t*   __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
       const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
       const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       aie::vector<data_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_INPUT) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      } else {
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A;
-      pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP;
+      pA2 += AOp::INNER_STEP;
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -223,15 +211,10 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_INPUT) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A;
-        pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP;
+        pA2 += AOp::INNER_STEP;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -264,6 +247,7 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
   static constexpr int N    = ConfigT::N;
 
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
+  using AOp  = stored_operand<data_t, M, K, rowA, colA, ConfigT::TRANSPOSE_INPUT, ConfigT::A_ROWS>;
 
   const data_t*   pA = ifm.data();
   const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
@@ -280,21 +264,16 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
       MMUL C10; C10 = acc10;
       MMUL C11; C11 = acc11;
 
-      const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
+      const data_t*   __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const data_t*   __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
       const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
       const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       aie::vector<data_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_INPUT) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      } else {
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A;
-      pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP;
+      pA2 += AOp::INNER_STEP;
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -306,15 +285,10 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_INPUT) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A;
-        pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP;
+        pA2 += AOp::INNER_STEP;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -348,6 +322,7 @@ void dense_last<ConfigT>::run(input_buffer<data_t>& ifm,
   static constexpr int SHIFT = ConfigT::SHIFT;
 
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
+  using AOp  = stored_operand<data_t, M, K, rowA, colA, ConfigT::TRANSPOSE_INPUT, ConfigT::A_ROWS>;
 
   const data_t*      pA    = ifm.data();
   const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
@@ -358,8 +333,8 @@ void dense_last<ConfigT>::run(input_buffer<data_t>& ifm,
     result_t* __restrict pC2 = pC + ((z + 1) * (colB / N) + 0) * MMUL::size_C;
 
     for (unsigned j = 0; j < colB / N; j += 2) {
-      const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
+      const data_t*   __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const data_t*   __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
       const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
       const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
@@ -369,15 +344,10 @@ void dense_last<ConfigT>::run(input_buffer<data_t>& ifm,
       MMUL C11(readincr_v<MMUL::size_C>(inCascade));
 
       aie::vector<data_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_INPUT) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      } else {
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A;
-      pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP;
+      pA2 += AOp::INNER_STEP;
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -387,15 +357,10 @@ void dense_last<ConfigT>::run(input_buffer<data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_INPUT) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A;
-        pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP;
+        pA2 += AOp::INNER_STEP;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-
 from ....aie_types import FloatIntent
 from ....ir.graph import ExecutionInstance, OpNode, input_role, input_tensor_for_role
 from ...base import BufferLocation, OpImplFootprint, row_flow
@@ -10,12 +8,10 @@ from ...registry import register_variant
 from ...utils import ParallelismConfig, parse_directives
 from ...utils.precision import (
     aie_rounding_token,
-    element_bytes,
     resolve_accumulator_output_shift,
     resolve_operand_precision,
     resolve_output_scale_shift,
 )
-from ...utils.tensor_view import microtile_from_staging
 from .common import (
     bitwidths_supported,
     describe_inner_lhs_staging,
@@ -24,8 +20,10 @@ from .common import (
     describe_outer_lhs_staging,
     describe_outer_output_staging,
     describe_outer_rhs_staging,
+    producer_blocks,
+    read_as_stored,
     requested_contract,
-    rhs_storage_block,
+    stored_block_rows,
 )
 from .config import MatmulConfig, MatmulFlags
 from .dense import _BaseDenseMatmulVariant
@@ -48,21 +46,15 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
     def resolve(self, node: OpNode, device, directives, input_contracts) -> MatmulConfig:
         io_route, parallel_cfg = parse_directives(directives)
         precision, accumulator_tag = resolve_operand_precision(node, device)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
+        lhs_producer = producer_blocks(input_tensor_for_role(node, 'lhs'), input_contracts)
+        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], lhs_producer=lhs_producer)
         tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract, parallel_cfg)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
 
+        io_views = read_as_stored(node, io_views, input_contracts, precision)
+
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
-        rhs_view = io_views[rhs_tensor.name]
-        producer = input_contracts.get(rhs_tensor.name)
-        block = rhs_storage_block(
-            microtiling,
-            rhs_view.is_transposed,
-            None if producer is None else microtile_from_staging(producer.port_staging[0]),
-            element_bytes(precision['rhs']),
-        )
-        io_views[rhs_tensor.name] = dataclasses.replace(rhs_view, microtile=block)
         is_float = isinstance(rhs_tensor.precision, FloatIntent)
 
         shift = (
@@ -92,9 +84,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
 
     def kernel_params(self, node, config):
         rhs_view = config.io_views[input_tensor_for_role(node, 'rhs').name]
-        block = rhs_view.microtile
-        rows = block.inner if rhs_view.is_transposed else block.outer
-        return {**super().kernel_params(node, config), 'rhs_block_rows': int(rows)}
+        return {**super().kernel_params(node, config), 'rhs_block_rows': stored_block_rows(rhs_view)}
 
     def validate_config(self, node: OpNode, config: MatmulConfig, _device) -> None:
         rhs_tensor = input_tensor_for_role(node, 'rhs')

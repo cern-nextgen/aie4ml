@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -16,7 +17,8 @@ from ...utils import (
     canonical_buffer_axes,
     ordered_view_shape,
 )
-from ...utils.precision import resolve_exact_storage_dtype
+from ...utils.precision import element_bytes, resolve_exact_storage_dtype
+from ...utils.tensor_view import microtile_from_staging
 
 # Keys are canonical format-string pairs (lhs_format, rhs_format).
 # Integer formats: 'int8', 'int16' (sign-agnostic — both int8_t and uint8_t map here).
@@ -110,7 +112,7 @@ def describe_inner_lhs_staging(view: TensorView, port: int):
     microtile_k = int(view.microtile.inner)
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
-    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    inner_dim, outer_dim, _ = canonical_buffer_axes(view)
     k_start, k_held = _slice(view.logical_inner, in_slice, view.tile_raw_inner, port)
     return build_staging_descriptor(
         view,
@@ -119,7 +121,7 @@ def describe_inner_lhs_staging(view: TensorView, port: int):
             inner_dim: AxisPlan(microtile_k, microtile_k, in_slice // microtile_k, port * in_slice),
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
         },
-        order=traversal_dims,
+        order=list(range(view.rank)),
         logical_origin={inner_dim: k_start},
         io_tiling_overrides={inner_dim: k_held},
         boundary_shape='logical',
@@ -153,7 +155,7 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int):
     microtile_k = int(view.microtile.inner)
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
-    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    inner_dim, outer_dim, _ = canonical_buffer_axes(view)
 
     cas_length = max(1, int(parallelism.cas_length))
     row_group = int(port) // cas_length
@@ -169,7 +171,7 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int):
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, row_group * outer_slice),
         },
         logical_origin={inner_dim: k_start, outer_dim: row_start},
-        order=traversal_dims,
+        order=list(range(view.rank)),
         io_tiling_overrides={inner_dim: k_held, outer_dim: rows_held},
         slice_dim=outer_dim,
         boundary_shape='logical',
@@ -235,29 +237,56 @@ def describe_stream_staging(view: TensorView, port: int, access: str, contract: 
     )
 
 
-def rhs_storage_block(microtiling, transposed: bool, producer: MicrotileShape | None, element_bytes: int):
-    """The blocks a matmul reads its rhs in, in the rhs view's axes.
+def adopts_blocks(microtile: MicrotileShape, transposed: bool, producer: MicrotileShape, element_size: int) -> bool:
+    """Whether an operand read in `microtile`s of its view can read the blocks its producer stores: they hold the
+    columns of one microtile of the stored tensor (the view, or its transpose) and divide its rows, each at least
+    one 16-byte vector load."""
+    rows, cols = (microtile.inner, microtile.outer) if transposed else (microtile.outer, microtile.inner)
+    return (
+        int(producer.inner) == int(cols)
+        and int(rows) % int(producer.outer) == 0
+        and int(producer.outer) * int(cols) * int(element_size) % 16 == 0
+    )
 
-    The kernel reads the tensor as stored -- B, or B transposed -- in blocks of one microtile's columns, stacks a
-    microtile's rows of them into one mmul operand and transposes it in registers when the view is transposed. The
-    blocks are the microtile's own, or the producer's where they have its columns and divide its rows, so the
-    hand-over needs no re-layout; a block is at least one 16-byte vector load.
-    """
-    k, n = int(microtiling.microtile_k), int(microtiling.microtile_n)
-    rows, cols = (n, k) if transposed else (k, n)
-    if (
-        producer is not None
-        and int(producer.inner) == cols
-        and rows % int(producer.outer) == 0
-        and int(producer.outer) * cols * int(element_bytes) % 16 == 0
-    ):
-        rows = int(producer.outer)
-    return MicrotileShape(outer=cols, inner=rows) if transposed else MicrotileShape(outer=rows, inner=cols)
+
+def stored_block(microtile: MicrotileShape, transposed: bool, producer: MicrotileShape | None, element_size: int):
+    """The blocks a kernel reads an mmul operand in, in its view's axes (see stored_operand.h): the producer's where
+    it can read them, so the hand-over needs no re-layout, else the microtile's own."""
+    if producer is None or not adopts_blocks(microtile, transposed, producer, element_size):
+        return microtile
+    if transposed:
+        return MicrotileShape(outer=int(microtile.outer), inner=int(producer.outer))
+    return MicrotileShape(outer=int(producer.outer), inner=int(microtile.inner))
+
+
+def stored_block_rows(view: TensorView) -> int:
+    """Rows of the stored tensor in one block of an operand view (stored_operand.h's BLOCK_ROWS)."""
+    return int(view.microtile.inner if view.is_transposed else view.microtile.outer)
+
+
+def producer_blocks(tensor, input_contracts) -> MicrotileShape | None:
+    """The microtile blocks the producer of `tensor` stores it in, or None (no producer, or not microtiled)."""
+    contract = input_contracts.get(tensor.name)
+    return None if contract is None else microtile_from_staging(contract.port_staging[0])
+
+
+def read_as_stored(node, io_views: Dict[str, TensorView], input_contracts, precision) -> Dict[str, TensorView]:
+    """`io_views` with each activation operand read in its producer's blocks where it can be (see stored_block)."""
+    views = dict(io_views)
+    for role in ('lhs', 'rhs'):
+        tensor = input_tensor_for_role(node, role)
+        if tensor.is_parameter:
+            continue
+        producer = producer_blocks(tensor, input_contracts)
+        view = views[tensor.name]
+        block = stored_block(view.microtile, view.is_transposed, producer, element_bytes(precision[role]))
+        views[tensor.name] = dataclasses.replace(view, microtile=block)
+    return views
 
 
 def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
     """RHS staging for the 'outer' contract: the port selects a K-chain; every row group shares it. Its blocks are in
-    the tensor's own order, transposed or not (see `rhs_storage_block`)."""
+    the tensor's own order, transposed or not (see `stored_block`)."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
     k_slice = view.tile_outer
@@ -283,7 +312,7 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int):
 
 def describe_inner_rhs_staging(view: TensorView, parallelism, port: int):
     """RHS staging for the 'inner' contract: the port selects an (N-slice, K-chain) tile, its blocks in the tensor's
-    own order (see `rhs_storage_block`)."""
+    own order (see `stored_block`)."""
     microtile_k = int(view.microtile.outer)
     microtile_n = int(view.microtile.inner)
     # The rhs view encodes both K and N slices: outer dim = K, inner dim = N.

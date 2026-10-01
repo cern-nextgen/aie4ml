@@ -11,7 +11,7 @@ from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, inherited_microtile, parse_directives
+from ...utils import ParallelismConfig, parse_directives
 from ...utils.io import view_shape
 from ...utils.precision import (
     aie_rounding_token,
@@ -33,8 +33,11 @@ from .common import (
     pack_as_float,
     pack_mmul_rhs_matrix,
     pack_vector_by_n_slice,
+    producer_blocks,
     quantize_to_int,
+    read_as_stored,
     requested_contract,
+    stored_block_rows,
 )
 from .config import DenseConfig, DenseFlags
 from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg
@@ -68,6 +71,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
         params['stream_in'] = self.input_port_kind == PORT_KIND_STREAM
         params['stream_out'] = self.output_port_kind == PORT_KIND_STREAM
         params['row_blocks'] = self.row_blocks
+        params['lhs_block_rows'] = stored_block_rows(lhs_view)
         return params
 
     def kernel_outer_extent(self, lhs_view):
@@ -96,7 +100,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         precision, accumulator_tag = resolve_operand_precision(node, device)
         precision['bias'] = resolve_bias_dtype(node, precision)
         lhs_tensor = input_tensor_for_role(node, 'lhs')
-        required_microtile = None
+        require_producer_blocks = False
         producer_contract = input_contracts.get(lhs_tensor.name)
         # A hand-off with no memory tile to re-shard it (AIE1, or any stream port) takes the
         # producer's port count as its cas_length and, for buffers, inherits its microtile.
@@ -115,19 +119,18 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
                     f'{required_cas_length} required for direct AIE1 transport.'
                 )
             parallel_cfg['cas_length'] = required_cas_length
-            required_microtile = inherited_microtile(node, input_contracts)
+            require_producer_blocks = True
 
         # A kernel of one row block pays for every row of its microtile, so it takes the fewest rows the part
-        # offers -- unless its producer writes a microtile the part also offers, which keeps the hand-off direct.
-        one_block = self.row_blocks == 1
+        # offers among those that keep the hand-off direct.
         microtiling = _resolve_tile_cfg(
             node,
             device,
             precision['lhs'],
             precision['rhs'],
-            required_lhs_microtile=required_microtile,
-            preferred_lhs_microtile=inherited_microtile(node, input_contracts) if one_block else None,
-            fewest_rows=one_block,
+            lhs_producer=producer_blocks(lhs_tensor, input_contracts),
+            require_lhs_producer=require_producer_blocks,
+            fewest_rows=self.row_blocks == 1,
         )
         tiling = _resolve_parallelism(
             node,
@@ -138,7 +141,9 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             parallel_cfg=parallel_cfg,
             row_blocks=self.row_blocks,
         )
-        io_views = _build_matmul_io_views(node, microtiling, tiling, self.row_blocks)
+        io_views = read_as_stored(
+            node, _build_matmul_io_views(node, microtiling, tiling, self.row_blocks), input_contracts, precision
+        )
         # K stored shard by shard is still K: the kernel reduces over it whatever its order, so the weight rows
         # follow it (see pack) and every tiling of it stays legal.
         lhs_inner_shards = producer_contract.inner_shards if producer_contract is not None else None

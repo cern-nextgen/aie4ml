@@ -1,35 +1,6 @@
 #include "matmul.h"
+#include "stored_operand.h"
 using namespace adf;
-
-// B as stored: the tensor itself (B, or B transposed under TRANSPOSE_B), row-major in blocks of B_ROWS rows by one
-// microtile's columns. An mmul operand stacks a microtile's rows of blocks, transposed in registers under TRANSPOSE_B.
-template<typename ConfigT>
-struct matmul_b_operand {
-  using b_t = typename ConfigT::b_t;
-  static constexpr bool TRANSPOSED = ConfigT::TRANSPOSE_B;
-  static constexpr int K = ConfigT::K, N = ConfigT::N, ROWS = ConfigT::B_ROWS;
-  static constexpr int COLS = TRANSPOSED ? K : N;
-  static constexpr int WIDTH = TRANSPOSED ? ConfigT::K_SLICE : ConfigT::N_SLICE;
-  static constexpr int STACK = (TRANSPOSED ? N : K) / ROWS;
-  static constexpr int K_STEP = TRANSPOSED ? ROWS * K : K * WIDTH;  // to the next microtile along K
-  static constexpr int N_STEP = TRANSPOSED ? N * WIDTH : ROWS * N;  // to the next microtile along N
-  static_assert(STACK * ROWS == (TRANSPOSED ? N : K), "B_ROWS must divide a microtile's rows of the stored B");
-
-  __attribute__((always_inline)) static aie::vector<b_t, K * N> load(const b_t* __restrict p) {
-    aie::vector<b_t, K * N> v;
-    if constexpr (STACK == 1) {
-      v = aie::load_v<K * N>(p);
-    } else {
-      for (int s = 0; s < STACK; ++s)
-        chess_flatten_loop
-      {
-        v.template insert<ROWS * COLS>(s, aie::load_v<ROWS * COLS>(p + s * ROWS * WIDTH));
-      }
-    }
-    if constexpr (TRANSPOSED) return aie::transpose(v, N, K);
-    else return v;
-  }
-};
 
 template<typename ConfigT>
 matmul_base<ConfigT>::matmul_base() {
@@ -71,7 +42,8 @@ void matmul_single<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int SHIFT = ConfigT::SHIFT;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
-  using BOp  = matmul_b_operand<ConfigT>;
+  using AOp  = stored_operand<a_t, M, K, rowA, colA, ConfigT::TRANSPOSE_A, ConfigT::A_ROWS>;
+  using BOp  = stored_operand<b_t, K, N, colA, colB, ConfigT::TRANSPOSE_B, ConfigT::B_ROWS>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
@@ -82,24 +54,19 @@ void matmul_single<ConfigT>::run(input_buffer<a_t>& A,
     c_t* __restrict pC2 = pC + ((z + 1) * (colB / N) + 0) * MMUL::size_C;
 
     for (unsigned j = 0; j < colB / N; j += 2) {
-      const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
-      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
+      const a_t* __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const a_t* __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
+      const b_t* __restrict pB1 = pB +  j      * BOp::INNER_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::INNER_STEP;
 
       aie::vector<a_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_A) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      } else {
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
 
       aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
-      pB1 += BOp::K_STEP;
-      pB2 += BOp::K_STEP;
+      pB1 += BOp::OUTER_STEP;
+      pB2 += BOp::OUTER_STEP;
 
       MMUL C00; C00.mul(A0, B0);
       MMUL C01; C01.mul(A0, B1);
@@ -109,18 +76,13 @@ void matmul_single<ConfigT>::run(input_buffer<a_t>& A,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_A) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
         B0 = BOp::load(pB1);
         B1 = BOp::load(pB2);
-        pB1 += BOp::K_STEP;
-        pB2 += BOp::K_STEP;
+        pB1 += BOp::OUTER_STEP;
+        pB2 += BOp::OUTER_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);
@@ -148,31 +110,27 @@ void matmul_first<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int N    = ConfigT::N;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
-  using BOp  = matmul_b_operand<ConfigT>;
+  using AOp  = stored_operand<a_t, M, K, rowA, colA, ConfigT::TRANSPOSE_A, ConfigT::A_ROWS>;
+  using BOp  = stored_operand<b_t, K, N, colA, colB, ConfigT::TRANSPOSE_B, ConfigT::B_ROWS>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
 
   for (unsigned z = 0; z < rowA / M; z += 2) {
     for (unsigned j = 0; j < colB / N; j += 2) {
-      const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
-      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
+      const a_t* __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const a_t* __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
+      const b_t* __restrict pB1 = pB +  j      * BOp::INNER_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::INNER_STEP;
 
       aie::vector<a_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_A) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      } else {
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
 
       aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
-      pB1 += BOp::K_STEP;
-      pB2 += BOp::K_STEP;
+      pB1 += BOp::OUTER_STEP;
+      pB2 += BOp::OUTER_STEP;
 
       MMUL C00; C00.mul(A0, B0);
       MMUL C01; C01.mul(A0, B1);
@@ -182,18 +140,13 @@ void matmul_first<ConfigT>::run(input_buffer<a_t>& A,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_A) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
         B0 = BOp::load(pB1);
         B1 = BOp::load(pB2);
-        pB1 += BOp::K_STEP;
-        pB2 += BOp::K_STEP;
+        pB1 += BOp::OUTER_STEP;
+        pB2 += BOp::OUTER_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);
@@ -222,7 +175,8 @@ void matmul_middle<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int N    = ConfigT::N;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
-  using BOp  = matmul_b_operand<ConfigT>;
+  using AOp  = stored_operand<a_t, M, K, rowA, colA, ConfigT::TRANSPOSE_A, ConfigT::A_ROWS>;
+  using BOp  = stored_operand<b_t, K, N, colA, colB, ConfigT::TRANSPOSE_B, ConfigT::B_ROWS>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
@@ -239,24 +193,19 @@ void matmul_middle<ConfigT>::run(input_buffer<a_t>& A,
       MMUL C10; C10 = acc10;
       MMUL C11; C11 = acc11;
 
-      const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
-      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
+      const a_t* __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const a_t* __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
+      const b_t* __restrict pB1 = pB +  j      * BOp::INNER_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::INNER_STEP;
 
       aie::vector<a_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_A) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      } else {
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
 
       aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
-      pB1 += BOp::K_STEP;
-      pB2 += BOp::K_STEP;
+      pB1 += BOp::OUTER_STEP;
+      pB2 += BOp::OUTER_STEP;
 
       C00.mac(A0, B0);
       C01.mac(A0, B1);
@@ -266,18 +215,13 @@ void matmul_middle<ConfigT>::run(input_buffer<a_t>& A,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_A) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
         B0 = BOp::load(pB1);
         B1 = BOp::load(pB2);
-        pB1 += BOp::K_STEP;
-        pB2 += BOp::K_STEP;
+        pB1 += BOp::OUTER_STEP;
+        pB2 += BOp::OUTER_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);
@@ -307,7 +251,8 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
   static constexpr int SHIFT = ConfigT::SHIFT;
 
   using MMUL = aie::mmul<M, K, N, a_t, b_t, acc_scalar_t>;
-  using BOp  = matmul_b_operand<ConfigT>;
+  using AOp  = stored_operand<a_t, M, K, rowA, colA, ConfigT::TRANSPOSE_A, ConfigT::A_ROWS>;
+  using BOp  = stored_operand<b_t, K, N, colA, colB, ConfigT::TRANSPOSE_B, ConfigT::B_ROWS>;
 
   const a_t* pA = A.data();
   const b_t* pB = B.data();
@@ -318,10 +263,10 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
     c_t* __restrict pC2 = pC + ((z + 1) * (colB / N) + 0) * MMUL::size_C;
 
     for (unsigned j = 0; j < colB / N; j += 2) {
-      const a_t* __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
-      const a_t* __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const b_t* __restrict pB1 = pB +  j      * BOp::N_STEP;
-      const b_t* __restrict pB2 = pB + (j + 1) * BOp::N_STEP;
+      const a_t* __restrict pA1 = pA +  z      * AOp::OUTER_STEP;
+      const a_t* __restrict pA2 = pA + (z + 1) * AOp::OUTER_STEP;
+      const b_t* __restrict pB1 = pB +  j      * BOp::INNER_STEP;
+      const b_t* __restrict pB2 = pB + (j + 1) * BOp::INNER_STEP;
 
       MMUL C00(readincr_v<MMUL::size_C>(inCascade));
       MMUL C01(readincr_v<MMUL::size_C>(inCascade));
@@ -329,18 +274,13 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
       MMUL C11(readincr_v<MMUL::size_C>(inCascade));
 
       aie::vector<a_t, MMUL::size_A> A0, A1;
-      if constexpr (ConfigT::TRANSPOSE_A) {
-        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-      } else {
-        A0 = aie::load_v<MMUL::size_A>(pA1);
-        A1 = aie::load_v<MMUL::size_A>(pA2);
-      }
-      pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+      A0 = AOp::load(pA1);
+      A1 = AOp::load(pA2);
+      pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
 
       aie::vector<b_t, MMUL::size_B> B0 = BOp::load(pB1), B1 = BOp::load(pB2);
-      pB1 += BOp::K_STEP;
-      pB2 += BOp::K_STEP;
+      pB1 += BOp::OUTER_STEP;
+      pB2 += BOp::OUTER_STEP;
 
       C00.mac(A0, B0);  C01.mac(A0, B1);
       C10.mac(A1, B0);  C11.mac(A1, B1);
@@ -348,18 +288,13 @@ void matmul_last<ConfigT>::run(input_buffer<a_t>& A,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        if constexpr (ConfigT::TRANSPOSE_A) {
-          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
-          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
-        } else {
-          A0 = aie::load_v<MMUL::size_A>(pA1);
-          A1 = aie::load_v<MMUL::size_A>(pA2);
-        }
-        pA1 += MMUL::size_A; pA2 += MMUL::size_A;
+        A0 = AOp::load(pA1);
+        A1 = AOp::load(pA2);
+        pA1 += AOp::INNER_STEP; pA2 += AOp::INNER_STEP;
         B0 = BOp::load(pB1);
         B1 = BOp::load(pB2);
-        pB1 += BOp::K_STEP;
-        pB2 += BOp::K_STEP;
+        pB1 += BOp::OUTER_STEP;
+        pB2 += BOp::OUTER_STEP;
 
         C00.mac(A0, B0);
         C01.mac(A0, B1);
