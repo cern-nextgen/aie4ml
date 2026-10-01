@@ -375,8 +375,7 @@ def quantize_to_int(
     """Quantize float weight/bias data to fixed-point integers for mmul kernels."""
     if array is None:
         return None
-    scale = 1 << frac_bits if frac_bits > 0 else 1
-    scaled = np.asarray(array, dtype=np.float64) * scale
+    scaled = np.ldexp(np.asarray(array, dtype=np.float64), int(frac_bits))
     rounded = apply_rounding(scaled, rounding_mode)
     integers = rounded.astype(np.int64)
     processed = handle_overflow(integers, target_bits, signed, saturation_mode)

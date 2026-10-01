@@ -244,11 +244,7 @@ def dequantize_outputs(layout: IOLayout, outputs: Dict[str, np.ndarray]) -> Dict
     out: Dict[str, np.ndarray] = {}
     for tensor, arr in outputs.items():
         p0 = layout.outputs[tensor][0]
-        frac = max(0, int(p0.dtype.frac))
-        if frac == 0:
-            out[tensor] = arr.astype(np.float64, copy=False)
-        else:
-            out[tensor] = arr.astype(np.float64, copy=False) / float(1 << frac)
+        out[tensor] = np.ldexp(arr.astype(np.float64, copy=False), -int(p0.dtype.frac))
     return out
 
 
@@ -256,8 +252,7 @@ def _quantize_to_int(data: np.ndarray, dtype: AIEDataType) -> np.ndarray:
     if np.issubdtype(data.dtype, np.integer):
         return data.astype(dtype_for_precision(dtype.width, dtype.signed), copy=False)
 
-    scale = 1 << max(0, int(dtype.frac))
-    scaled = data * float(scale)
+    scaled = np.ldexp(np.asarray(data, dtype=np.float64), int(dtype.frac))
     rounded = apply_rounding(scaled, dtype.rounding)
     integers = rounded.astype(np.int64, copy=False)
     clipped = handle_overflow(integers, int(dtype.width), bool(dtype.signed), dtype.saturation)

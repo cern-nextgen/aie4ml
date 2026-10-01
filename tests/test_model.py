@@ -42,3 +42,16 @@ def test_a_configuration_changed_after_building_is_built_again(tmp_path, monkeyp
 
     model.context.reset_ir()
     assert model.context.emitted is None
+
+
+@pytest.mark.parametrize('frac', [3, 0, -2])
+def test_fixed_point_scaling_holds_for_a_step_coarser_than_one(frac):
+    """A negative frac (bit-exact types of coarse constants) scales by 2**frac like any other, never by 1."""
+    from aie4ml.aie_types import AIEDataType, RoundingMode, SaturationMode
+    from aie4ml.op_impls.families.matmul.common import quantize_to_int
+    from aie4ml.simulation import _quantize_to_int
+
+    values = np.array([-8.0, 4.0, 12.0])
+    codes = np.ldexp(values, frac).astype(np.int64)
+    assert np.array_equal(quantize_to_int(values, frac, 8, True, RoundingMode.RND, SaturationMode.SAT), codes)
+    assert np.array_equal(_quantize_to_int(values, AIEDataType('int8', frac=frac)), codes)

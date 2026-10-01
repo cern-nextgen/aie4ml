@@ -60,7 +60,7 @@ def pack_layernorm_param(
     if not np.all(np.isfinite(arr)):
         raise ValueError(f'LayerNorm parameter {name!r} contains non-finite values.')
 
-    scale = float(1 << int(frac)) if int(frac) > 0 else 1.0
+    scale = 2.0 ** int(frac)
     scaled = np.rint(arr * scale).astype(np.int64, copy=False)
 
     if signed:

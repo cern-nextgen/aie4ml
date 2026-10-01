@@ -142,7 +142,7 @@ def _create_weight_tensors(layer, graph: LogicalIR):
     else:
         # Pre-quantize raw bias with QKeras-compatible rounding so pack re-quantization is idempotent.
         raw_bias = getattr(bias_var, 'data_unquantized', bias_var.data)
-        delta = 1.0 / (1 << bias_intent.frac)
+        delta = 2.0 ** -int(bias_intent.frac)
         bias_data = np.round(np.asarray(raw_bias, dtype=np.float64) / delta) * delta
 
     bias_tv = TensorVar(
