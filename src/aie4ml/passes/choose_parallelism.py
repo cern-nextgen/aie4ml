@@ -3,10 +3,13 @@
 Resolution and the transport classifier stay the only judges of legality; user directives are constraints and are
 never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Designs are ranked by
 an estimate of their interval (the slowest kernel or leg) and latency (the critical path), in cycles (`estimate`):
-'performance' takes the lowest latency among the designs whose interval is within INTERVAL_TOLERANCE of the best,
-'resource' the fewest tiles, then the lowest latency.
+'performance' takes the lowest interval, then latency -- each to within INTERVAL_TOLERANCE, which the estimate cannot
+tell apart -- then the fewest tiles; 'resource' the fewest tiles, then the lowest latency.
 
-The search is bounded, not exhaustive: it keeps KEEP designs per state and tile count and builds at most
+It takes the layers in an order that keeps few tensors alive, since a state holds a layout per live tensor.
+'performance' first finds the lowest interval a design within the budget reaches, keeping only each state's
+fewest-tile design, then searches the designs within it. The search is bounded, not exhaustive: per state it keeps
+the designs no other beats on both tiles and latency, at most MAX_PARTIALS designs per layer, and builds at most
 MAX_PLACEMENT_TRIALS, so it reports a search limit unless it discarded nothing.
 """
 
@@ -15,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,10 +37,9 @@ from .transport.collect import TransportCollector
 log = logging.getLogger(__name__)
 
 MODES = ('performance', 'resource')
-KEEP = 4  # designs kept per state and tile count, so the next ones are at hand when placement refuses one
-MAX_PARTIALS = 50_000
+MAX_PARTIALS = 50_000  # partial designs kept past a layer; beyond it the search narrows
 MAX_PLACEMENT_TRIALS = 16
-INTERVAL_TOLERANCE = 0.1  # intervals the estimate cannot tell apart
+INTERVAL_TOLERANCE = 0.1  # cycle estimates this close the search cannot tell apart
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,42 @@ class _Design:
     chosen: Tuple[Tuple[str, Any], ...]  # (layer, instance)
     live: Tuple[Tuple[str, Any], ...]  # (tensor, producing instance)
     ready: Tuple[Tuple[str, int], ...]  # (live tensor, estimated cycle it is written by)
+
+
+def _step(cycles: int) -> int:
+    """`cycles` on a geometric grid INTERVAL_TOLERANCE apart."""
+    return int(math.log1p(cycles) / math.log1p(INTERVAL_TOLERANCE))
+
+
+def _fewest_live(layers: List[OpNode], reads: Dict[str, Tuple[str, ...]]) -> List[OpNode]:
+    """The layers in an order their reads allow that keeps few tensors alive between them. A search state holds a
+    layout per live tensor, so the states multiply with every tensor alive at once: attention's Q, K and V, taken in
+    model order, are all alive before Q.Kᵀ consumes two of them. Next is always the ready layer that adds the fewest
+    live tensors less those it reads last, the earliest in model order on a tie."""
+    producer = {t.name: node.name for node in layers for t in node.outputs}
+    readers = defaultdict(int)  # layers not yet taken that read each tensor
+    for node in layers:
+        for tensor in set(reads[node.name]):
+            readers[tensor] += 1
+    order: List[OpNode] = []
+    taken: set = set()
+    while len(order) < len(layers):
+        ready = [
+            node
+            for node in layers
+            if node.name not in taken and all(t not in producer or producer[t] in taken for t in reads[node.name])
+        ]
+
+        def growth(node: OpNode) -> int:
+            freed = sum(readers[t] == 1 for t in set(reads[node.name]))
+            return sum(readers[t.name] > 0 for t in node.outputs) - freed
+
+        node = min(ready, key=growth)
+        order.append(node)
+        taken.add(node.name)
+        for tensor in set(reads[node.name]):
+            readers[tensor] -= 1
+    return order
 
 
 class ChooseParallelism(AIEPass):
@@ -76,13 +115,18 @@ class ChooseParallelism(AIEPass):
         )
         search = _Search(ctx, mode, max_tiles)
         design, built, trials = search.best_buildable()
-        print(f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {search.compared} compared.', flush=True)
+        narrowed = f', narrowed after {len(search.narrowed)} layers' if search.narrowed else ''
+        print(
+            f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {search.compared} compared{narrowed}.',
+            flush=True,
+        )
         ctx.ir.optimizer = {
             'mode': mode,
             'max_tiles': max_tiles,
             'tiles': design.tiles,
             'memtile_legs': design.memtile,
             'designs_tried': trials,
+            'narrowed_after': sorted(search.narrowed),
             'parallelism': search.parallelism(design),
             # The trial already placed the design: pinning its places spares the placer a second search.
             'placement': {
@@ -99,7 +143,17 @@ class _Search:
         self.ctx = ctx
         self.mode = mode
         self.max_tiles = max_tiles
-        self.layers: List[OpNode] = [node for node in ctx.ir.logical if not node.is_folded_view]
+        self.values = logical_values(ctx.ir.logical)
+        # what each layer's legs read: its inputs, or the sources of a folded view it reads
+        self.reads: Dict[str, Tuple[str, ...]] = {}
+        layers = [node for node in ctx.ir.logical if not node.is_folded_view]
+        for node in layers:
+            views = [self.values[t.name].view for t in node.inputs if not t.is_parameter]
+            inputs = [t.name for t in node.inputs if not t.is_parameter]
+            self.reads[node.name] = tuple(
+                source for name, view in zip(inputs, views) for source in (view.sources if view else (name,))
+            )
+        self.layers: List[OpNode] = _fewest_live(layers, self.reads)
         registry = get_family_resolver_registry()
         self.options: Dict[str, List[Optional[Dict[str, Any]]]] = {}
         self.choosing = set()  # the layers the search picks a parallelism for; the rest resolve as they stand
@@ -117,20 +171,12 @@ class _Search:
             if offered:
                 self.choosing.add(node.name)
             self.options[node.name] = offered or [None]
-        self.values = logical_values(ctx.ir.logical)
         self.graph_inputs = tuple(ctx.ir.logical.input_tensor_names)
         self.graph_outputs = tuple(ctx.ir.logical.output_tensor_names)
-        # what each layer's legs read -- its inputs, or the sources of a folded view it reads -- and after which
-        # layer each tensor is read no more: a tensor stays in the state until then
-        self.reads: Dict[str, Tuple[str, ...]] = {}
-        self.last_read: Dict[str, int] = {}
-        for position, node in enumerate(self.layers):
-            views = [self.values[t.name].view for t in node.inputs if not t.is_parameter]
-            inputs = [t.name for t in node.inputs if not t.is_parameter]
-            self.reads[node.name] = tuple(
-                source for name, view in zip(inputs, views) for source in (view.sources if view else (name,))
-            )
-            self.last_read.update({tensor: position for tensor in self.reads[node.name]})
+        # after which layer each tensor is read no more: a tensor stays in the state until then
+        self.last_read: Dict[str, int] = {
+            tensor: position for position, node in enumerate(self.layers) for tensor in self.reads[node.name]
+        }
         # how many layers read each tensor: a tensor more than one reads is copied to each, never shared
         self.readers: Dict[str, int] = defaultdict(int)
         for tensors in self.reads.values():
@@ -139,6 +185,7 @@ class _Search:
         self.refusals: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         self.intervals: set = set()  # every layer's estimated interval met, the bounds a performance search tries
         self.truncated = False  # whether the program has discarded a design since last reset
+        self.narrowed: set = set()  # the layers past which the search kept only MAX_PARTIALS designs
         self._resolved: Dict[Any, Any] = {}
         self._legs_cache: Dict[Any, Any] = {}
         self.compared = 0  # distinct complete designs within the budget that best_buildable ranked
@@ -247,9 +294,10 @@ class _Search:
 
     # -- the dynamic program ------------------------------------------------------------------------
 
-    def designs(self, bound: Optional[int]) -> List[_Design]:
-        """The complete designs whose estimated interval stays within `bound`, as the program keeps them."""
-        frontier = {((), 0): [_Design(0, 0, 0, 0, (), (), ())]}
+    def designs(self, bound: Optional[int] = None, fewest: bool = False) -> List[_Design]:
+        """The complete designs whose estimated interval stays within `bound`, as the program keeps them; with
+        `fewest`, only each state's fewest-tile one, which tells whether any design completes within the budget."""
+        frontier = {(): [_Design(0, 0, 0, 0, (), (), ())]}
         for position, node in enumerate(self.layers):
             grown: Dict[Any, List[_Design]] = defaultdict(list)
             for designs in frontier.values():
@@ -280,7 +328,7 @@ class _Search:
                             start = max((0 if src in self.graph_inputs else ready[src]) + cc for src, cc, _ in legs_in)
                             ready.update({t: start + kernel_cc for t in kernel.outputs})
                         finish = max(ready[t] for t in inst.outputs)
-                        grown[(state, total)].append(
+                        grown[state].append(
                             _Design(
                                 design.memtile + memtile,
                                 total,
@@ -291,42 +339,76 @@ class _Search:
                                 tuple((t, ready[t]) for t in kept),
                             )
                         )
-            # Designs sharing a state and tile count have the same futures: keeping KEEP of them loses alternatives
-            # for placement, never feasibility, so an empty result still proves no design resolves.
-            self.truncated |= any(len(found) > KEEP for found in grown.values())
-            frontier = {key: sorted(found, key=self._rank)[:KEEP] for key, found in grown.items()}
+            frontier = {state: self._kept(found, fewest) for state, found in grown.items()}
             if sum(len(found) for found in frontier.values()) > MAX_PARTIALS:
-                raise RuntimeError(
-                    f'choose_parallelism: over {MAX_PARTIALS} partial designs at {node.name}; give some layers a '
-                    'parallelism directive to narrow the search.'
-                )
+                frontier = self._narrow(node, frontier)
         return [design for found in frontier.values() for design in found]
+
+    def _narrow(self, node: OpNode, frontier: Dict[Any, List[_Design]]) -> Dict[Any, List[_Design]]:
+        """MAX_PARTIALS of the designs: each state's fewest-tile one, which can be completed within the budget
+        whenever any of its state's can, so narrowing loses no feasible design, then the best of the others."""
+        if len(frontier) > MAX_PARTIALS:
+            raise RuntimeError(
+                f'choose_parallelism: over {MAX_PARTIALS} search states at {node.name}; give some layers a '
+                'parallelism directive to narrow the search.'
+            )
+        self.narrowed.add(node.name)
+        self.truncated = True
+        kept = {state: [min(found, key=lambda design: design.tiles)] for state, found in frontier.items()}
+        others = sorted(
+            ((state, design) for state, found in frontier.items() for design in found if design is not kept[state][0]),
+            key=lambda item: self._rank(item[1]),
+        )
+        for state, design in others[: MAX_PARTIALS - len(kept)]:
+            kept[state].append(design)
+        return kept
+
+    def _kept(self, designs: List[_Design], fewest: bool) -> List[_Design]:
+        """The designs of one state the search carries on: those no other beats on both tiles and latency, latencies
+        to within INTERVAL_TOLERANCE, or with `fewest` the fewest-tile one alone. Designs sharing a state have the
+        same futures, so this keeps every trade of tiles spent here against tiles left for later layers: one beaten
+        on both only completes as a design beaten on both, and the fewest-tile one completes within the budget
+        whenever any does. Intervals need no such trade: `best_buildable` bounds them. One design per point of the
+        front: ties placement refuses alike would spend its trials on one failure."""
+        ordered = sorted(designs, key=lambda design: (design.tiles, _step(design.latency), *self._rank(design)))
+        kept = ordered[:1]
+        for design in ordered[1:] if not fewest else ():
+            if _step(design.latency) < _step(kept[-1].latency):
+                kept.append(design)
+        self.truncated |= not fewest and len(designs) > len(kept)
+        return kept
 
     def _rank(self, design: _Design) -> tuple:
         if self.mode == 'resource':
             return (design.tiles, design.latency, design.interval)
-        return (design.latency, design.interval, design.tiles)
+        # intervals, then latencies, within INTERVAL_TOLERANCE of each other the estimate cannot tell apart: of
+        # those, the fewest tiles
+        return (_step(design.interval), _step(design.latency), design.tiles, design.interval, design.latency)
 
     def best_buildable(self) -> Tuple[_Design, Any, int]:
         """The best-ranked design the rest of the pipeline builds, the context it was built in, and how many
         designs were tried."""
         bounds: List[Optional[int]] = [None]
-        complete = self.designs(None)  # resolves every option, so each one's interval is known
-        self.compared = len({json.dumps(self.parallelism(design), sort_keys=True) for design in complete})
         if self.mode == 'performance':
-            bounds = sorted(self.intervals)
-            low, high = 0, len(bounds)  # designs exist from some bound on
-            while low < high:
-                middle = (low + high) // 2
-                low, high = (low, middle) if self.designs(bounds[middle]) else (middle + 1, high)
-            # the lowest latency among the designs within the tolerance of the best interval, then the next
-            # bounds up, should placement refuse them all
-            within = [i for i in bounds[low:] if i <= bounds[low] * (1 + INTERVAL_TOLERANCE)]
-            bounds = bounds[low + len(within) - 1 :] if within else []
-        tried, unbuilt = set(), defaultdict(int)
+            # each grid step's widest interval met, from the lowest step any design completes within on
+            bounds = []
+            if self.designs(fewest=True):  # also resolves every option it meets
+                widest = {}
+                for interval in self.intervals:
+                    widest[_step(interval)] = max(interval, widest.get(_step(interval), 0))
+                bounds = [widest[step] for step in sorted(widest)]
+                low, high = 0, len(bounds) - 1
+                while low < high:
+                    middle = (low + high) // 2
+                    low, high = (low, middle) if self.designs(bounds[middle], fewest=True) else (middle + 1, high)
+                bounds = bounds[low:]
+        tried, compared, unbuilt = set(), set(), defaultdict(int)
         self.truncated = False
         for bound in bounds:
-            for design in sorted(self.designs(bound), key=self._rank):
+            complete = self.designs(bound)
+            compared.update(json.dumps(self.parallelism(design), sort_keys=True) for design in complete)
+            self.compared = len(compared)
+            for design in sorted(complete, key=self._rank):
                 key = json.dumps(self.parallelism(design), sort_keys=True)
                 if key in tried:
                     continue
@@ -345,11 +427,7 @@ class _Search:
             raise ConfigRefused(
                 self._failure(f'none of the {len(tried)} designs within the tile budget can be built', unbuilt)
             )
-        raise RuntimeError(
-            self._failure(
-                f'search limit: none of the {len(tried)} designs kept ({KEEP} per search state) can be built', unbuilt
-            )
-        )
+        raise RuntimeError(self._failure(f'search limit: none of the {len(tried)} designs kept can be built', unbuilt))
 
     def parallelism(self, design: _Design) -> Dict[str, Dict[str, Any]]:
         """The parallelism the design resolved each chosen layer to."""
