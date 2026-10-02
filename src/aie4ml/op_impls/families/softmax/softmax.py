@@ -111,7 +111,8 @@ class _SoftmaxVariantBase(OpImplVariant):
         in_shape = tuple(int(x) for x in view_shape(node, in_tensor, 'inputs'))
         full_inner, outer_prefix, last_outer = extract_inner_outer(in_shape)
         vec_size = softmax_vec_size(precision['lhs'], device)
-        if full_inner % vec_size != 0:
+        microtile = self.resolve_microtile(node, input_contracts)
+        if microtile is None and full_inner % vec_size != 0:  # the tiled kernels check their microtile instead
             raise ValueError(
                 f'{node.name}: softmax axis length {full_inner} must be a multiple of vec_size={vec_size}; '
                 'pad the softmax dimension before lowering.'
@@ -123,6 +124,7 @@ class _SoftmaxVariantBase(OpImplVariant):
 
         in_bpp = storage_bytes_for_spec(precision['lhs'])
         out_bpp = storage_bytes_for_spec(precision['output'])
+        scratch_rows = microtile.outer if microtile else 1  # the int16 scores kept between passes
         cas_num, tile_outer = find_tile_split(
             partition_size=last_outer,
             max_rows=max(1, int(device.rows) - int(device.row_start)),
@@ -130,7 +132,7 @@ class _SoftmaxVariantBase(OpImplVariant):
             tile_bytes_fn=lambda to: max(
                 outer_prefix * to * full_inner * in_bpp,
                 outer_prefix * to * full_inner * out_bpp,
-                full_inner * 2,
+                scratch_rows * full_inner * 2,
             ),
             parallel_cfg=parallel_cfg,
             input_contracts=input_contracts,
@@ -138,7 +140,6 @@ class _SoftmaxVariantBase(OpImplVariant):
             contract='outer',
         )
 
-        microtile = self.resolve_microtile(node, input_contracts)
         io_views = build_io_views(
             node,
             [in_tensor],

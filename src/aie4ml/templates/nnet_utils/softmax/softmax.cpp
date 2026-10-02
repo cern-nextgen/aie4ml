@@ -230,11 +230,11 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
     const in_t*  __restrict in_ptr  = in.data();
           out_t* __restrict out_ptr = out.data();
 
-    const int16_t B    = B_param;
+    const int32_t B    = B_param;
     const int8_t  S    = S_param;
-    const int16_t DMAX = (int16_t)DMAX_param;
-
-    const aie::vector<int16, BLK> dmax_v = aie::broadcast<int16, BLK>(DMAX);
+    const int32_t DMAX = DMAX_param;
+    const aie::vector<int8, BLK> s_v = aie::broadcast<int8, BLK>(S);
+    const aie::vector<int16, BLK> nb_v = aie::broadcast<int16, BLK>((int16)NB);
 
     for (int bm = 0; bm < ROWS / MT_OUTER; ++bm) {
         const in_t*  __restrict band = in_ptr  + bm * NB * BLK;
@@ -247,32 +247,32 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
         for (int step = MT_INNER / 2; step >= 1; step >>= 1)
             vmax = aie::max(vmax, aie::shuffle_down(vmax, step));
 
-        // Lane m*MT_INNER holds row m's max; spread it back to its lane group (int16 so every
-        // vector piece is a legal width). max-x stays non-negative and <=255, so the int16
-        // subtraction reproduces the linear kernel's uint8 difference exactly.
-        int16_t row_max[STAT_LANES] = {};
-        for (int m = 0; m < MT_OUTER; ++m) row_max[m] = (int16_t)vmax.get(m * MT_INNER);
-        const aie::vector<int16, BLK> max16 = spread_rows<int16, MT_OUTER, MT_INNER>(row_max);
-
-        // ---- pass 2: scores and per-row sum (segmented add) ----
-        aie::vector<int32, BLK> ssum = aie::zeros<int32, BLK>();
-        for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
-            const aie::vector<int16, BLK> vx16 = aie::from_vector<acc_t>(vx).template to_vector<int16>(0);
-            aie::vector<int16, BLK> d = aie::min(aie::sub(max16, vx16), dmax_v);   // min(max-x, DMAX)
-            aie::accum<acc_t, BLK> acc;
-            acc.from_vector(aie::broadcast<int32, BLK>(B));
-            acc = aie::mac(acc, d, aie::broadcast<int16, BLK>((int16_t)(-S)));     // score = B - S*d
-            ssum = aie::add(ssum, acc.template to_vector<int32>(0));
+        // min(max-x, DMAX) = max - max(x, lo), lo = max-DMAX clamped to int8 (below -128 no x reaches it),
+        // so score = B - S*(max - y) = c + S*y with y = max(x, lo) and c = B - S*max.
+        int16_t lo16[STAT_LANES] = {}, c16[STAT_LANES] = {};
+        for (int m = 0; m < MT_OUTER; ++m) {
+            const int32_t row_max = vmax.get(m * MT_INNER);
+            lo16[m] = (int16_t)(row_max - DMAX < -128 ? -128 : row_max - DMAX);
+            c16[m] = (int16_t)(B - S * row_max);
         }
-        // Segmented sum -> row totals, reduced in <=32-lane pieces: a shuffle_down across a
-        // 64-lane int32 vector (2048-bit) does not compose into a full logical shift, but a
-        // 32-lane (1024-bit) one does. Only the int32 sum needs this; the int8 max and the wide
-        // loads stay whole.
+        const aie::vector<int8, BLK> lo_v =
+            aie::accum<acc_t, BLK>(spread_rows<int16, MT_OUTER, MT_INNER>(lo16)).template to_vector<int8>(0);
+        const aie::vector<int16, BLK> c_v = spread_rows<int16, MT_OUTER, MT_INNER>(c16);
+        const aie::accum<acc_t, BLK> c_acc(c_v);
+
+        // ---- pass 2: scores to the scratch band, and their per-row sum Z = NB*c + S*sum(y) per lane ----
+        aie::accum<acc_t, BLK> zsum = aie::mul(c_v, nb_v);
+        for (int bn = 0; bn < NB; ++bn) {
+            const aie::vector<int8, BLK> y =
+                aie::max(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK), lo_v);
+            *aie::begin_vector<BLK>(scores_ + bn * BLK) = aie::mac(c_acc, y, s_v).template to_vector<int16>(0);
+            zsum = aie::mac(zsum, y, s_v);
+        }
+        aie::vector<int32, BLK> zv = zsum.template to_vector<int32>(0);
         int32_t sum[STAT_LANES] = {};
         constexpr int SUB = (BLK < 32) ? BLK : 32;
         for (int sb = 0; sb < BLK / SUB; ++sb) {
-            aie::vector<int32, SUB> sv = ssum.template extract<SUB>(sb);
+            aie::vector<int32, SUB> sv = zv.template extract<SUB>(sb);
             for (int step = MT_INNER / 2; step >= 1; step >>= 1)
                 sv = aie::add(sv, aie::shuffle_down(sv, step));
             for (int g = 0; g < SUB / MT_INNER; ++g)
@@ -287,25 +287,13 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
             base::template batched_reciprocal<STAT_LANES>(sum, invq);
         }
         int16_t inv16[STAT_LANES] = {};
-        for (int m = 0; m < MT_OUTER; ++m) {
-            const int32_t v = invq[m];
-            inv16[m] = (int16_t)(v > 32767 ? 32767 : (v < 0 ? 0 : v));
-        }
+        for (int m = 0; m < MT_OUTER; ++m) inv16[m] = (int16_t)invq[m];   // <= 32767: Z >= 256 by the HCCS constraints
         const aie::vector<int16, BLK> inv_v = spread_rows<int16, MT_OUTER, MT_INNER>(inv16);
 
-        // ---- pass 3: normalise (recompute the score, then scale) ----
+        // ---- pass 3: normalise the stored scores ----
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
-            const aie::vector<int16, BLK> vx16 = aie::from_vector<acc_t>(vx).template to_vector<int16>(0);
-            aie::vector<int16, BLK> d = aie::min(aie::sub(max16, vx16), dmax_v);
-            aie::accum<acc_t, BLK> acc;
-            acc.from_vector(aie::broadcast<int32, BLK>(B));
-            acc = aie::mac(acc, d, aie::broadcast<int16, BLK>((int16_t)(-S)));
-            const aie::vector<int16, BLK> score16 = acc.template to_vector<int16>(0);
-
-            aie::accum<acc_t, BLK> prod = aie::mul(score16, inv_v);
-            auto vout = aie::begin_vector<BLK>(dst + bn * BLK);
-            *vout = prod.template to_vector<out_t>(OUT_SHIFT);
+            const aie::vector<int16, BLK> score16 = *aie::cbegin_vector<BLK>(scores_ + bn * BLK);
+            *aie::begin_vector<BLK>(dst + bn * BLK) = aie::mul(score16, inv_v).template to_vector<out_t>(OUT_SHIFT);
         }
     }
 }

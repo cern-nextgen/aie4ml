@@ -107,6 +107,7 @@ private:
     int16_t B_param;
     int8_t S_param;
     uint8_t DMAX_param;
+    alignas(aie::vector_decl_align) int16_t scores_[NB * BLK];  // one row band's scores, between passes 2 and 3
 };
 
 
