@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from aie4ml.errors import ConfigRefused
 from aie4ml.ir.graph import shard_major_order
+from aie4ml.op_impls.families.conv2d import halo
 from aie4ml.op_impls.utils.tensor_view import staging_tile_shape
 from helpers import (
     PART,
@@ -1348,10 +1349,18 @@ def test_channel_chains_of_a_flattened_conv_match_onnx(tmp_path, part):
     )
 
 
-def test_row_bands_on_aie1_refuse_a_tile_short_of_dma_channels(tmp_path):
-    """On AIE1 the halo rows of an odd-row band travel by DMA, and the middle conv's odd row sends two of them beside
-    its output to the Dense: three MM2S buffers on one tile, which has two channels. Refused before Vitis, whose
-    placer would only report a failed placement."""
+def test_row_bands_on_aie1_do_not_relay_a_halo(tmp_path):
+    """A band that reads its halo and sends its own edge rows on deadlocked AIE1 in aiesim: refused there."""
+    chain = {name: {'parallelism': {'contract': 'outer', 'cas_num': 2}} for name in ('b', 'd', 'e')}
+    with pytest.raises(ConfigRefused, match=r'd_aie: its row bands would read their halo and send their edge rows on'):
+        lower(_halo_chain_model(), tmp_path, {**chain, 'fc': {'parallelism': {'cas_length': 2}}}, part=AIE1_PART)
+
+
+def test_row_bands_on_aie1_refuse_a_tile_short_of_dma_channels(tmp_path, monkeypatch):
+    """On AIE1 the halo rows of an odd-row band travel by DMA, and a relaying middle conv's odd row sends two of them
+    beside its output to the Dense: three MM2S buffers on one tile, which has two channels. Refused before Vitis,
+    whose placer would only report a failed placement."""
+    monkeypatch.setattr(halo, 'RELAYING_BANDS', halo.RELAYING_BANDS | {'AIE'})
     with pytest.raises(ConfigRefused, match=r'3 buffers need its MM2S DMA .* which has 2 channels'):
         lower(_halo_chain_model(), tmp_path, HALO_CHAIN, part=AIE1_PART)
 

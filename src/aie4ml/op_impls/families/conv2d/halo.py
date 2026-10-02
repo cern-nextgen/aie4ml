@@ -20,6 +20,11 @@ from .common import (
 from .config import Conv2dConfig
 from .conv2d import Conv2dOpImplVariant
 
+# Generations where a band may relay: read its halo from its neighbours and send its own edge rows on. On AIE1 a chain
+# of three banded convs into a Dense stalled every core after its first sample in aiesim (Vitis 2026.1.1), whatever
+# the rows or channels; a pair of banded convs, with or without the Dense, ran exact.
+RELAYING_BANDS = frozenset({'AIE-ML', 'AIE-MLV2'})
+
 
 def _reads_halo(node: OpNode) -> bool:
     """Whether its window reads rows of the neighbouring bands, which another kernel's bands write."""
@@ -68,6 +73,11 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         config = super().resolve(node, device, directives, input_contracts)
         if not _reads_halo(node):
             return config
+        if any(_sent_rows(node)) and device.generation not in RELAYING_BANDS:
+            raise ConfigRefused(
+                f'{node.name}: its row bands would read their halo and send their edge rows on, which deadlocks on '
+                f'{device.generation}; split it, or the conv after it, by channels.'
+            )
         lhs = input_tensor_for_role(node, 'lhs')
         spatial = config.spatial
         top, _, bottom, _ = spatial.pads
