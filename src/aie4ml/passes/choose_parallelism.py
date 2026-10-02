@@ -4,13 +4,14 @@ Resolution and the transport classifier stay the only judges of legality; user d
 never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Designs are ranked by
 an estimate of their interval (the slowest kernel or leg) and latency (the critical path), in cycles (`estimate`):
 'performance' takes the lowest interval, then latency -- each to within INTERVAL_TOLERANCE, which the estimate cannot
-tell apart -- then the fewest tiles; 'resource' the fewest tiles, then the lowest latency.
+tell apart -- then the fewest memory-tile legs and tiles; 'resource' the fewest tiles, then memory-tile legs, then the
+lowest latency.
 
 It takes the layers in an order that keeps few tensors alive, since a state holds a layout per live tensor.
 'performance' first finds the lowest interval a design within the budget reaches, keeping only each state's
 fewest-tile design, then searches the designs within it. The search is bounded, not exhaustive: per state it keeps
-the designs no other beats on both tiles and latency, at most MAX_PARTIALS designs per layer, and builds at most
-MAX_PLACEMENT_TRIALS, so it reports a search limit unless it discarded nothing.
+the designs no other beats on tiles, latency and memory-tile legs, at most MAX_PARTIALS designs per layer, and builds
+at most MAX_PLACEMENT_TRIALS, so it reports a search limit unless it discarded nothing.
 """
 
 from __future__ import annotations
@@ -364,26 +365,37 @@ class _Search:
         return kept
 
     def _kept(self, designs: List[_Design], fewest: bool) -> List[_Design]:
-        """The designs of one state the search carries on: those no other beats on both tiles and latency, latencies
-        to within INTERVAL_TOLERANCE, or with `fewest` the fewest-tile one alone. Designs sharing a state have the
-        same futures, so this keeps every trade of tiles spent here against tiles left for later layers: one beaten
-        on both only completes as a design beaten on both, and the fewest-tile one completes within the budget
-        whenever any does. Intervals need no such trade: `best_buildable` bounds them. One design per point of the
-        front: ties placement refuses alike would spend its trials on one failure."""
-        ordered = sorted(designs, key=lambda design: (design.tiles, _step(design.latency), *self._rank(design)))
-        kept = ordered[:1]
-        for design in ordered[1:] if not fewest else ():
-            if _step(design.latency) < _step(kept[-1].latency):
-                kept.append(design)
-        self.truncated |= not fewest and len(designs) > len(kept)
-        return kept
+        """The designs of one state the search carries on: those no other beats on tiles, latency and memory-tile
+        legs at once, latencies to within INTERVAL_TOLERANCE, or with `fewest` the fewest-tile one alone. Designs
+        sharing a state have the same futures, so this keeps every trade of tiles spent here against tiles left for
+        later layers, and a direct design beside a cheaper one through memory tiles: one beaten on all three only
+        completes as a design beaten on all three, and the fewest-tile one completes within the budget whenever any
+        does. Intervals need no such trade: `best_buildable` bounds them. One design per point of the front: ties
+        placement refuses alike would spend its trials on one failure."""
+        ordered = sorted(designs, key=lambda d: (d.tiles, _step(d.latency), d.memtile, *self._rank(d)))
+        if fewest:
+            return ordered[:1]
+        kept: List[Tuple[int, int, _Design]] = []
+        for design in ordered:
+            latency = _step(design.latency)
+            if not any(other <= latency and memtile <= design.memtile for other, memtile, _ in kept):
+                kept.append((latency, design.memtile, design))
+        self.truncated |= len(designs) > len(kept)
+        return [design for *_, design in kept]
 
     def _rank(self, design: _Design) -> tuple:
         if self.mode == 'resource':
-            return (design.tiles, design.latency, design.interval)
+            return (design.tiles, design.memtile, design.latency, design.interval)
         # intervals, then latencies, within INTERVAL_TOLERANCE of each other the estimate cannot tell apart: of
-        # those, the fewest tiles
-        return (_step(design.interval), _step(design.latency), design.tiles, design.interval, design.latency)
+        # those, the fewest memory-tile legs, then the fewest tiles
+        return (
+            _step(design.interval),
+            _step(design.latency),
+            design.memtile,
+            design.tiles,
+            design.interval,
+            design.latency,
+        )
 
     def best_buildable(self) -> Tuple[_Design, Any, int]:
         """The best-ranked design the rest of the pipeline builds, the context it was built in, and how many
