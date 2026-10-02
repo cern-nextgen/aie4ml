@@ -115,7 +115,8 @@ def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
     """Why a PLIO cannot feed or drain this graph-boundary leg's kernel ports through the tile's own DMA, or None.
     That DMA writes only the logical elements: padding rows may hold anything, since no row reads another, but an
     input padded along its inner axis is summed across it, so only a memory tile, which zero-fills, may feed it.
-    Nor may one port's walk need more BDs than a tile has."""
+    Nor may one port's walk need more BDs than its tile has beside the kernel's other buffer ports there, each of
+    which a DMA may feed wherever the kernel is placed."""
     output = leg.consumer is None
     endpoint = leg.producer if output else leg.consumer
     inst = execution.get(endpoint.node.name)
@@ -141,12 +142,29 @@ def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
             return str(refusal)
         walk = None if describes_natural_order(access) else access
         bds = tile_port_bds(walk, KERNEL_BUFFERS, device.tile_dma, device.generation, element.width)
-        if bds > device.tile_dma.bds:
+        neighbours = _ports_beside(inst, endpoint.group, port)
+        if bds + KERNEL_BUFFERS * neighbours > device.tile_dma.bds:
             return (
-                f'{endpoint.node.name}.{endpoint.group}[{port}] walks its layout with {bds} BDs, past a tile of '
-                f'{device.tile_dma.bds}'
+                f'{endpoint.node.name}.{endpoint.group}[{port}] walks its layout with {bds} BDs, beside '
+                f'{neighbours} other buffer port(s), past a tile of {device.tile_dma.bds}'
             )
     return None
+
+
+def _ports_beside(inst, group: str, port: int) -> int:
+    """How many of the kernel's other buffer ports share the tile memory one port is pinned to, the most over the
+    anchor rows' parities (AIE1 mirrors its banks on odd rows)."""
+    most = 0
+    for anchor_row in (0, 1):
+        locations = inst.variant.buffer_locations(inst.node, inst.config, anchor_row)
+        tiles = {(loc.rel_col, loc.rel_row) for loc in locations if loc.port_group == group and loc.port == port}
+        beside = {
+            (loc.port_group, loc.port)
+            for loc in locations
+            if (loc.rel_col, loc.rel_row) in tiles and (loc.port_group, loc.port) != (group, port)
+        }
+        most = max(most, len(beside))
+    return most
 
 
 def _inner_shards_failure(leg: Connection, execution) -> str | None:
