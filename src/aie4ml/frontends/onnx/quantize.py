@@ -32,6 +32,26 @@ def _pin_if_unset(tensor, intent: QuantIntent, *, force_signed: bool) -> None:
     )
 
 
+def _pin_back(tensor, intent: QuantIntent, *, force_signed: bool = False) -> None:
+    """Pin the un-quantized tensors a Quantize reaches back through a Relu, a scale or a bias add -- a Dense's
+    accumulator behind MatMul -> Add -> Relu, say -- to its intent; signed behind a Relu, which clips the sign."""
+    producer = tensor.producer
+    if producer is None:
+        return
+    if producer.op_type == 'activation' and producer.metadata.get('activation') == 'relu':
+        behind, force_signed = producer.inputs[:1], True
+    elif producer.op_type in ('scale', 'add'):
+        behind = producer.inputs if producer.op_type == 'add' else producer.inputs[:1]
+        if producer.op_type == 'scale':
+            producer.metadata['before_quantizer'] = True  # it belongs to its producer's requantization
+    else:
+        return
+    for source in behind:
+        if source is not None and not source.is_parameter and source.precision is None:
+            _pin_if_unset(source, intent, force_signed=force_signed)
+            _pin_back(source, intent, force_signed=force_signed)
+
+
 @onnx_handler('QuantizeLinear')
 def _quantize_linear(ctx: OnnxImportContext, node, node_name: str, _directives: dict) -> None:
     if len(node.input) != 3:
@@ -50,23 +70,12 @@ def _quantize_linear(ctx: OnnxImportContext, node, node_name: str, _directives: 
         relu_producer = (
             producer is not None and producer.op_type == 'activation' and producer.metadata.get('activation') == 'relu'
         )
-        scale_producer = producer is not None and producer.op_type == 'scale'
-
-        add_producer = producer is not None and producer.op_type == 'add'
-
         if tensor.precision is None:
-            if relu_producer:
-                _pin_if_unset(producer.inputs[0], intent, force_signed=True)
-            elif scale_producer:
-                _pin_if_unset(producer.inputs[0], intent, force_signed=False)
-            elif add_producer:
-                # A dense accumulator feeding a bias add carries the add's requant precision.
-                for inp in producer.inputs:
-                    _pin_if_unset(inp, intent, force_signed=False)
+            _pin_back(tensor, intent)
             tensor.precision = intent
         elif tensor.precision != intent:
             if relu_producer:
-                _pin_if_unset(producer.inputs[0], intent, force_signed=True)
+                _pin_back(tensor, intent)
                 tensor.precision = intent
             else:
                 raise ValueError(f'{node_name}: QuantizeLinear intent does not match source tensor precision.')

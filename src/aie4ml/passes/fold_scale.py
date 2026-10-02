@@ -39,7 +39,9 @@ class FoldScale(AIEPass):
             consumers = list(scale_node.outputs[0].consumers)
             producer = in_tensor.producer
 
-            consumer = consumers[0] if len(consumers) == 1 else None
+            # A scale before its quantizer scales what is quantized: only the producer's requantization applies it
+            # exactly. One after reads quantized codes, which a consumer can scale as it reads them.
+            consumer = consumers[0] if len(consumers) == 1 and not scale_node.metadata.get('before_quantizer') else None
             if consumer is not None and _SCALE_ABSORBERS.get(consumer.op_type) == 'input_scale':
                 _accumulate_scale(consumer, 'input_scale', scale)
                 graph.remove_node(scale_node, mode='bypass')
