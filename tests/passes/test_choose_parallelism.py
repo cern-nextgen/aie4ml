@@ -12,7 +12,19 @@ from aie4ml.passes import choose_parallelism, placement
 from aie4ml.passes.resolve import resolve_instance
 from frontends.test_onnx_aie1 import _dense_model, _normalization_chain_model
 from frontends.test_onnx_aie1_views import _split_model
-from helpers import PART, TensorProto, assert_aie_matches_onnx, helper, lower, make_model, memtiles
+from helpers import (
+    PART,
+    TensorProto,
+    assert_aie_matches_onnx,
+    dq,
+    helper,
+    lower,
+    make_model,
+    memtiles,
+    numpy_helper,
+    qdq,
+    qparams,
+)
 from ops.test_conv2d import AIE1_PART, MLV2_PART, H, W, _conv, _start, _strided_chain_model
 
 PARTS = {'aie1': AIE1_PART, 'aie-ml': PART, 'aie-mlv2': MLV2_PART}
@@ -200,6 +212,80 @@ def test_dense_offers_splits_its_tiling_pads(tmp_path):
 def test_an_unknown_mode_is_refused(tmp_path):
     with pytest.raises(ValueError, match="Optimize='fast'"):
         lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'fast'})
+
+
+def _encoder_model(tokens=16, features=64, ffn=128):
+    """One pre-LN transformer block: LayerNorm, Q/K/V, Q.K^T, Softmax, .V, projection and residual Add, then
+    LayerNorm, a ReLU MLP and residual Add. Q, K and V alive at once multiply the search's states."""
+    rng = np.random.default_rng(0)
+    nodes: list = []
+    inits: list = [*qparams('x')]
+    dq(nodes, 'x_q', 'x', 'x')
+
+    def dense(src, name, k, n, relu=False):
+        dq(nodes, f'{name}_wq', f'{name}_w', f'{name}_w')
+        nodes.append(helper.make_node('MatMul', [src, f'{name}_w'], [f'{name}_mm'], name=name))
+        out = f'{name}_mm'
+        if relu:
+            nodes.append(helper.make_node('Relu', [out], [f'{name}_relu']))
+            out = f'{name}_relu'
+        qdq(nodes, out, f'{name}_out', f'{name}_o')
+        inits.extend([*qparams(f'{name}_w', frac=6), *qparams(f'{name}_o', unsigned=relu)])
+        inits.append(numpy_helper.from_array(rng.integers(-3, 4, (k, n), dtype=np.int8), f'{name}_wq'))
+        return f'{name}_out'
+
+    def layernorm(src, name):
+        inits.extend(
+            [
+                numpy_helper.from_array(np.ones(features, np.float32), f'{name}_g'),
+                numpy_helper.from_array(np.zeros(features, np.float32), f'{name}_b'),
+            ]
+        )
+        nodes.append(
+            helper.make_node(
+                'LayerNormalization', [src, f'{name}_g', f'{name}_b'], [f'{name}_ln'], name=name, epsilon=2.0**-8
+            )
+        )
+        qdq(nodes, f'{name}_ln', f'{name}_out', f'{name}_o')
+        inits.extend(qparams(f'{name}_o', frac=5))
+        return f'{name}_out'
+
+    def add(a, b, name):
+        nodes.append(helper.make_node('Add', [a, b], [f'{name}_sum'], name=name))
+        qdq(nodes, f'{name}_sum', f'{name}_out', f'{name}_o')
+        inits.extend(qparams(f'{name}_o'))
+        return f'{name}_out'
+
+    h = layernorm('x', 'ln1')
+    q, k, v = (dense(h, name, features, features) for name in 'qkv')
+    nodes.append(helper.make_node('Transpose', [k], ['k_t'], perm=[1, 0], name='k_t'))
+    nodes.append(helper.make_node('MatMul', [q, 'k_t'], ['scores_mm'], name='scores'))
+    qdq(nodes, 'scores_mm', 's', 's')
+    nodes.append(helper.make_node('Softmax', ['s'], ['sm'], name='softmax', axis=-1))
+    qdq(nodes, 'sm', 'p', 'p')
+    nodes.append(helper.make_node('MatMul', ['p', v], ['ctx_mm'], name='ctx'))
+    qdq(nodes, 'ctx_mm', 'c', 'c')
+    x = add('x', dense('c', 'proj', features, features), 'res1')
+    y = add(x, dense(dense(layernorm(x, 'ln2'), 'fc1', features, ffn, relu=True), 'fc2', ffn, features), 'res2')
+    inits.extend([*qparams('s', frac=3), *qparams('p', frac=8, unsigned=True), *qparams('c')])
+    return make_model(
+        'encoder',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [tokens, features])],
+        outputs=[(y, TensorProto.FLOAT, [tokens, features])],
+        initializers=inits,
+    )
+
+
+def test_a_transformer_block_is_searched_in_both_modes(tmp_path):
+    """Q, K and V alive at once once overflowed the search, and a LayerNorm left to split itself cut its rows below
+    a microtile band; both modes now find a design, and 'performance' splits the row-wise layers by rows."""
+    ctx = lower(_encoder_model(), tmp_path / 'resource', aie_config={'Optimize': 'resource'})
+    assert ctx.ir.optimizer['tiles'] == _placed_tiles(ctx)
+    budget = 2 * ctx.ir.optimizer['tiles']
+    ctx = lower(_encoder_model(), tmp_path / 'performance', aie_config={'Optimize': 'performance', 'MaxTiles': budget})
+    assert ctx.ir.optimizer['tiles'] == _placed_tiles(ctx) <= budget
+    assert _splits(ctx)['softmax_aie'].cas_num > 1
 
 
 @pytest.mark.requires_vitis

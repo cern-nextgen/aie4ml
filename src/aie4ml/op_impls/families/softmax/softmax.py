@@ -72,6 +72,15 @@ class _SoftmaxVariantBase(OpImplVariant):
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'approximation', 'layout', 'parallelism'})
 
+    def work(self, node: OpNode, config) -> int:
+        """Multiply-accumulates' time one tile takes per call, mostly per row: int8 HCCS on an AIE-ML tile took about
+        22 cc a row and 0.18 cc an element with the CLB reciprocal (16x64: 545 cc, 64x128: 2929), about 235 and 0.3
+        with the exact one (16x64: 4064), counted at its 256 int8 multiply-accumulates a cycle. The exp Softmax is
+        slower still; it is costed as exact HCCS."""
+        *rows, cols = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
+        per_row, per_element = (22, 0.18) if config.use_clb else (235, 0.3)
+        return round(math.prod(rows) * (per_row + per_element * cols) * 256)
+
     def matches(self, node: OpNode, device, _directives) -> bool:
         if not layout_variant_matches(node, self.layout_name):
             return False

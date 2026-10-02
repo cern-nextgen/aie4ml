@@ -78,6 +78,13 @@ class _LayerNormVariantBase(OpImplVariant):
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'layout', 'parallelism'})
 
+    def work(self, node: OpNode, config) -> int:
+        """Multiply-accumulates' time one tile takes per call, mostly per row: int8 LayerNorm on an AIE-ML tile took
+        about 101 cc a row and 0.22 cc an element (4x64: 466 cc, 16x64: 1842, 64x64: 7266, 16x128: 2066), counted
+        at its 256 int8 multiply-accumulates a cycle."""
+        *rows, cols = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
+        return round(math.prod(rows) * (101 + 0.22 * cols) * 256)
+
     def matches(self, node: OpNode, device, _directives) -> bool:
         if not layout_variant_matches(node, self.layout_name):
             return False

@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from typing import Callable, Tuple
 
 from ...errors import ConfigRefused
-from ...ir.graph import TENSOR_LAYOUTS
+from ...ir.graph import TENSOR_LAYOUTS, input_tensor_for_role
 from ..common_types import PORT_KIND_BUFFER
+from .io import view_shape
 from .tensor_view import microtile_from_staging
 
 
@@ -45,6 +46,14 @@ def extract_inner_outer(shape: tuple[int, ...]) -> tuple[int, int, int]:
     last_outer = int(shape[-2]) if len(shape) >= 2 else 1
     outer_prefix = int(math.prod(shape[:-2])) if len(shape) > 2 else 1
     return full_inner, outer_prefix, last_outer
+
+
+def row_band_candidates(node, device) -> Tuple[dict, ...]:
+    """The splits a row-wise op (LayerNorm, Softmax) offers a design search: bands of its rows, any divisor of them
+    up to the array's rows; which of them fit a bank is resolution's call."""
+    rows = extract_inner_outer(tuple(int(x) for x in view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')))[2]
+    limit = min(rows, max(1, int(device.rows) - int(device.row_start)))
+    return tuple({'contract': 'outer', 'cas_num': n, 'cas_length': 1} for n in range(1, limit + 1) if rows % n == 0)
 
 
 def requested_layout(node) -> str:
