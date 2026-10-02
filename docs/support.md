@@ -12,9 +12,10 @@ Quantization is static and per tensor. Scales are powers of two, so rescaling is
 Each compute kernel that is not fused (Dense/MatMul, Conv2D, etc.) can span several AI Engine tiles. The compiler chooses every layer's split for the whole model at once, keeping the hand-overs between layers direct where it can and falling back to a memory tile
 where it must (`AIEConfig`):
 
-- `Optimize: 'resource'` (default) uses the fewest tiles that fit, then the lowest latency.
-- `Optimize: 'performance'` takes the lowest latency among the designs whose interval is within 10% of the best,
-  within `MaxTiles` (default: the whole array).
+- `Optimize: 'resource'` (default) uses the fewest tiles that fit, then the fewest memory-tile hand-overs, then the
+  lowest latency.
+- `Optimize: 'performance'` takes the lowest interval, then the lowest latency (each within 10%, which the estimate
+  cannot tell apart), then the fewest memory-tile hand-overs and tiles, within `MaxTiles` (default: the whole array).
 
 Both rank designs by a rough, relative estimate of cycles, not a timing model: each kernel's multiply-accumulates or loads,
 plus each hand-over's bytes (none where two kernels share a buffer, twice through a memory tile).
@@ -94,13 +95,19 @@ features (`cas_num`); there is no cascade.
 
 ## LayerNorm
 
-int8 in and out, over the last axis, with constant gamma and beta and a positive epsilon. `cas_num` splits the rows.
+int8 in and out, over the last axis, whose length must be a power of two, with constant gamma and beta and a
+positive epsilon. `cas_num` splits the rows.
 
 ## Softmax
 
-int8 in, uint8 (Q8) or int16 (Q15) out, over the last axis. The default computes the exponential exactly in integer
-arithmetic (beta). `approximation` selects a faster surrogate, which is accurate only for a model trained with it thus needs QAT (HCCS approx).
+int8 in, uint8 (Q8) or int16 (Q15) out, over the last axis, whose length must be a multiple of 8 (32 with
+`layout: 'linear'`). The default computes the exponential exactly in integer arithmetic (beta). `approximation`
+selects a faster surrogate, which is accurate only for a model trained with it thus needs QAT (HCCS approx).
 `cas_num` splits the rows.
+
+HCCS takes the trained `B`, `S` and `Dmax` (one set per Softmax), with `0 <= S, Dmax <= 127` and
+`ceil(256/n) + S*Dmax <= B <= floor(32767/n)` for an axis of length `n`. `use_clb: true` normalises by a power of two
+instead of an exact division, several times faster; use it when the model was trained that way.
 
 ## Folded operators
 
