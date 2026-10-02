@@ -223,6 +223,18 @@ static inline aie::vector<T, N> load_microtile(const T* p)
 }
 
 
+// The lanes the tiled HCCS works in: int8 where the vector unit has int8 max and multiplies, int16 on AIE1, whose
+// int8 arithmetic widens through 16-bit lanes (and spills) on every step; one unpack per block widens it once.
+using hccs_lane_t = std::conditional_t<__AIE_ARCH__ == 10, int16, int8>;
+
+template <unsigned N>
+static inline aie::vector<hccs_lane_t, N> hccs_lanes(const aie::vector<int8, N>& v)
+{
+    if constexpr (std::is_same_v<hccs_lane_t, int8>) return v;
+    else return aie::unpack(v);
+}
+
+
 template <typename ConfigT>
 void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& out)
 {
@@ -233,7 +245,7 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
     const int32_t B    = B_param;
     const int8_t  S    = S_param;
     const int32_t DMAX = DMAX_param;
-    const aie::vector<int8, BLK> s_v = aie::broadcast<int8, BLK>(S);
+    const aie::vector<hccs_lane_t, BLK> s_v = aie::broadcast<hccs_lane_t, BLK>(S);
     const aie::vector<int16, BLK> nb_v = aie::broadcast<int16, BLK>((int16)NB);
 
     for (int bm = 0; bm < ROWS / MT_OUTER; ++bm) {
@@ -241,9 +253,9 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
               out_t* __restrict dst  = out_ptr + bm * NB * BLK;
 
         // ---- pass 1: per-row max, segmented over the MT_INNER lane groups ----
-        aie::vector<int8, BLK> vmax = aie::broadcast<int8, BLK>(-128);
+        aie::vector<hccs_lane_t, BLK> vmax = aie::broadcast<hccs_lane_t, BLK>(-128);
         for (int bn = 0; bn < NB; ++bn)
-            vmax = aie::max(vmax, load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK));
+            vmax = aie::max(vmax, hccs_lanes(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK)));
         for (int step = MT_INNER / 2; step >= 1; step >>= 1)
             vmax = aie::max(vmax, aie::shuffle_down(vmax, step));
 
@@ -255,16 +267,19 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
             lo16[m] = (int16_t)(row_max - DMAX < -128 ? -128 : row_max - DMAX);
             c16[m] = (int16_t)(B - S * row_max);
         }
-        const aie::vector<int8, BLK> lo_v =
-            aie::accum<acc_t, BLK>(spread_rows<int16, MT_OUTER, MT_INNER>(lo16)).template to_vector<int8>(0);
+        aie::vector<hccs_lane_t, BLK> lo_v;
+        if constexpr (std::is_same_v<hccs_lane_t, int16>)
+            lo_v = spread_rows<int16, MT_OUTER, MT_INNER>(lo16);
+        else
+            lo_v = aie::accum<acc_t, BLK>(spread_rows<int16, MT_OUTER, MT_INNER>(lo16)).template to_vector<int8>(0);
         const aie::vector<int16, BLK> c_v = spread_rows<int16, MT_OUTER, MT_INNER>(c16);
         const aie::accum<acc_t, BLK> c_acc(c_v);
 
         // ---- pass 2: scores to the scratch band, and their per-row sum Z = NB*c + S*sum(y) per lane ----
         aie::accum<acc_t, BLK> zsum = aie::mul(c_v, nb_v);
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int8, BLK> y =
-                aie::max(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK), lo_v);
+            const aie::vector<hccs_lane_t, BLK> y =
+                aie::max(hccs_lanes(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK)), lo_v);
             *aie::begin_vector<BLK>(scores_ + bn * BLK) = aie::mac(c_acc, y, s_v).template to_vector<int16>(0);
             zsum = aie::mac(zsum, y, s_v);
         }
