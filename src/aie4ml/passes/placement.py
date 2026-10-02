@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from functools import cached_property
 from itertools import permutations
 from statistics import median
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -81,6 +82,9 @@ class NodeSpec:
     anchor: Optional[Tuple[int, int]] = None  # local device coordinates
     x_range: Optional[Tuple[int, int]] = None
     y_range: Optional[Tuple[int, int]] = None
+    _domains: Dict[Tuple[PortFace, int, int], Tuple[float, float, float, float]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -108,6 +112,15 @@ class GraphSpec:
     edges: List[EdgeSpec]
     preds: Dict[str, List[str]]
     succs: Dict[str, List[str]]
+    _between: Dict[Tuple[str, str], Tuple[EdgeSpec, ...]] = field(default_factory=dict, repr=False, compare=False)
+
+    def edges_between(self, src: str, dst: str) -> Tuple[EdgeSpec, ...]:
+        """The edges from `src` to `dst`: the search asks for them of every pair of ops it checks, so they are
+        indexed once."""
+        if not self._between and self.edges:
+            for edge in self.edges:
+                self._between[(edge.src, edge.dst)] = self._between.get((edge.src, edge.dst), ()) + (edge,)
+        return self._between.get((src, dst), ())
 
 
 @dataclass(frozen=True)
@@ -138,6 +151,30 @@ class Placed:
     x: int
     y: int
     rect: Rect
+    _banks: Dict[Tuple[str, int], frozenset] = field(default_factory=dict, repr=False, compare=False)
+
+    @cached_property
+    def tiles(self) -> frozenset:
+        """The tiles it occupies."""
+        return frozenset(
+            (col, row) for col in range(self.x, self.x + self.rect.w) for row in range(self.y, self.y + self.rect.h)
+        )
+
+    def banks(self, group: str, port: int) -> frozenset:
+        """The (column, row, banks) its port's buffers are pinned to; asked of a placement at every state below it."""
+        key = (group, int(port))
+        if key not in self._banks:
+            self._banks[key] = frozenset(
+                (self.x + location.rel_col, self.y + location.rel_row, tuple(location.banks))
+                for location in self.rect.locations_at(self.y)
+                if location.port_group == group and location.port == int(port)
+            )
+        return self._banks[key]
+
+    @cached_property
+    def memory(self) -> frozenset:
+        """The tiles whose memory its transport-visible buffers use, as it declares them."""
+        return frozenset((self.x + loc.rel_col, self.y + loc.rel_row) for loc in self.rect.locations_at(self.y))
 
 
 class PlacementInfeasibleError(ConfigRefused):
@@ -321,37 +358,20 @@ def _edge_cost_between_placements(src: Placed, dst: Placed, lam: float) -> float
     )
 
 
-def _occupied_tiles(placed: Placed) -> set[Tuple[int, int]]:
-    return {
-        (col, row)
-        for col in range(placed.x, placed.x + placed.rect.w)
-        for row in range(placed.y, placed.y + placed.rect.h)
-    }
-
-
-def _memory_tiles(placed: Placed) -> set[Tuple[int, int]]:
-    """The tiles whose memory the op's transport-visible buffers use, as it declares them."""
-    return {(placed.x + loc.rel_col, placed.y + loc.rel_row) for loc in placed.rect.locations_at(placed.y)}
-
-
 def _absolute_bank_locations(
     placed: Placed,
     *,
     group: str,
     port: int,
-) -> set[Tuple[int, int, Tuple[int, ...]]]:
-    return {
-        (placed.x + location.rel_col, placed.y + location.rel_row, tuple(location.banks))
-        for location in placed.rect.locations_at(placed.y)
-        if location.port_group == group and location.port == int(port)
-    }
+) -> frozenset:
+    return placed.banks(group, port)
 
 
 def _aliased_tiles(producer: Placed, consumer: Placed, graph: GraphSpec) -> set[Tuple[int, int]]:
     """The tiles where a direct edge from `producer` to `consumer` puts one buffer both ports name."""
     tiles = set()
-    for edge in graph.edges:
-        if not (edge.direct and edge.producer_exclusive and edge.src == producer.name and edge.dst == consumer.name):
+    for edge in graph.edges_between(producer.name, consumer.name):
+        if not (edge.direct and edge.producer_exclusive):
             continue
         for src_port, dst_port in edge.port_pairs:
             source = _absolute_bank_locations(producer, group=edge.src_group, port=src_port)
@@ -363,8 +383,8 @@ def _aliased_tiles(producer: Placed, consumer: Placed, graph: GraphSpec) -> set[
 def _shared_edges_coincide(a: Placed, b: Placed, graph: GraphSpec) -> bool:
     """Whether every edge between the two that must be shared pins both of its ports to the same
     memory -- the same (column, row, banks) -- so the compiler has one buffer to place, and no DMA."""
-    for edge in graph.edges:
-        if not edge.shared or {edge.src, edge.dst} != {a.name, b.name}:
+    for edge in (*graph.edges_between(a.name, b.name), *graph.edges_between(b.name, a.name)):
+        if not edge.shared:
             continue
         src, dst = (a, b) if edge.src == a.name else (b, a)
         for src_port, dst_port in edge.port_pairs:
@@ -378,12 +398,10 @@ def _placements_conflict(a: Placed, b: Placed, graph: GraphSpec) -> bool:
     """Two ops conflict when they share a tile, or when one keeps buffers in a tile's memory that the
     other occupies or also keeps buffers in -- unless it is the one buffer a direct edge between them
     shares there."""
-    occupied_a, occupied_b = _occupied_tiles(a), _occupied_tiles(b)
-    if occupied_a & occupied_b:
+    if a.tiles & b.tiles:
         return True
-    memory_a, memory_b = _memory_tiles(a), _memory_tiles(b)
-    clash = (memory_a & memory_b) | ((memory_a - occupied_a) & occupied_b) | ((memory_b - occupied_b) & occupied_a)
-    return bool(clash - _aliased_tiles(a, b, graph) - _aliased_tiles(b, a, graph))
+    clash = (a.memory & b.memory) | ((a.memory - a.tiles) & b.tiles) | ((b.memory - b.tiles) & a.tiles)
+    return bool(clash) and bool(clash - _aliased_tiles(a, b, graph) - _aliased_tiles(b, a, graph))
 
 
 def _in_bounds(p: Placed, W: int, H: int) -> bool:
@@ -394,7 +412,7 @@ def _in_bounds(p: Placed, W: int, H: int) -> bool:
         and p.y + p.rect.h <= H
         # A buffer may sit west of or below the placement region -- the device starts before it -- but
         # never past its far edges, where the device ends.
-        and all(col < W and row < H for col, row in _memory_tiles(p))
+        and all(col < W and row < H for col, row in p.memory)
     )
 
 
@@ -414,8 +432,16 @@ def _possible_face_domain(
     Bounding box of the union of all possible absolute face positions for `spec`.
 
     This intentionally ignores occupancy conflicts and uses only bounds/anchors.
-    That makes it an admissible lower-bound domain for cut-edge estimates.
+    That makes it an admissible lower-bound domain for cut-edge estimates. It depends on the op and the grid
+    alone, and the bound asks for it at every state, so each is computed once.
     """
+    key = (face, W, H)
+    if key not in spec._domains:
+        spec._domains[key] = _face_domain(spec, face, W, H)
+    return spec._domains[key]
+
+
+def _face_domain(spec: NodeSpec, face: PortFace, W: int, H: int) -> Tuple[float, float, float, float]:
     rect = spec.rect
 
     if spec.anchor is not None:
@@ -1072,6 +1098,9 @@ def _bnb_place_graph(
     best: Dict[str, Placed] = {}
     states_visited = 0
     budget_exhausted = False
+    # Tiles the placed ops occupy: two ops never share one, so a candidate on any of them is refused before the
+    # pairwise checks, which most candidates of a packed array would otherwise each run.
+    taken = set().union(*(placed.tiles for placed in preplaced.values()))
 
     def dfs(placed: Dict[str, Placed]) -> None:
         nonlocal best, best_cost, states_visited, budget_exhausted
@@ -1107,11 +1136,13 @@ def _bnb_place_graph(
             heuristics,
         ):
             cand = Placed(name=name, x=x, y=y, rect=spec.rect)
-            if not _feasible(cand, placed, graph, W, H):
+            if cand.tiles & taken or not _feasible(cand, placed, graph, W, H):
                 continue
 
             placed[name] = cand
+            taken.update(cand.tiles)
             dfs(placed)
+            taken.difference_update(cand.tiles)
             del placed[name]
 
     dfs(dict(preplaced))
