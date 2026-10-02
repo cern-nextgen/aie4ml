@@ -122,9 +122,18 @@ public:
 
     static constexpr int NB = COLS / MT_INNER;                  // microtiles across the features
 
-    // Lanes the statistics vector carries. The surplus lanes read zero variance, which the epsilon
-    // floor makes safe to invert, and their results are never stored.
-    static constexpr int STAT_LANES = (MT_OUTER < 4) ? 4 : MT_OUTER;
+    // Row bands one statistics call covers, and the lanes it carries; the surplus lanes read zero variance,
+    // which the epsilon floor makes safe to invert, and are never stored. AIE-ML and AIE-MLv2 emulate the
+    // float inverse square root as one latency-bound chain, which takes up to 16 rows for the time of one;
+    // AIE1 has a float unit, where a call per band costs least.
+    static constexpr int BANDS = ROWS / MT_OUTER;
+    static constexpr int GROUP = []() constexpr {
+        int group = 1;
+        for (int g = 1; __AIE_ARCH__ != 10 && g * MT_OUTER <= 16; ++g)
+            if (BANDS % g == 0) group = g;
+        return group;
+    }();
+    static constexpr int STAT_LANES = (GROUP * MT_OUTER <= 4) ? 4 : (GROUP * MT_OUTER <= 8) ? 8 : 16;
 
     static_assert(ROWS % MT_OUTER == 0, "ROWS must be a whole number of microtile row bands");
     static_assert(COLS % MT_INNER == 0, "COLS must be a whole number of microtiles");

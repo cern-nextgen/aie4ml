@@ -154,34 +154,33 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
 
     const aie::vector<int8, BLK> ones8 = aie::broadcast<int8, BLK>(1);
 
-    for (int bm = 0; bm < ROWS / MT_OUTER; ++bm) {
-
-        const in_t*  __restrict band = in_ptr  + bm * NB * BLK;
-              out_t* __restrict dst  = out_ptr + bm * NB * BLK;
-
-        // Lane group m of every microtile belongs to row m, so accumulating along the
-        // feature axis keeps the rows' partial sums separate with no shuffling.
-        aie::accum<acc_t, BLK> acc_sum = aie::zeros<acc_t, BLK>();
-        aie::accum<acc_t, BLK> acc_sq  = aie::zeros<acc_t, BLK>();
-
-        for (int bn = 0; bn < NB; ++bn)
-            chess_prepare_for_pipelining
-            chess_loop_range(NB, NB)
-        {
-            aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
-            if constexpr (ConfigT::TRANSPOSE_INPUT) vx = aie::transpose(vx, MT_INNER, MT_OUTER);
-            acc_sum = aie::mac(acc_sum, vx, ones8);
-            acc_sq  = aie::mac_square(acc_sq, vx);
-        }
-
-        // Segmented reduce: halving rounds collapse each MT_INNER lane group and leave row m's
-        // total in lane m * MT_INNER (a full reduce would sum the rows together). Done in
-        // <=32-lane pieces because a shuffle_down across a 64-lane int32 vector (2048-bit) does
-        // not compose into a full logical shift, but a 32-lane (1024-bit) one does.
-        // Padded to the vector width: lanes past MT_OUTER stay zero and are never stored.
+    for (int bg = 0; bg < BANDS; bg += GROUP) {
+        // Padded to the vector width: lanes past the group's rows stay zero and are never stored.
         int32_t sum_x[STAT_LANES]  = {};
         int32_t sum_sq[STAT_LANES] = {};
-        {
+
+        for (int g = 0; g < GROUP; ++g) {
+            const in_t* __restrict band = in_ptr + (bg + g) * NB * BLK;
+
+            // Lane group m of every microtile belongs to row m, so accumulating along the
+            // feature axis keeps the rows' partial sums separate with no shuffling.
+            aie::accum<acc_t, BLK> acc_sum = aie::zeros<acc_t, BLK>();
+            aie::accum<acc_t, BLK> acc_sq  = aie::zeros<acc_t, BLK>();
+
+            for (int bn = 0; bn < NB; ++bn)
+                chess_prepare_for_pipelining
+                chess_loop_range(NB, NB)
+            {
+                aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+                if constexpr (ConfigT::TRANSPOSE_INPUT) vx = aie::transpose(vx, MT_INNER, MT_OUTER);
+                acc_sum = aie::mac(acc_sum, vx, ones8);
+                acc_sq  = aie::mac_square(acc_sq, vx);
+            }
+
+            // Segmented reduce: halving rounds collapse each MT_INNER lane group and leave row m's
+            // total in lane m * MT_INNER (a full reduce would sum the rows together). Done in
+            // <=32-lane pieces because a shuffle_down across a 64-lane int32 vector (2048-bit) does
+            // not compose into a full logical shift, but a 32-lane (1024-bit) one does.
             const aie::vector<int32, BLK> s_full = acc_sum.template to_vector<int32>(0);
             const aie::vector<int32, BLK> q_full = acc_sq.template to_vector<int32>(0);
             constexpr int SUB = (BLK < 32) ? BLK : 32;
@@ -192,10 +191,10 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
                     s = aie::add(s, aie::shuffle_down(s, step));
                     q = aie::add(q, aie::shuffle_down(q, step));
                 }
-                for (int g = 0; g < SUB / MT_INNER; ++g) {
-                    const int m = sb * (SUB / MT_INNER) + g;
-                    sum_x[m]  = s.get(g * MT_INNER);
-                    sum_sq[m] = q.get(g * MT_INNER);
+                for (int k = 0; k < SUB / MT_INNER; ++k) {
+                    const int m = g * MT_OUTER + sb * (SUB / MT_INNER) + k;
+                    sum_x[m]  = s.get(k * MT_INNER);
+                    sum_sq[m] = q.get(k * MT_INNER);
                 }
             }
         }
@@ -204,32 +203,37 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
         int16_t inv_std16[STAT_LANES];
         base::template row_statistics<STAT_LANES>(sum_x, sum_sq, mu16, inv_std16);
 
-        // Widen the per-row statistics to the microtile's lane groups.
-        const aie::vector<int16, BLK> mu_v = spread_rows<MT_OUTER, MT_INNER>(mu16);
-        const aie::vector<int16, BLK> is_v = spread_rows<MT_OUTER, MT_INNER>(inv_std16);
+        for (int g = 0; g < GROUP; ++g) {
+            const in_t*  __restrict band = in_ptr  + (bg + g) * NB * BLK;
+                  out_t* __restrict dst  = out_ptr + (bg + g) * NB * BLK;
 
-        for (int bn = 0; bn < NB; ++bn)
-            chess_prepare_for_pipelining
-            chess_loop_range(NB, NB)
-        {
-            aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
-            if constexpr (ConfigT::TRANSPOSE_INPUT) vx = aie::transpose(vx, MT_INNER, MT_OUTER);
+            // Widen the per-row statistics to the microtile's lane groups.
+            const aie::vector<int16, BLK> mu_v = spread_rows<MT_OUTER, MT_INNER>(mu16 + g * MT_OUTER);
+            const aie::vector<int16, BLK> is_v = spread_rows<MT_OUTER, MT_INNER>(inv_std16 + g * MT_OUTER);
 
-            // Already widened in ROM: one block load, no broadcast or concat in the loop.
-            const aie::vector<int16, BLK> gamma_blk = *aie::cbegin_vector<BLK>((const int16_t*)gamma + bn * BLK);
-            const aie::vector<int16, BLK> beta_blk  = *aie::cbegin_vector<BLK>((const int16_t*)beta + bn * BLK);
+            for (int bn = 0; bn < NB; ++bn)
+                chess_prepare_for_pipelining
+                chess_loop_range(NB, NB)
+            {
+                aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+                if constexpr (ConfigT::TRANSPOSE_INPUT) vx = aie::transpose(vx, MT_INNER, MT_OUTER);
 
-            const aie::vector<int16, BLK> vd16 =
-                aie::sub(aie::from_vector<acc_t>(vx), mu_v).template to_vector<int16>(0);
+                // Already widened in ROM: one block load, no broadcast or concat in the loop.
+                const aie::vector<int16, BLK> gamma_blk = *aie::cbegin_vector<BLK>((const int16_t*)gamma + bn * BLK);
+                const aie::vector<int16, BLK> beta_blk  = *aie::cbegin_vector<BLK>((const int16_t*)beta + bn * BLK);
 
-            const aie::accum<acc_t, BLK> acc_fs = aie::mul(is_v, gamma_blk);
-            const aie::vector<int16, BLK> fscale = acc_fs.template to_vector<int16>(GAMMA_SHIFT);
+                const aie::vector<int16, BLK> vd16 =
+                    aie::sub(aie::from_vector<acc_t>(vx), mu_v).template to_vector<int16>(0);
 
-            aie::accum<acc_t, BLK> acc_out = aie::mul(vd16, fscale);
-            acc_out = aie::add(acc_out, beta_blk);
+                const aie::accum<acc_t, BLK> acc_fs = aie::mul(is_v, gamma_blk);
+                const aie::vector<int16, BLK> fscale = acc_fs.template to_vector<int16>(GAMMA_SHIFT);
 
-            auto vout_it = aie::begin_vector<BLK>(dst + bn * BLK);
-            *vout_it = acc_out.template to_vector<out_t>(NORM_SHIFT - OUT_SHIFT);
+                aie::accum<acc_t, BLK> acc_out = aie::mul(vd16, fscale);
+                acc_out = aie::add(acc_out, beta_blk);
+
+                auto vout_it = aie::begin_vector<BLK>(dst + bn * BLK);
+                *vout_it = acc_out.template to_vector<out_t>(NORM_SHIFT - OUT_SHIFT);
+            }
         }
     }
 }
