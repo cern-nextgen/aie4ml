@@ -2,9 +2,10 @@
 
 Each kernel port declares, through its staging, which tensor element sits at each position of its buffer. This model
 fills every producer buffer that way and moves the elements through the plan as the ADF tiling parameters say --
-direct edges, memory tiles, and the host's files as the simulator packs them. Every consumer buffer must then hold the
-elements it declares, and zeros where it asks for them, and every graph output must reassemble its tensor. It shares
-no code with the walk generator, so it checks the transport against the ops' declarations rather than against itself.
+direct edges, ordered merges, memory tiles, and the host's files as the simulator packs them. Every consumer buffer
+must then hold the elements it declares, and zeros where it asks for them, and every graph output must reassemble its
+tensor. It shares no code with the walk generator, so it checks the transport against the ops' declarations rather
+than against itself.
 """
 
 from __future__ import annotations
@@ -157,6 +158,8 @@ class _Plan:
             self._leg_tags[key] = self._tags(producer, self._graph_port(key) if producer.node is None else None)
         for edge in self.plan.get('direct_edges', ()):
             self._direct_edge(edge)
+        for merge in self.plan.get('merges', ()):
+            self._merge(merge)
         for buffer in self.plan.get('buffers', ()):
             self._memory_tile(buffer)
         for tensor, ports in self.layout.outputs.items():
@@ -241,6 +244,16 @@ class _Plan:
         producer, _consumer = self.legs[(consumer_id, cgroup, cport)]
         values = self._filled(producer, int(port), self._leg_tags[(consumer_id, cgroup, cport)])
         self._receive(where, consumer_id, cgroup, cport, values, zero_filled=False)
+
+    def _merge(self, merge):
+        """An ordered packet merge hands each reader its writers' buffers one after another, in writer order."""
+        for target in merge['readers']:
+            consumer_id, group, port = self._targets({'endpoint': target})[0]
+            producer, _consumer = self.legs[(consumer_id, group, port)]
+            tags = self._leg_tags[(consumer_id, group, port)]
+            ports = [int(writer.rstrip(']').split('[')[1]) for writer in merge['writers']]
+            values = np.concatenate([self._filled(producer, p, tags) for p in ports])
+            self._receive(f"{merge['name']} -> {target}", consumer_id, group, port, values, zero_filled=False)
 
     @staticmethod
     def _access(desc, size, stream):

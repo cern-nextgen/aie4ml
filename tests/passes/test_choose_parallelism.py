@@ -10,6 +10,8 @@ from aie4ml.op_impls import get_family_resolver_registry
 from aie4ml.op_impls.families.conv2d.conv2d import Conv2dOpImplVariant
 from aie4ml.passes import choose_parallelism, placement
 from aie4ml.passes.resolve import resolve_instance
+from aie4ml.passes.transport.collect import TransportCollector
+from aie4ml.passes.transport.legality import direct_pairing
 from frontends.test_onnx_aie1 import _dense_model, _normalization_chain_model
 from frontends.test_onnx_aie1_views import _split_model
 from helpers import (
@@ -286,6 +288,39 @@ def _encoder_model(tokens=16, features=64, ffn=128):
         outputs=[(y, TensorProto.FLOAT, [tokens, features])],
         initializers=inits,
     )
+
+
+def test_row_chains_gather_through_ordered_merges(tmp_path):
+    """K and V in two row chains feed single-chain Q.K^T and .V: each a gather, which an ordered packet merge makes
+    direct where the part has one, as nothing else reads K or V -- and nothing else does (AIE1 has none). LayerNorm's
+    two chains feed a single-chain Q too, but also K and V: a merge's producer streams carry packet headers ADF would
+    hand those plain readers, so that gather takes a memory tile."""
+    split = {'parallelism': {'cas_num': 2, 'cas_length': 1, 'contract': 'outer'}}
+    whole = {'parallelism': {'cas_num': 1, 'cas_length': 1, 'contract': 'outer'}}
+    one = {'parallelism': {'cas_num': 1, 'cas_length': 1, 'contract': 'inner'}}
+    directives = {
+        'ln1': split, 'k': split, 'v': split, 'q': one, 'scores': whole, 'softmax': whole, 'ctx': whole,
+        'proj': one, 'ln2': one, 'fc1': one, 'fc2': one,
+    }  # fmt: skip
+    ctx = lower(_encoder_model(), tmp_path, directives)
+    plan = ctx.ir.physical.plan
+    assert [buffer['tensor'] for buffer in plan['buffers']] == ['ln1_ln']
+    assert sorted((m['tensor'], len(m['writers']), len(m['readers'])) for m in plan['merges']) == [
+        ('k_mm', 2, 1),
+        ('v_mm', 2, 1),
+    ]
+    (leg,) = [
+        leg
+        for entry in TransportCollector(ctx.ir.execution).collect()
+        for leg in entry.consumers
+        if entry.producer.node is not None
+        and (entry.producer.node.name, leg.consumer.node.name) == ('k_aie', 'scores_aie')
+    ]
+    assert direct_pairing(ctx.ir.execution, leg.logical_tensor, leg.producer, leg.consumer, merge=True) == (
+        None,
+        ((0, 0), (1, 0)),
+    )
+    assert direct_pairing(ctx.ir.execution, leg.logical_tensor, leg.producer, leg.consumer, merge=False)[0]
 
 
 def test_a_transformer_block_is_searched_in_both_modes(tmp_path):

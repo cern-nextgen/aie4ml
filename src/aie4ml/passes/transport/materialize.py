@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from math import prod
 from typing import Any, Dict, List
 
@@ -68,6 +69,7 @@ class _MemoryPlanMaterializer:
 
         self.buffers = []
         self.direct_edges = []
+        self.merges = []
         self.io_ports = []
         self.kernel_read_accesses = []
         self.kernel_write_accesses = []
@@ -90,6 +92,7 @@ class _MemoryPlanMaterializer:
     def materialize(self, state):
         self.buffers = []
         self.direct_edges = []
+        self.merges = []
         self.io_ports = []
         self.kernel_read_accesses = []
         self.kernel_write_accesses = []
@@ -104,6 +107,7 @@ class _MemoryPlanMaterializer:
         return {
             'buffers': self.buffers,
             'direct_edges': self.direct_edges,
+            'merges': self.merges,
             'io_ports': self.io_ports,
             'kernel_read_accesses': self.kernel_read_accesses,
             'kernel_write_accesses': self.kernel_write_accesses,
@@ -162,7 +166,11 @@ class _MemoryPlanMaterializer:
         producer, consumer = self._kernel_inst(p.node), self._kernel_inst(c.node)
         stream = producer.ports.outputs[p.tensor].kind == PORT_KIND_STREAM
 
+        reads = entry.unit.reads()
+        self._emit_merges(entry, {c_port: ports for c_port, ports in reads.items() if len(ports) > 1})
         for p_port, c_port in zip(p_ports, c_ports):
+            if len(reads[c_port]) > 1:
+                continue
             edge = {
                 'source': f'{sanitize_identifier(p.node.name)}.{p.group}[{int(p_port)}]',
                 'target': f'{sanitize_identifier(c.node.name)}.{c.group}[{int(c_port)}]',
@@ -188,6 +196,20 @@ class _MemoryPlanMaterializer:
                 )
                 edge['realization'] = SHARED_MEMORY if shared else DMA
             self.direct_edges.append(edge)
+
+    def _emit_merges(self, entry, gathered) -> None:
+        """One ordered packet merge per producer-port tuple some consumer ports gather: its producer ports in order
+        as writers, every consumer port reading the tuple as a reader (one merged stream, broadcast)."""
+        p, c = entry.producer, entry.single_consumer()
+        source, sink = sanitize_identifier(p.node.name), sanitize_identifier(c.node.name)
+        readers = defaultdict(list)
+        for c_port, ports in gathered.items():
+            readers[ports].append(c_port)
+        for ports, c_ports in readers.items():
+            name = f'merge_{sanitize_identifier(entry.logical_tensor)}_{len(self.merges)}'
+            writers = [f'{source}.{p.group}[{port}]' for port in ports]
+            targets = [f'{sink}.{c.group}[{port}]' for port in c_ports]
+            self.merges.append({'name': name, 'tensor': entry.logical_tensor, 'writers': writers, 'readers': targets})
 
     def _emit_direct_graph_input(self, entry, graph_ports, consumer_ports):
         consumer = entry.single_consumer()

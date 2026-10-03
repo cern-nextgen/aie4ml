@@ -16,7 +16,7 @@ searches. The physical verifier asks both again of the finished plan.
 
 from __future__ import annotations
 
-from typing import Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 from ..op_impls.common_types import PORT_KIND_BUFFER
 
@@ -52,13 +52,19 @@ def static_problem(
         problem = port_problem(inst, group, port, direction)
         if problem:
             return problem
-    readers = [inst.name for inst in execution if any(item.tensor == tensor for item in inst.inputs)]
-    views = [v.name for v in execution.values.values() if v.view is not None and tensor in v.view.sources]
-    if readers != [consumer.name] or views or tensor in execution.graph_outputs:
-        return f'{tensor!r} is also read by {sorted(set(readers) - {consumer.name}) + views}' + (
-            ' and the graph boundary' if tensor in execution.graph_outputs else ''
-        )
+    others = other_readers(execution, tensor, consumer.name)
+    if others:
+        return f'{tensor!r} is also read by {others}'
     return None
+
+
+def other_readers(execution, tensor: str, consumer: str) -> List[str]:
+    """What reads `tensor` besides the kernel graph `consumer`: other kernels, views over it, the graph boundary."""
+    readers = sorted(
+        {inst.name for inst in execution if any(item.tensor == tensor for item in inst.inputs)} - {consumer}
+    )
+    views = [v.name for v in execution.values.values() if v.view is not None and tensor in v.view.sources]
+    return readers + views + (['the graph boundary'] if tensor in execution.graph_outputs else [])
 
 
 def pinned_locations(inst, group: str, port: int, col: int, row: int) -> Set[Tuple[int, int, Tuple[int, ...]]]:

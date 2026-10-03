@@ -5,6 +5,7 @@ from ...ir import get_backend_context
 from ...ir.graph import ROUTE_MODES
 from ...op_impls.utils.tensor_view import staging_tile_shape
 from ..base import AIEPass
+from ..shared_buffer import other_readers
 from .boundary import direct_boundary_access
 from .descriptors import describes_natural_order, rebase_descriptor_offset
 from .dma_resources import KERNEL_BUFFERS, tile_port_bds
@@ -25,11 +26,13 @@ class ClassifyTransportEntries(AIEPass):
         for entry in entries:
             self._validate_entry(entry)
             leg = entry.consumers[0] if entry.consumers else Connection(entry.logical_tensor, entry.producer, None)
-            decision = classify_connection(leg, ctx.ir.execution, ctx.device)
+            merge = leg.consumer is not None and gathers(ctx.ir.execution, ctx.device, leg)
+            decision = classify_connection(leg, ctx.ir.execution, ctx.device, merge=merge)
             changed = changed or entry.decision != decision
             entry.decision = decision
             kernels = entry.producer.node is not None and entry.consumers
-            entry.unit = direct_unit(ctx.ir.execution, leg) if decision.realization == 'direct' and kernels else None
+            direct = decision.realization == 'direct' and kernels
+            entry.unit = direct_unit(ctx.ir.execution, leg, merge=merge) if direct else None
         return changed
 
     @staticmethod
@@ -46,19 +49,28 @@ class ClassifyTransportEntries(AIEPass):
             raise RuntimeError(f'{entry.logical_tensor}: internal transport entry has no consumer.')
 
 
-def direct_unit(execution, leg: Connection) -> TransportUnit:
-    """The ports a direct kernel-to-kernel leg joins, in consumer-port order: each with the producer port it reads
-    (`direct_pairing`), a port broadcast to several readers listed once per reader."""
-    failure, paired = direct_pairing(execution, leg.logical_tensor, leg.producer, leg.consumer)
+def gathers(execution, device, leg: Connection) -> bool:
+    """Whether a kernel-to-kernel leg may gather through an ordered packet merge: where the device has one and the leg
+    is its tensor's only reader. A producer stream into a merge carries packet headers, which ADF also hands to any
+    plain reader of the same port (seen in aiesim: such a reader's buffer shifted by a header word)."""
+    return bool(device.packet_ordered_merge) and not other_readers(
+        execution, leg.producer.tensor, leg.consumer.node.name
+    )
+
+
+def direct_unit(execution, leg: Connection, *, merge: bool) -> TransportUnit:
+    """A direct kernel-to-kernel leg's edges (`direct_pairing`) as aligned port lists: a producer port listed with
+    several consumer ports is broadcast, a consumer port listed with several producer ports gathers them in order."""
+    failure, edges = direct_pairing(execution, leg.logical_tensor, leg.producer, leg.consumer, merge=merge)
     if failure:
         raise RuntimeError(f'{leg.logical_tensor}: classified direct, but {failure}.')
-    sink = execution.get(leg.consumer.node.name)
-    return TransportUnit(paired, leg.consumer.selected_ports(sink.ports.inputs[leg.consumer.tensor].count))
+    return TransportUnit(tuple(p for p, _ in edges), tuple(c for _, c in edges))
 
 
-def classify_connection(leg: Connection, execution, device) -> TransportDecision:
+def classify_connection(leg: Connection, execution, device, *, merge: bool) -> TransportDecision:
     """How one transport leg is realised; `leg.consumer` is None for a graph output. Reads only the resolved
-    instances and contracts in `execution`, so the parallelism search decides every leg by this rule too."""
+    instances and contracts in `execution`, so the parallelism search decides every leg by this rule too. `merge`:
+    whether the leg may gather through an ordered packet merge (`gathers`)."""
     tensor, producer, consumer = leg.logical_tensor, leg.producer, leg.consumer
     shards_failure = _inner_shards_failure(leg, execution)
     if shards_failure is not None:
@@ -80,7 +92,7 @@ def classify_connection(leg: Connection, execution, device) -> TransportDecision
         if route == 'memtile':
             raise ConfigRefused(f'{tensor}: io_route=memtile requested on a stream port.')
         if not is_boundary:
-            failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer)
+            failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer, merge=False)
             if failure is not None:
                 raise ConfigRefused(f'{tensor}: point-to-point ports cannot connect directly: {failure}.')
         return TransportDecision('direct', True)
@@ -96,7 +108,7 @@ def classify_connection(leg: Connection, execution, device) -> TransportDecision
             realization = 'direct' if _direct_boundary_failure(leg, execution, device) is None else 'memtile'
         return TransportDecision(realization, True if realization == 'direct' else None)
 
-    direct_failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer)
+    direct_failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer, merge=merge)
     staging_compatible = direct_failure is None
     if route == 'direct':
         if not staging_compatible:

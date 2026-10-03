@@ -54,6 +54,9 @@ private:
 {% for buf in graph_plan.buffers %}
   adf::shared_buffer<{{ buf.ctype }}> {{ buf.name }};
 {% endfor %}
+{% for merge in graph_plan.merges %}
+  adf::pktorderedmerge<{{ merge.writers|length }}> {{ merge.name }};
+{% endfor %}
 
   friend struct graph_plan<
 {% for i in range(1, layers|length + 1) %}

@@ -184,7 +184,8 @@ def verify_tile_dma_channels(ctx, graphs, shared) -> None:
 
 def verify_stream_routes(ctx) -> None:
     """Every stream within the switches' ports (`transport.routing`): each hand-over not in shared memory -- a DMA
-    between tiles, each memory-tile writer and reader, each PLIO -- from its source port to all its targets."""
+    between tiles, each memory-tile writer and reader, each merge writer, each PLIO -- from its source port to all its
+    targets."""
     physical = ctx.ir.physical
     graphs = {sanitize_identifier(inst.name): inst for inst in ctx.ir.execution}
     buffers = {buffer['name'] for buffer in physical.plan.get('buffers', ())}
@@ -216,6 +217,10 @@ def verify_stream_routes(ctx) -> None:
     for buffer in physical.plan.get('buffers', ()):
         for port in (*buffer['writers'], *buffer['readers']):
             add(port['source'], port['target'])
+    for merge in physical.plan.get('merges', ()):  # each writer's stream counted to every reader: an upper bound
+        for writer in merge['writers']:
+            for reader in merge['readers']:
+                add(writer, reader)
     problem = route_overflow(streams, ctx.device.stream_switch_ports, ctx.device.columns)
     if problem:
         raise ConfigRefused(f'stream routes: {problem}.')

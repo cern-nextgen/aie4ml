@@ -65,5 +65,16 @@ struct graph_plan {
 {% for edge in graph_plan.direct_edges %}
     connect<>(self.{{ edge.source }}, self.{{ edge.target }});
 {% endfor %}
+
+{% for merge in graph_plan.merges %}
+    // in port order: each reader's buffer fills with the writers' buffers one after another
+    self.{{ merge.name }} = adf::pktorderedmerge<{{ merge.writers|length }}>::create();
+    {% for writer in merge.writers %}
+    connect<>(self.{{ writer }}, self.{{ merge.name }}.in[{{ loop.index0 }}]);
+    {% endfor %}
+    {% for reader in merge.readers %}
+    connect<>(self.{{ merge.name }}.out[0], self.{{ reader }});
+    {% endfor %}
+{% endfor %}
   }
 };

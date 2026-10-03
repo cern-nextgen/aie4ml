@@ -41,7 +41,7 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
 - **Transposed operands**: an activation operand read through a Transpose of its last two axes (a Dense or MatMul
   input, a MatMul's right operand such as Kᵀ in Q·Kᵀ) is read as its producer stores it, a microtile at a time, and
   transposed in registers. It hands over without a memory tile where the producer writes the consumer's microtiles
-  (AIE-MLv2's 8×8 ones); otherwise a memory tile re-tiles it (AIE-ML). AIE1 refuses it: its cores transpose 8- and
+  (8×8 ones: AIE-MLv2's, and AIE-ML's where the design uses 8-row microtiles); otherwise a memory tile re-tiles it. AIE1 refuses it: its cores transpose 8- and
   16-bit values at scalar speed.
 - **Parallelism**: `cas_length` splits the reduction over a cascade chain; `cas_num` runs parallel chains over the
   output features (`contract: 'inner'`) or the rows (`'outer'`). What a directive leaves open, the compiler chooses for
@@ -127,8 +127,11 @@ These never become kernels of their own:
 
 ## Model structure and data movement
 
-- Layers hand data over directly, tile to tile, when both sides agree on the layout. On AIE-ML and AIE-MLv2 a memory
-  tile reorders it otherwise (one stage). AIE1 has no memory tile, so a layout mismatch there is refused.
+- Layers hand data over directly, tile to tile, when both sides agree on the layout: a buffer to its one reader
+  (shared memory where the two tiles neighbour, else a DMA copy), one buffer to several readers (a DMA broadcast), and
+  on AIE-ML and AIE-MLv2 several buffers into one, in order (an ordered packet merge, as where a split layer feeds an
+  unsplit one). Otherwise a memory tile reorders it on AIE-ML and AIE-MLv2 (one stage); AIE1 has no memory tile, so a
+  layout mismatch there is refused.
 - A tile's DMA has 16 buffer descriptors; the compiler counts them on every generation and refuses a design that needs
   more, before the AIE compiler runs. A graph input or output whose direct walk would need more goes through a memory
   tile on AIE-ML and AIE-MLv2; on AIE1, give the boundary Dense a stream end.

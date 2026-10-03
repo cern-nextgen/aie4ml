@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Sequence, Tuple
 
+import numpy as np
+
 from ...errors import ConfigRefused
 from ...op_impls.utils import STORAGE_LAYOUT_INNER_BLOCKED
 
@@ -66,6 +68,17 @@ class Layout:
                 loop = Loop(loop.axis, loops.pop().count * loop.count, loop.step)
             loops.append(loop)
         return Layout(tuple(loops), self.start, self.data, self.tensor)
+
+    def elements(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Per buffer position in memory order, the tensor coordinate it holds (positions x axes), and whether it is
+        data rather than padding."""
+        coords = np.array([self.start], dtype=np.int64)
+        for loop in self.loops:  # slowest first: each further loop varies faster
+            offsets = np.zeros((loop.count, len(self.start)), dtype=np.int64)
+            offsets[:, loop.axis] = np.arange(loop.count) * loop.step
+            coords = (coords[:, None, :] + offsets[None, :, :]).reshape(-1, len(self.start))
+        data = np.all([(coords[:, axis] >= lo) & (coords[:, axis] < hi) for axis, (lo, hi) in enumerate(self.data)], 0)
+        return coords, data
 
     def span(self) -> Tuple[Tuple[int, int], ...]:
         """Per axis, the tensor coordinates [first, last + 1) the buffer holds."""

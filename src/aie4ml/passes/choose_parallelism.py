@@ -38,7 +38,7 @@ from .base import AIEPass, run_aie_passes
 from .estimate import kernel_cycles, leg_cycles, shareable
 from .legalize_layouts import convert_inputs
 from .resolve import logical_values, output_contracts, resolve_instance
-from .transport.classify import classify_connection
+from .transport.classify import classify_connection, direct_unit
 from .transport.collect import TransportCollector
 from .transport.memtile import check_memtile_leg
 from .transport.routing import BELOW, port_tiles, route_overflow
@@ -435,7 +435,15 @@ class _Search:
         source, sink = insts
         streams, sharing = [], []
         try:
-            realization = classify_connection(leg, execution, self.ctx.device).realization
+            # an ordered merge only where the leg is its tensor's only reader (`classify.gathers`)
+            readers = self.readers.get(leg.producer.tensor, 0)
+            merge = (
+                bool(self.ctx.device.packet_ordered_merge)
+                and sink is not None
+                and readers == 1
+                and leg.producer.tensor not in self.graph_outputs
+            )
+            realization = classify_connection(leg, execution, self.ctx.device, merge=merge).realization
             if realization == 'memtile':
                 check_memtile_leg(leg, execution, self.ctx.device)
             if sink is not None and (realization == 'memtile' or source is None):
@@ -448,8 +456,14 @@ class _Search:
                 for port in leg.producer.selected_ports(binding.count):
                     (tile,) = self._port_tiles(source, 'outputs', binding.group, port)
                     streams.append((source.name, (binding.group, port), (tile, (BELOW,))))
-            readers = self.readers.get(leg.producer.tensor, 0)
-            shared = shareable(leg, realization, execution, readers)
+            # one buffer per port pair only: no port broadcast to several readers, none gathering several writers
+            one_to_one = (
+                realization == 'direct'
+                and source is not None
+                and sink is not None
+                and direct_unit(execution, leg, merge=merge).one_to_one()
+            )
+            shared = one_to_one and shareable(leg, realization, execution, readers)
             # Placement shares a direct leg's buffer unless its producer's ports are surely read by another leg
             # too: a whole tensor read by several layers, or a graph output.
             if (
@@ -460,8 +474,7 @@ class _Search:
                 and (readers == 1 or leg.consumer.tensor != leg.producer.tensor)
             ):
                 ports = leg.consumer.selected_ports(sink.ports.inputs[leg.consumer.tensor].count)
-                written = leg.producer.selected_ports(source.ports.outputs[leg.producer.tensor].count)
-                if len(written) == len(ports):  # a broadcast copies to each reader
+                if one_to_one:
                     sharing.append((sink.name, tuple((leg.consumer.group, port) for port in ports)))
             cycles = (leg.producer.tensor, *leg_cycles(leg, realization, shared, execution, self.ctx.device))
             facts = (int(realization == 'memtile'), tuple(streams), tuple(sharing), cycles)

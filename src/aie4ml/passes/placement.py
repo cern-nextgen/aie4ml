@@ -95,7 +95,7 @@ class EdgeSpec:
     dst: str
     tensor: Optional[str] = None
     direct: bool = False
-    producer_exclusive: bool = True
+    one_to_one: bool = True  # each port pair its own buffer: no port broadcast or gathered
     src_group: str = ''
     dst_group: str = ''
     port_pairs: Tuple[Tuple[int, int], ...] = ()
@@ -371,7 +371,7 @@ def _aliased_tiles(producer: Placed, consumer: Placed, graph: GraphSpec) -> set[
     """The tiles where a direct edge from `producer` to `consumer` puts one buffer both ports name."""
     tiles = set()
     for edge in graph.edges_between(producer.name, consumer.name):
-        if not (edge.direct and edge.producer_exclusive):
+        if not (edge.direct and edge.one_to_one):
             continue
         for src_port, dst_port in edge.port_pairs:
             source = _absolute_bank_locations(producer, group=edge.src_group, port=src_port)
@@ -534,6 +534,8 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                 continue
             entry_consumer_ports = consumer_ports(entry, consumer)
             direct = entry.decision is not None and entry.decision.realization == 'direct'
+            # one buffer per port pair only: no port read by another leg, broadcast or gathered
+            one_to_one = direct and producer_exclusive and entry.unit.one_to_one()
             shared = ctx.ir.execution.get(consumer.node.name).input(consumer.tensor).shared_memory
             if shared and not direct:
                 raise RuntimeError(
@@ -586,12 +588,12 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                     dst=consumer.node.name,
                     tensor=entry.producer.tensor,
                     direct=direct,
-                    producer_exclusive=producer_exclusive,
+                    one_to_one=one_to_one,
                     src_group=entry.producer.group,
                     dst_group=consumer.group,
                     port_pairs=tuple(zip(entry_producer_ports, entry_consumer_ports)) if direct else (),
                     shared=shared,
-                    shareable=direct and producer_exclusive and not problems,
+                    shareable=direct and one_to_one and not problems,
                 )
             )
     return edges

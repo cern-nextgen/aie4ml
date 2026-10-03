@@ -65,12 +65,26 @@ class TransportDecision:
 
 @dataclass(frozen=True)
 class TransportUnit:
-    """The ports one realization of a leg joins: the whole leg when direct, or one memory-tile buffer of `count`."""
+    """The ports one realization of a leg joins: one memory-tile buffer of `count`, or the whole leg when direct --
+    then as edges, producer_ports[i] -> consumer_ports[i]: a producer port listed with several consumer ports is
+    broadcast, a consumer port listed with several producer ports gathers them in their order."""
 
     producer_ports: Tuple[int, ...]
     consumer_ports: Tuple[int, ...]
     index: int = 0
     count: int = 1
+
+    def reads(self) -> Dict[int, Tuple[int, ...]]:
+        """A direct unit's consumer ports, each with the producer ports it reads in order."""
+        reads: Dict[int, Tuple[int, ...]] = {}
+        for p_port, c_port in zip(self.producer_ports, self.consumer_ports):
+            reads[int(c_port)] = reads.get(int(c_port), ()) + (int(p_port),)
+        return reads
+
+    def one_to_one(self) -> bool:
+        """Whether every edge of a direct unit joins a port no other edge does: each pair could be one buffer."""
+        edges = len(self.producer_ports)
+        return len(set(self.producer_ports)) == len(set(self.consumer_ports)) == edges
 
     def __post_init__(self) -> None:
         if not self.producer_ports:

@@ -70,6 +70,7 @@ class DeviceSpec:
     # Streams one switch drives to each neighbour ('North', 'South', 'East', 'West'); memory tiles have no east or
     # west links.
     stream_switch_ports: Dict[str, int]
+    packet_ordered_merge: bool  # whether ADF's pktorderedmerge gathers several streams into one buffer in order
     cascade_width_bits: int
     bank_mem_bytes: int
     max_mem_in_ports: int
@@ -146,6 +147,7 @@ class DeviceSpec:
             },
             cascade_width_bits=int(require(cfg, 'CascadeWidthBits')),
             bank_mem_bytes=int(require(require(cfg, 'Memory'), 'BankMemBytes')),
+            packet_ordered_merge=bool(require(cfg, 'PacketOrderedMerge')),
             max_mem_in_ports=int(require(cfg, 'MaxMemTileInPorts')),
             max_mem_out_ports=int(require(cfg, 'MaxMemTileOutPorts')),
             vector_bytes=int(require(cfg, 'VectorBytes')),

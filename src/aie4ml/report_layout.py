@@ -26,8 +26,8 @@ _COLORS = (
     '#bde0fe',
 )
 _ANSI = (39, 214, 77, 203, 141, 43, 220, 44, 209, 117)
-_KINDS = {'shared_memory': 'shared', 'dma': 'DMA', 'stream': 'stream', 'memtile': 'memtile'}
-_KIND_ORDER = {'shared_memory': 0, 'dma': 1, 'stream': 2, 'memtile': 3}
+_KINDS = {'shared_memory': 'shared', 'dma': 'DMA', 'merge': 'merge', 'stream': 'stream', 'memtile': 'memtile'}
+_KIND_ORDER = {'shared_memory': 0, 'dma': 1, 'merge': 2, 'stream': 3, 'memtile': 4}
 
 
 class Layout(dict):
@@ -232,7 +232,7 @@ def _connections(plan: Dict[str, Any], endpoint_ids: Dict[str, str], order: Dict
         if source is None or target is None:
             continue
         kind = edge.get('realization')
-        if kind not in _KINDS or kind == 'memtile':
+        if kind not in _KINDS or kind in ('memtile', 'merge'):
             raise ValueError(f'aie_pipeline.json: {source} -> {target} has unknown direct realization {kind!r}.')
         counts[(source, target, kind)] = counts.get((source, target, kind), 0) + 1
 
@@ -247,6 +247,11 @@ def _connections(plan: Dict[str, Any], endpoint_ids: Dict[str, str], order: Dict
         for source in sources:
             for target in targets:
                 counts[(source, target, 'memtile')] = counts.get((source, target, 'memtile'), 0) + 1
+
+    for merge in plan.get('merges', []):  # an ordered packet merge: each reader port gathers every writer
+        source = _endpoint(merge['writers'][0], endpoint_ids)
+        target = _endpoint(merge['readers'][0], endpoint_ids)
+        counts[(source, target, 'merge')] = counts.get((source, target, 'merge'), 0) + len(merge['readers'])
 
     return [
         {'source': source, 'target': target, 'kind': kind, 'count': count}

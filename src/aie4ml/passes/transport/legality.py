@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import numpy as np
+
 from ...op_impls.common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM
 from .layout import port_layout
 from .model import Endpoint
@@ -58,17 +60,19 @@ def memtile_staging_failure(execution, endpoints) -> str | None:
     return None
 
 
-def direct_transport_failure(execution, logical_tensor: str, producer: Endpoint, consumer: Endpoint) -> str | None:
-    return direct_pairing(execution, logical_tensor, producer, consumer)[0]
+def direct_transport_failure(
+    execution, logical_tensor: str, producer: Endpoint, consumer: Endpoint, *, merge: bool
+) -> str | None:
+    return direct_pairing(execution, logical_tensor, producer, consumer, merge=merge)[0]
 
 
 def direct_pairing(
-    execution, logical_tensor: str, producer: Endpoint, consumer: Endpoint
-) -> Tuple[Optional[str], Tuple[int, ...]]:
-    """(why the leg cannot be direct or None, the producer port each consumer port reads in consumer-port order).
-    Port i reads producer port i where the counts agree; with fewer producer ports, each consumer port reads the
-    producer port whose buffer it holds whole, a producer port read by several being broadcast, and every producer
-    port is read."""
+    execution, logical_tensor: str, producer: Endpoint, consumer: Endpoint, *, merge: bool
+) -> Tuple[Optional[str], Tuple[Tuple[int, int], ...]]:
+    """(why the leg cannot be direct or None, its (producer port, consumer port) edges in consumer-port order).
+    Port i reads producer port i where the counts agree; otherwise each consumer port reads the producer port whose
+    buffer it holds whole, a port read by several being broadcast -- or, with `merge` (an ordered packet merge), all
+    the producer ports' buffers one after another in port order, a gather. Every producer port is read."""
     if producer.node is None or consumer.node is None:
         return 'direct transport requires resolved kernel endpoints', ()
     producer_inst = execution.get(producer.node.name)
@@ -85,44 +89,65 @@ def direct_pairing(
             f'{consumer.node.name}.{consumer.group} is a {consumer_kind} port'
         ), ()
 
-    producer_ports = producer.selected_ports(producer_inst.ports.outputs[producer.tensor].count)
-    consumer_ports = consumer.selected_ports(consumer_inst.ports.inputs[consumer.tensor].count)
-    if len(producer_ports) > len(consumer_ports):
-        return f'producer ports {producer_ports} do not match consumer ports {consumer_ports}', ()
-
+    producer_ports = [int(p) for p in producer.selected_ports(producer_inst.ports.outputs[producer.tensor].count)]
+    consumer_ports = [int(p) for p in consumer.selected_ports(consumer_inst.ports.inputs[consumer.tensor].count)]
     tc = execution.tensor_contracts.get(producer.tensor)
     if tc is not None:
-        if any(int(port) < 0 or int(port) >= len(tc.port_staging) for port in producer_ports):
+        if any(port < 0 or port >= len(tc.port_staging) for port in producer_ports):
             return f'producer ports {producer_ports} exceed the published staging contract', ()
+
+    def written(p_port):
+        return producer_inst.variant.describe_output_staging(
+            producer.node, producer_inst.config, producer.tensor, p_port
+        )
+
+    def read(c_port):
+        return consumer_inst.variant.describe_input_staging(
+            consumer.node, consumer_inst.config, consumer.tensor, c_port, producer.node
+        )
 
     def mismatch(p_port, c_port) -> Optional[str]:
         """Why one buffer cannot serve both ports: some position holds a different element, as data or padding."""
-        written = producer_inst.variant.describe_output_staging(
-            producer.node, producer_inst.config, producer.tensor, int(p_port)
-        )
-        read = consumer_inst.variant.describe_input_staging(
-            consumer.node, consumer_inst.config, consumer.tensor, int(c_port), producer.node
-        )
+        source_staging, target_staging = written(p_port), read(c_port)
         where = f'{producer.node.name}.{producer.group}[{p_port}] -> {consumer.node.name}.{consumer.group}[{c_port}]'
-        if written.get('transfer_bytes') != read.get('transfer_bytes'):
+        if source_staging.get('transfer_bytes') != target_staging.get('transfer_bytes'):
             return f'staging mismatch at {where}: the ports frame each inference as different transfers'
-        source = port_layout(written).shifted(producer.offset_base).canonical()
-        target = port_layout(read).shifted(consumer.offset_base).canonical()
+        source = port_layout(source_staging).shifted(producer.offset_base).canonical()
+        target = port_layout(target_staging).shifted(consumer.offset_base).canonical()
         if source.data != target.data:
             return f'staging mismatch at {where}: the ports hold different parts of the tensor as data'
         if source != target:
             return f'staging mismatch at {where}: the buffers hold the tensor in different orders'
         return None
 
+    def gathers(c_port) -> bool:
+        """Whether the consumer port's buffer is the producer ports' buffers one after another, element for element,
+        data and padding alike."""
+        stagings = [written(p) for p in producer_ports]
+        target_staging = read(c_port)
+        if any('transfer_bytes' in staging for staging in (*stagings, target_staging)):
+            return False
+        sources = [port_layout(staging).shifted(producer.offset_base).elements() for staging in stagings]
+        coords, data = port_layout(target_staging).shifted(consumer.offset_base).elements()
+        return np.array_equal(np.concatenate([c for c, _ in sources]), coords) and np.array_equal(
+            np.concatenate([d for _, d in sources]), data
+        )
+
+    gather = merge and producer_kind == PORT_KIND_BUFFER and len(producer_ports) > 1
+    if len(producer_ports) > len(consumer_ports) and not gather:
+        return f'producer ports {producer_ports} do not match consumer ports {consumer_ports}', ()
     one_to_one = len(producer_ports) == len(consumer_ports)
-    paired = []
+    edges = []
     for index, c_port in enumerate(consumer_ports):
         candidates = [producer_ports[index]] if one_to_one else producer_ports
         problems = [mismatch(p_port, c_port) for p_port in candidates]
-        if all(problems):
+        if not all(problems):
+            edges.append((candidates[problems.index(None)], c_port))
+        elif gather and gathers(c_port):
+            edges.extend((p_port, c_port) for p_port in producer_ports)
+        else:
             return problems[0], ()
-        paired.append(int(candidates[problems.index(None)]))
-    unread = sorted(set(int(p) for p in producer_ports) - set(paired))
+    unread = sorted(set(producer_ports) - {p_port for p_port, _ in edges})
     if unread:
         return f'producer ports {unread} are read by no consumer port', ()
-    return None, tuple(paired)
+    return None, tuple(edges)
