@@ -16,8 +16,9 @@ where it must (`AIEConfig`):
   lowest latency.
 - `Optimize: 'performance'` takes the lowest interval, then the lowest latency (each within 10%, which the estimate
   cannot tell apart), then the fewest memory-tile hand-overs and tiles, within `MaxTiles` (default: the whole array).
+- `Optimize: 'latency'` takes the lowest latency (first inference), then the lowest interval, likewise.
 
-Both rank designs by a rough, relative estimate of cycles, not a timing model: each kernel's multiply-accumulates or loads,
+All rank designs by a rough, relative estimate of cycles, not a timing model: each kernel's multiply-accumulates or loads,
 plus each hand-over's bytes (none where two kernels share a buffer, twice through a memory tile).
 
 A layer's split can be fixed per layer (`LayerDirectives` in the ONNX config, or the hls4ml layer config); the

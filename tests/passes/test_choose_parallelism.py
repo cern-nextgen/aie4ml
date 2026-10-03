@@ -209,6 +209,17 @@ def test_dense_offers_splits_its_tiling_pads(tmp_path):
     assert inst.config.io_views[node.outputs[0].name].tile[-1] * 3 > 40
 
 
+def test_latency_mode_ranks_latency_before_interval():
+    """Of a design that finishes the first inference sooner and one that takes the next one sooner, 'latency' ranks
+    the first best and 'performance' the second."""
+    soon = choose_parallelism._Design(0, 8, 0, 2000, 5000, (), (), ())
+    steady = choose_parallelism._Design(0, 8, 0, 1000, 9000, (), (), ())
+    search = object.__new__(choose_parallelism._Search)
+    for mode, best in (('latency', soon), ('performance', steady)):
+        search.mode = mode
+        assert min((soon, steady), key=search.rank) is best
+
+
 def test_an_unknown_mode_is_refused(tmp_path):
     with pytest.raises(ValueError, match="Optimize='fast'"):
         lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'fast'})

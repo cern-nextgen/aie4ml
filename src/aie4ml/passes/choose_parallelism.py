@@ -5,8 +5,8 @@ Resolution and the transport classifier stay the only judges of legality; user d
 never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Designs are ranked by
 an estimate of their interval (the slowest kernel or leg) and latency (the critical path), in cycles (`estimate`):
 'performance' takes the lowest interval, then latency -- each to within INTERVAL_TOLERANCE, which the estimate cannot
-tell apart -- then the fewest memory-tile legs and tiles; 'resource' the fewest tiles, then memory-tile legs, then the
-lowest latency.
+tell apart -- then the fewest memory-tile legs and tiles; 'latency' the lowest latency, then interval, likewise;
+'resource' the fewest tiles, then memory-tile legs, then the lowest latency.
 
 It takes the layers in an order that keeps few tensors alive, since a state holds a layout per live tensor.
 'performance' first finds the lowest interval a design within the budget reaches, keeping only each state's
@@ -45,7 +45,7 @@ from .transport.routing import BELOW, port_tiles, route_overflow
 
 log = logging.getLogger(__name__)
 
-MODES = ('performance', 'resource')
+MODES = ('performance', 'latency', 'resource')
 MAX_PARTIALS = 50_000  # partial designs kept past a layer; beyond it the search narrows
 MAX_PLACEMENT_TRIALS = 16
 INTERVAL_TOLERANCE = 0.1  # cycle estimates this close the search cannot tell apart
@@ -519,16 +519,12 @@ class _Search:
     def rank(self, design: _Design) -> tuple:
         if self.mode == 'resource':
             return (design.tiles, design.memtile, design.latency, design.interval)
-        # intervals, then latencies, within INTERVAL_TOLERANCE of each other the estimate cannot tell apart: of
-        # those, the fewest memory-tile legs, then the fewest tiles
-        return (
-            _step(design.interval),
-            _step(design.latency),
-            design.memtile,
-            design.tiles,
-            design.interval,
-            design.latency,
+        # intervals and latencies, within INTERVAL_TOLERANCE of each other the estimate cannot tell apart: of those,
+        # the fewest memory-tile legs, then the fewest tiles
+        first, second = (
+            (design.latency, design.interval) if self.mode == 'latency' else (design.interval, design.latency)
         )
+        return (_step(first), _step(second), design.memtile, design.tiles, first, second)
 
     def best_buildable(self) -> Tuple[_Design, Any, int]:
         """The best-ranked design the rest of the pipeline builds, the context it was built in, and how many
