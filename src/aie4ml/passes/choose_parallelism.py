@@ -27,7 +27,7 @@ import json
 import logging
 import math
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..errors import ConfigRefused
@@ -169,8 +169,9 @@ class ChooseParallelism(AIEPass):
             flush=True,
         )
         found, refusal, trials = None, None, 0
+        shared = _Shared(logical_values(ctx.ir.logical))
         for height in (None, *_block_heights(ctx)):
-            search = _Search(ctx, mode, max_tiles, height)
+            search = _Search(ctx, mode, max_tiles, shared, height)
             if height is not None and search.microtiling == {}:
                 continue  # no layer offers this height: the pass would repeat the first
             try:
@@ -207,8 +208,24 @@ class ChooseParallelism(AIEPass):
         return True
 
 
+@dataclass
+class _Shared:
+    """What a layer, its legs and its refusals resolve to, which no microtile height changes: the searches of one
+    pass share it, so each resolves an option it meets again only once."""
+
+    values: Dict[str, Any]
+    resolved: Dict[Any, Any] = field(default_factory=dict)
+    legs: Dict[Any, Any] = field(default_factory=dict)
+    leg: Dict[Any, Any] = field(default_factory=dict)  # `_leg_facts`, by a leg and its two instances
+    routes: Dict[Any, Optional[str]] = field(default_factory=dict)
+    tiles: Dict[Any, Any] = field(default_factory=dict)
+    contracts: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    signatures: Dict[Tuple[int, str], str] = field(default_factory=dict)
+    refusals: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(int)))
+
+
 class _Search:
-    def __init__(self, ctx, mode: str, max_tiles: int, height: Optional[int] = None):
+    def __init__(self, ctx, mode: str, max_tiles: int, shared: _Shared, height: Optional[int] = None):
         self.ctx = ctx
         self.mode = mode
         self.max_tiles = max_tiles
@@ -217,7 +234,7 @@ class _Search:
         # it where the device has them, which only buffers may use
         columns = int(device.columns - max(0, device.column_start - 1))
         self.room = columns * int(device.rows - max(0, device.row_start - 1))
-        self.values = logical_values(ctx.ir.logical)
+        self.values = shared.values
         # what each layer's legs read: its inputs, or the sources of a folded view it reads
         self.reads: Dict[str, Tuple[str, ...]] = {}
         layers = [node for node in ctx.ir.logical if not node.is_folded_view]
@@ -272,15 +289,22 @@ class _Search:
         for tensors in self.reads.values():
             for tensor in set(tensors):
                 self.readers[tensor] += 1
-        self.refusals: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self.refusals = shared.refusals
         self.intervals: set = set()  # every layer's estimated interval met, the bounds a performance search tries
         self.truncated = False  # whether the program has discarded a design since last reset
         self.narrowed: set = set()  # the layers past which the search kept only MAX_PARTIALS designs
-        self._resolved: Dict[Any, Any] = {}
-        self._legs_cache: Dict[Any, Any] = {}
+        self._resolved = shared.resolved
+        self._legs_cache = shared.legs
+        self._leg_cache = shared.leg
+        self._route_cache = shared.routes
+        self._tiles_cache = shared.tiles
         self.compared = 0  # distinct complete designs within the budget that best_buildable ranked
-        self._contracts: Dict[int, Dict[str, Any]] = {}
-        self._signatures: Dict[Tuple[int, str], str] = {}
+        self._contracts = shared.contracts
+        self._signatures = shared.signatures
+        # an option's content: the searches share what it resolves to
+        self._option_keys = {
+            id(option): json.dumps(option, sort_keys=True) for options in self.options.values() for option in options
+        }
 
     # -- what an instance publishes -----------------------------------------------------------------
 
@@ -320,7 +344,7 @@ class _Search:
         instance, and each one's estimated cycles -- or None when resolution refuses it; per input arrival."""
         inputs = {t.name: live[t.name] for t in node.inputs if t.name in live}
         arrival = tuple((t, self._signature(i, t)) for t, i in inputs.items())
-        key = (node.name, json.dumps(option, sort_keys=True), arrival)
+        key = (node.name, self._option_keys[id(option)], arrival)
         if key in self._resolved:
             return self._resolved[key]
         contracts = {t: self._output_contracts(i)[t] for t, i in inputs.items() if t in self._output_contracts(i)}
@@ -369,41 +393,16 @@ class _Search:
 
             def cost(leg):
                 nonlocal memtile
-                realization = classify_connection(leg, execution, self.ctx.device).realization
-                if realization == 'memtile':
-                    check_memtile_leg(leg, execution, self.ctx.device)
-                    memtile += 1
-                if leg.consumer is not None and (realization == 'memtile' or leg.producer.node is None):
-                    sink = execution.get(leg.consumer.node.name)
-                    binding = sink.ports.inputs[leg.consumer.tensor]
-                    for port in leg.consumer.selected_ports(binding.count):
-                        tiles = port_tiles(sink, 'inputs', binding.group, port, 0, 0)
-                        below[sink.name][(binding.group, port)] = (BELOW, tuple(tiles))
-                if leg.producer.node is not None and (realization == 'memtile' or leg.consumer is None):
-                    source = execution.get(leg.producer.node.name)
-                    binding = source.ports.outputs[leg.producer.tensor]
-                    for port in leg.producer.selected_ports(binding.count):
-                        (tile,) = port_tiles(source, 'outputs', binding.group, port, 0, 0)
-                        below[source.name][(binding.group, port)] = (tile, (BELOW,))
-                readers = self.readers.get(leg.producer.tensor, 0)
-                shared = shareable(leg, realization, execution, readers)
-                # Placement shares a direct leg's buffer unless its producer's ports are surely read by another
-                # leg too: a whole tensor read by several layers, or a graph output.
-                if (
-                    leg.consumer is not None
-                    and realization == 'direct'
-                    and leg.producer.node is not None
-                    and leg.producer.tensor not in self.graph_outputs
-                    and (readers == 1 or leg.consumer.tensor != leg.producer.tensor)
-                ):
-                    sink = execution.get(leg.consumer.node.name)
-                    ports = leg.consumer.selected_ports(sink.ports.inputs[leg.consumer.tensor].count)
-                    written = leg.producer.selected_ports(
-                        execution.get(leg.producer.node.name).ports.outputs[leg.producer.tensor].count
-                    )
-                    if len(written) == len(ports):  # a broadcast copies to each reader
-                        may_share[sink.name].update((leg.consumer.group, port) for port in ports)
-                return (leg.producer.tensor, *leg_cycles(leg, realization, shared, execution, self.ctx.device))
+                facts = self._leg_facts(leg, execution)
+                if isinstance(facts, str):
+                    raise ConfigRefused(facts)
+                counted, streams, sharing, cycles = facts
+                memtile += counted
+                for name, port, stream in streams:
+                    below[name][port] = stream
+                for name, ports in sharing:
+                    may_share[name].update(ports)
+                return cycles
 
             try:
                 arrivals = tuple(tuple(cost(leg) for leg in collector.input_connections(kernel)) for kernel in kernels)
@@ -411,7 +410,7 @@ class _Search:
                 departure = tuple(max(cc, default=0) for cc in zip(*leaving)) or (0, 0)
                 reserved = sum(_reserved_tiles(kernel, may_share[kernel.name]) for kernel in kernels)
                 for name, streams in below.items():
-                    problem = route_overflow(streams, self.ctx.device.stream_switch_ports)
+                    problem = self._route_overflow(streams)
                     if problem:
                         raise ConfigRefused(f'{name}: its memory-tile and PLIO streams alone: {problem}.')
                 self._legs_cache[key] = (memtile, arrivals, departure, reserved)
@@ -419,6 +418,71 @@ class _Search:
                 self.refusals[node.name][str(refusal)] += 1
                 self._legs_cache[key] = None
         return self._legs_cache[key]
+
+    def _leg_facts(self, leg, execution):
+        """One leg's part in `_legs`, which depends on its two instances alone and is cached by them: (memory-tile
+        legs it counts, its streams from or to below as (kernel, port, stream), the (kernel, input ports) a
+        producer's buffer may coincide with, its (source tensor, latency, interval)) -- or why it is refused."""
+        ends = [None if end is None or end.node is None else end for end in (leg.producer, leg.consumer)]
+        insts = [None if end is None else execution.get(end.node.name) for end in ends]
+        key = (
+            *(id(inst) for inst in insts),
+            leg.logical_tensor,
+            *((end.tensor, end.group, end.ports, end.offset_base) for end in (leg.producer, leg.consumer) if end),
+        )
+        if key in self._leg_cache:
+            return self._leg_cache[key]
+        source, sink = insts
+        streams, sharing = [], []
+        try:
+            realization = classify_connection(leg, execution, self.ctx.device).realization
+            if realization == 'memtile':
+                check_memtile_leg(leg, execution, self.ctx.device)
+            if sink is not None and (realization == 'memtile' or source is None):
+                binding = sink.ports.inputs[leg.consumer.tensor]
+                for port in leg.consumer.selected_ports(binding.count):
+                    tiles = self._port_tiles(sink, 'inputs', binding.group, port)
+                    streams.append((sink.name, (binding.group, port), (BELOW, tuple(tiles))))
+            if source is not None and (realization == 'memtile' or leg.consumer is None):
+                binding = source.ports.outputs[leg.producer.tensor]
+                for port in leg.producer.selected_ports(binding.count):
+                    (tile,) = self._port_tiles(source, 'outputs', binding.group, port)
+                    streams.append((source.name, (binding.group, port), (tile, (BELOW,))))
+            readers = self.readers.get(leg.producer.tensor, 0)
+            shared = shareable(leg, realization, execution, readers)
+            # Placement shares a direct leg's buffer unless its producer's ports are surely read by another leg
+            # too: a whole tensor read by several layers, or a graph output.
+            if (
+                sink is not None
+                and realization == 'direct'
+                and source is not None
+                and leg.producer.tensor not in self.graph_outputs
+                and (readers == 1 or leg.consumer.tensor != leg.producer.tensor)
+            ):
+                ports = leg.consumer.selected_ports(sink.ports.inputs[leg.consumer.tensor].count)
+                written = leg.producer.selected_ports(source.ports.outputs[leg.producer.tensor].count)
+                if len(written) == len(ports):  # a broadcast copies to each reader
+                    sharing.append((sink.name, tuple((leg.consumer.group, port) for port in ports)))
+            cycles = (leg.producer.tensor, *leg_cycles(leg, realization, shared, execution, self.ctx.device))
+            facts = (int(realization == 'memtile'), tuple(streams), tuple(sharing), cycles)
+        except ConfigRefused as refusal:
+            facts = str(refusal)
+        self._leg_cache[key] = facts
+        return facts
+
+    def _port_tiles(self, inst, direction: str, group: str, port: int):
+        """`port_tiles` of an instance placed at (0, 0), cached by it."""
+        key = (id(inst), direction, group, port)
+        if key not in self._tiles_cache:
+            self._tiles_cache[key] = port_tiles(inst, direction, group, port, 0, 0)
+        return self._tiles_cache[key]
+
+    def _route_overflow(self, streams):
+        """`route_overflow` of one kernel's streams from or to below, cached by them."""
+        key = frozenset(streams.items())
+        if key not in self._route_cache:
+            self._route_cache[key] = route_overflow(streams, self.ctx.device.stream_switch_ports)
+        return self._route_cache[key]
 
     # -- the dynamic program ------------------------------------------------------------------------
 
