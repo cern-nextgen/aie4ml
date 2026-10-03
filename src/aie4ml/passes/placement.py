@@ -1068,9 +1068,7 @@ def _assign_branch_bands(
 # ---------------------------------------------------------------------------
 
 
-def _first_fit(
-    graph: GraphSpec, preplaced: Dict[str, Placed], W: int, H: int
-) -> Optional[Dict[str, Placed]]:
+def _first_fit(graph: GraphSpec, preplaced: Dict[str, Placed], W: int, H: int) -> Optional[Dict[str, Placed]]:
     """A placement found without search, or None: each op in dataflow order at the leftmost, then lowest, position
     legal beside those placed before it. It packs an array the cost-led search, which sets each op by its
     neighbours, leaves gaps in that no op fits; as that search's incumbent it can only make its result cheaper."""

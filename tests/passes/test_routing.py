@@ -19,7 +19,9 @@ def test_one_column_of_eight_chains_spreads_into_its_neighbours():
 def test_two_columns_of_memory_tile_readers_overflow():
     """A 2x8 matmul whose two operands each reach every tile from a memory tile: 32 streams into two columns, which
     the router could not route (ViT AV, 'AIE Router failed to find a legal solution')."""
-    streams = {(operand, row, col): (BELOW, [(8 + col, row)]) for operand in 'ab' for row in range(8) for col in range(2)}
+    streams = {
+        (operand, row, col): (BELOW, [(8 + col, row)]) for operand in 'ab' for row in range(8) for col in range(2)
+    }
     assert 'north' in route_overflow(streams, PORTS, COLUMNS)
 
 

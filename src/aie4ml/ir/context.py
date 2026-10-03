@@ -141,7 +141,8 @@ class DeviceSpec:
             core_stream_outputs=int(require(cfg, 'CoreStreamOutputs')),
             stream_switch_width_bits=int(require(cfg, 'StreamSwitchWidthBits')),
             stream_switch_ports={
-                side: int(require(require(cfg, 'StreamSwitchPorts'), side)) for side in ('North', 'South', 'East', 'West')
+                side: int(require(require(cfg, 'StreamSwitchPorts'), side))
+                for side in ('North', 'South', 'East', 'West')
             },
             cascade_width_bits=int(require(cfg, 'CascadeWidthBits')),
             bank_mem_bytes=int(require(require(cfg, 'Memory'), 'BankMemBytes')),

@@ -443,7 +443,9 @@ def _check_stream_rows(node, config: DenseConfig, axes) -> None:
 
 
 def _stream_locations(config, anchor_row, group: str) -> tuple:
-    return tuple(StreamLocation(g, p, col, row) for g, p, row, col, _ in cascade_ports(config, anchor_row) if g == group)
+    return tuple(
+        StreamLocation(g, p, col, row) for g, p, row, col, _ in cascade_ports(config, anchor_row) if g == group
+    )
 
 
 class _StreamInputDenseMixin:

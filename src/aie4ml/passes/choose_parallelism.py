@@ -215,7 +215,8 @@ class _Search:
         device = ctx.device
         # the tiles kernels and their buffers may take: the placement region, and the column west and row south of
         # it where the device has them, which only buffers may use
-        self.room = int(device.columns - max(0, device.column_start - 1)) * int(device.rows - max(0, device.row_start - 1))
+        columns = int(device.columns - max(0, device.column_start - 1))
+        self.room = columns * int(device.rows - max(0, device.row_start - 1))
         self.values = logical_values(ctx.ir.logical)
         # what each layer's legs read: its inputs, or the sources of a folded view it reads
         self.reads: Dict[str, Tuple[str, ...]] = {}

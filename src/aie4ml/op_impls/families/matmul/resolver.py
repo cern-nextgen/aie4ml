@@ -90,9 +90,9 @@ def _resolve_tile_cfg(
     preferred_lhs_microtile=None,
     fewest_rows=False,
 ) -> MatmulMicrotileConfig:
-    """The microtile a `microtiling` directive pins, else one the producer's must match (`required_lhs_microtile`), else the
-    producer's where the part offers it (`preferred_lhs_microtile`), else the first -- or, `fewest_rows`, the fewest
-    rows among those whose output a Dense of the same microtile reads directly (K == N).
+    """The microtile a `microtiling` directive pins, else one the producer's must match (`required_lhs_microtile`),
+    else the producer's where the part offers it (`preferred_lhs_microtile`), else the first -- or, `fewest_rows`, the
+    fewest rows among those whose output a Dense of the same microtile reads directly (K == N).
 
     The first is the generation's default; others can be slower (int8 Dense on AIE-ML at 64x64x64: 8x8x4 took 2234
     cc against 4x8x8's 1122). Operands are read in whole microtiles, and a hand-over whose producer writes other
