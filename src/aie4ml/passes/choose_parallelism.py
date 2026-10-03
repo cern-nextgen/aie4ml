@@ -1,4 +1,5 @@
-"""Choose every layer's parallelism for the whole graph at once (AIEConfig `Optimize`), before resolution.
+"""Choose every layer's parallelism, and the row height of its microtile blocks, for the whole graph at once (AIEConfig
+`Optimize`), before resolution.
 
 Resolution and the transport classifier stay the only judges of legality; user directives are constraints and are
 never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Designs are ranked by
@@ -11,7 +12,12 @@ It takes the layers in an order that keeps few tensors alive, since a state hold
 'performance' first finds the lowest interval a design within the budget reaches, keeping only each state's
 fewest-tile design, then searches the designs within it. The search is bounded, not exhaustive: per state it keeps
 the designs no other beats on tiles, latency and memory-tile legs, at most MAX_PARTIALS designs per layer, and builds
-at most MAX_PLACEMENT_TRIALS, so it reports a search limit unless it discarded nothing.
+at most MAX_PLACEMENT_TRIALS, so it reports a search limit unless it discarded nothing. A design counts the tiles its
+input buffers keep beside its kernels against the array, so it proposes none the array cannot hold.
+
+A hand-off is direct only where producer and consumer write and read the same blocks, so the block height is chosen
+for the graph, not per layer: one search with every layer's own microtile, then one per height the layers offer
+(`_block_heights`), each layer offering it taking it; the best design of them all wins.
 """
 
 from __future__ import annotations
@@ -44,6 +50,10 @@ MAX_PLACEMENT_TRIALS = 16
 INTERVAL_TOLERANCE = 0.1  # cycle estimates this close the search cannot tell apart
 
 
+class SearchLimit(RuntimeError):
+    """The search discarded or could not build designs within its limits; a design may still exist."""
+
+
 @dataclass(frozen=True)
 class _Design:
     """The layers resolved so far: what they cost, the instance chosen for each, and which of their outputs later
@@ -54,7 +64,7 @@ class _Design:
     reserved: int  # tiles beside the kernels that their input buffers keep every other op off (`_reserved_tiles`)
     interval: int  # estimated cycles: the slowest kernel or leg so far
     latency: int  # estimated cycles: the last kernel or graph output so far to finish
-    chosen: Tuple[Tuple[str, Any], ...]  # (layer, instance)
+    chosen: Tuple[Tuple[str, Any, Any], ...]  # (layer, instance, the search's choice or None)
     live: Tuple[Tuple[str, Any], ...]  # (tensor, producing instance)
     ready: Tuple[Tuple[str, int], ...]  # (live tensor, estimated cycle it is written by)
 
@@ -121,6 +131,21 @@ def _fewest_live(layers: List[OpNode], reads: Dict[str, Tuple[str, ...]]) -> Lis
     return order
 
 
+def _block_heights(ctx) -> List[int]:
+    """The row heights the layers' microtile candidates offer. A hand-off is direct only where producer and consumer
+    share a block, so besides the layers' own microtiles, the search tries each height shared by every layer that
+    offers it, one search apiece, rather than every layer's microtile apart, which multiplies its states."""
+    registry = get_family_resolver_registry()
+    return sorted(
+        {
+            option['microtile_m']
+            for node in ctx.ir.logical
+            if not node.is_folded_view
+            for option in registry.get(node.op_type).microtiling_candidates(node, ctx.device)
+        }
+    )
+
+
 class ChooseParallelism(AIEPass):
     def __init__(self):
         self.name = 'choose_parallelism'
@@ -142,8 +167,22 @@ class ChooseParallelism(AIEPass):
             f"[aie4ml] Searching for a '{mode}' design within {max_tiles} AIE tiles; this can take a minute...",
             flush=True,
         )
-        search = _Search(ctx, mode, max_tiles)
-        design, built, trials = search.best_buildable()
+        found, refusal, trials = None, None, 0
+        for height in (None, *_block_heights(ctx)):
+            search = _Search(ctx, mode, max_tiles, height)
+            if height is not None and search.microtiling == {}:
+                continue  # no layer offers this height: the pass would repeat the first
+            try:
+                design, built, tried = search.best_buildable()
+            except (ConfigRefused, SearchLimit) as failure:
+                refusal = refusal or failure
+                continue
+            trials += tried
+            if found is None or search.rank(design) < found[0].rank(found[1]):
+                found = (search, design, built)
+        if found is None:
+            raise refusal
+        search, design, built = found
         narrowed = f', narrowed after {len(search.narrowed)} layers' if search.narrowed else ''
         print(
             f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {search.compared} compared{narrowed}.',
@@ -156,7 +195,7 @@ class ChooseParallelism(AIEPass):
             'memtile_legs': design.memtile,
             'designs_tried': trials,
             'narrowed_after': sorted(search.narrowed),
-            'parallelism': search.parallelism(design),
+            **search.choices(design),
             # The trial already placed the design: pinning its places spares the placer a second search.
             'placement': {
                 name: {key: placed[key] for key in ('col', 'row')}
@@ -168,7 +207,7 @@ class ChooseParallelism(AIEPass):
 
 
 class _Search:
-    def __init__(self, ctx, mode: str, max_tiles: int):
+    def __init__(self, ctx, mode: str, max_tiles: int, height: Optional[int] = None):
         self.ctx = ctx
         self.mode = mode
         self.max_tiles = max_tiles
@@ -189,21 +228,37 @@ class _Search:
         self.layers: List[OpNode] = _fewest_live(layers, self.reads)
         registry = get_family_resolver_registry()
         self.options: Dict[str, List[Optional[Dict[str, Any]]]] = {}
-        self.choosing = set()  # the layers the search picks a parallelism for; the rest resolve as they stand
+        self.choosing = set()  # the layers the search makes a choice for; the rest resolve as they stand
+        self.microtiling: Dict[str, Dict[str, int]] = {}  # the layers this pass gives the shared block height
         for node in self.layers:
-            # A user's parallelism directive constrains the candidates to those agreeing with it; one that agrees
-            # with none is resolved as given, so resolution says what is wrong with it.
+            family = registry.get(node.op_type)
+            # A user's directive constrains the candidates to those agreeing with it; one that agrees with none is
+            # resolved as given, so resolution says what is wrong with it.
             asked = dict(node.directives.get('parallelism') or {})
-            offered = [
-                option
-                for option in registry.get(node.op_type).parallelism_candidates(node, ctx.device)
+            parallelisms = [
+                {'parallelism': option}
+                for option in family.parallelism_candidates(node, ctx.device)
                 if all(option.get(key) == value for key, value in asked.items())
                 # a candidate whose own kernels are past the budget cannot be part of a design
                 and int(option['cas_num']) * int(option['cas_length']) <= max_tiles
             ]
-            if offered:
+            pinned = node.directives.get('microtiling')
+            microtiling = next(
+                (
+                    option
+                    for option in family.microtiling_candidates(node, ctx.device)
+                    if option['microtile_m'] == height and pinned in (None, option)
+                ),
+                None,
+            )
+            if microtiling is not None:
+                self.microtiling[node.name] = microtiling
+            if parallelisms or microtiling:
                 self.choosing.add(node.name)
-            self.options[node.name] = offered or [None]
+                extra = {'microtiling': microtiling} if microtiling else {}
+                self.options[node.name] = [{**p, **extra} for p in parallelisms or [{}]]
+            else:
+                self.options[node.name] = [None]
         self.graph_inputs = tuple(ctx.ir.logical.input_tensor_names)
         self.graph_outputs = tuple(ctx.ir.logical.output_tensor_names)
         # after which layer each tensor is read no more: a tensor stays in the state until then
@@ -386,7 +441,7 @@ class _Search:
                                 design.reserved + reserved,
                                 max(design.interval, slowest),
                                 max(design.latency, finish + departure[0]),
-                                design.chosen + ((node.name, inst),),
+                                design.chosen + ((node.name, inst, option),),
                                 tuple(kept.items()),
                                 tuple((t, ready[t]) for t in kept),
                             )
@@ -401,7 +456,7 @@ class _Search:
         completed within the budget and the array whenever any of its state's can, so narrowing loses no feasible
         design, then the best of the others."""
         if len(frontier) > MAX_PARTIALS:
-            raise RuntimeError(
+            raise SearchLimit(
                 f'choose_parallelism: over {MAX_PARTIALS} search states at {node.name}; give some layers a '
                 'parallelism directive to narrow the search.'
             )
@@ -415,7 +470,7 @@ class _Search:
                 for design in found
                 if all(design is not k for k in kept[state])
             ),
-            key=lambda item: self._rank(item[1]),
+            key=lambda item: self.rank(item[1]),
         )
         for state, design in others[: max(0, MAX_PARTIALS - sum(map(len, kept.values())))]:
             kept[state].append(design)
@@ -431,7 +486,7 @@ class _Search:
         `best_buildable` bounds them. One design per point of the front: ties placement refuses alike would spend
         its trials on one failure."""
         ordered = sorted(
-            designs, key=lambda d: (d.tiles, d.tiles + d.reserved, _step(d.latency), d.memtile, *self._rank(d))
+            designs, key=lambda d: (d.tiles, d.tiles + d.reserved, _step(d.latency), d.memtile, *self.rank(d))
         )
         kept: List[Tuple[Tuple[int, ...], _Design]] = []
         for design in ordered:
@@ -442,7 +497,7 @@ class _Search:
         self.truncated |= not fewest and len(designs) > len(kept)
         return [design for _, design in kept]
 
-    def _rank(self, design: _Design) -> tuple:
+    def rank(self, design: _Design) -> tuple:
         if self.mode == 'resource':
             return (design.tiles, design.memtile, design.latency, design.interval)
         # intervals, then latencies, within INTERVAL_TOLERANCE of each other the estimate cannot tell apart: of
@@ -477,10 +532,10 @@ class _Search:
         self.truncated = False
         for bound in bounds:
             complete = self.designs(bound)
-            compared.update(json.dumps(self.parallelism(design), sort_keys=True) for design in complete)
+            compared.update(json.dumps(self.choices(design), sort_keys=True) for design in complete)
             self.compared = len(compared)
-            for design in sorted(complete, key=self._rank):
-                key = json.dumps(self.parallelism(design), sort_keys=True)
+            for design in sorted(complete, key=self.rank):
+                key = json.dumps(self.choices(design), sort_keys=True)
                 if key in tried:
                     continue
                 tried.add(key)
@@ -489,7 +544,7 @@ class _Search:
                     return design, built, len(tried)
                 unbuilt[built] += 1
                 if len(tried) == MAX_PLACEMENT_TRIALS:
-                    raise RuntimeError(
+                    raise SearchLimit(
                         self._failure(f'search limit: the {len(tried)} best designs cannot be built', unbuilt)
                     )
         if not tried:
@@ -498,11 +553,18 @@ class _Search:
             raise ConfigRefused(
                 self._failure(f'none of the {len(tried)} designs within the tile budget can be built', unbuilt)
             )
-        raise RuntimeError(self._failure(f'search limit: none of the {len(tried)} designs kept can be built', unbuilt))
+        raise SearchLimit(self._failure(f'search limit: none of the {len(tried)} designs kept can be built', unbuilt))
 
-    def parallelism(self, design: _Design) -> Dict[str, Dict[str, Any]]:
-        """The parallelism the design resolved each chosen layer to."""
-        return {name: asdict(inst.config.parallelism) for name, inst in design.chosen if name in self.choosing}
+    def choices(self, design: _Design) -> Dict[str, Dict[str, Any]]:
+        """Per directive the search chooses, what the design resolved each chosen layer under: its parallelism as
+        resolved, its microtiling as chosen."""
+        made: Dict[str, Dict[str, Any]] = {'parallelism': {}, 'microtiling': {}}
+        for name, inst, option in design.chosen:
+            if name in self.choosing:
+                made['parallelism'][name] = asdict(inst.config.parallelism)
+            if option and 'microtiling' in option:
+                made['microtiling'][name] = option['microtiling']
+        return made
 
     def _build(self, design: _Design):
         """The rest of the pipeline run on a copy of the context with this design: the built copy, or why the
@@ -510,7 +572,7 @@ class _Search:
         from ..pipeline import DEFAULT_PIPELINE
 
         trial = copy.deepcopy(self.ctx)
-        trial.ir.optimizer = {'parallelism': self.parallelism(design)}
+        trial.ir.optimizer = self.choices(design)
         rest = DEFAULT_PIPELINE[DEFAULT_PIPELINE.index(ChooseParallelism) + 1 :]
         try:
             run_aie_passes(trial, [cls() for cls in rest])

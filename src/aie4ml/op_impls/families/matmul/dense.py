@@ -9,7 +9,7 @@ from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role, shard_major_order
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
-from ...common_types import PORT_KIND_STREAM, PortBinding, PortMap
+from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
 from ...utils.io import view_shape
@@ -46,7 +46,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
 
     contract: ClassVar[str]
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism', 'microtiling'})
-    row_blocks: ClassVar[int] = 2  # row microtiles the kernel computes per step
+    row_blocks: ClassVar[int] = 2  # row microtiles the kernel computes per step, where the tiling allows
 
     def work(self, node, config) -> int:
         lhs = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
@@ -68,7 +68,6 @@ class _BaseDenseMatmulVariant(OpImplVariant):
         )
         params['stream_in'] = self.input_port_kind == PORT_KIND_STREAM
         params['stream_out'] = self.output_port_kind == PORT_KIND_STREAM
-        params['row_blocks'] = self.row_blocks
         return params
 
     def kernel_outer_extent(self, lhs_view):
@@ -126,6 +125,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             device,
             precision['lhs'],
             precision['rhs'],
+            directives.get('microtiling'),
             required_lhs_microtile=required_microtile,
             preferred_lhs_microtile=inherited_microtile(node, input_contracts) if one_block else None,
             fewest_rows=one_block,
@@ -138,8 +138,10 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             self.contract,
             parallel_cfg=parallel_cfg,
             row_blocks=self.row_blocks,
+            # dense_vector.cpp, a buffer kernel, takes a chain whose rows the two-block kernel cannot hold
+            one_block_chains=self.input_port_kind == PORT_KIND_BUFFER and self.output_port_kind == PORT_KIND_BUFFER,
         )
-        io_views = _build_matmul_io_views(node, microtiling, tiling, self.row_blocks)
+        io_views = _build_matmul_io_views(node, microtiling, tiling)
         check_register_transpose(node, io_views, device)
         # K stored shard by shard is still K: the kernel reduces over it whatever its order, so the weight rows
         # follow it (see pack) and every tiling of it stays legal.
@@ -182,6 +184,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
                 use_bias=has_input_role(node, 'bias'),
             ),
             lhs_inner_shards=lhs_inner_shards,
+            row_blocks=tiling.row_blocks,
         )
 
     def input_inner_shards(self, node, config, tensor_name):
@@ -372,7 +375,9 @@ class DenseVectorOpImplVariant(DenseOpImplVariant):
         if not super().matches(node, device, directives):
             return False
         precision, _ = resolve_operand_precision(node, device)
-        block = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], fewest_rows=True)
+        block = _resolve_tile_cfg(
+            node, device, precision['lhs'], precision['rhs'], directives.get('microtiling'), fewest_rows=True
+        )
         rows = int(np.prod(view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')[:-1]))
         return rows <= block.microtile_m
 

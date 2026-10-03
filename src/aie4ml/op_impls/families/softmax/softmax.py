@@ -94,7 +94,7 @@ class _SoftmaxVariantBase(OpImplVariant):
         in_prec = resolve_exact_storage_dtype(in_tensor.precision, namespace='lhs', layer_name=node.name)
         return in_prec.format == 'int8'
 
-    def resolve_microtile(self, _node: OpNode, _input_contracts):
+    def resolve_microtile(self, _node: OpNode, _directives, _input_contracts):
         """The microtile this variant reads/writes, or None when it works on whole rows."""
         return None
 
@@ -120,7 +120,7 @@ class _SoftmaxVariantBase(OpImplVariant):
         in_shape = tuple(int(x) for x in view_shape(node, in_tensor, 'inputs'))
         full_inner, outer_prefix, last_outer = extract_inner_outer(in_shape)
         vec_size = softmax_vec_size(precision['lhs'], device)
-        microtile = self.resolve_microtile(node, input_contracts)
+        microtile = self.resolve_microtile(node, directives, input_contracts)
         if microtile is None and full_inner % vec_size != 0:  # the tiled kernels check their microtile instead
             raise ValueError(
                 f'{node.name}: softmax axis length {full_inner} must be a multiple of vec_size={vec_size}; '
@@ -248,17 +248,17 @@ class _SoftmaxTiledMixin:
     # Prefer microtiled execution when layout is unconstrained; explicit layout wins in matches().
     plevel = 11
 
-    def resolve_microtile(self, node: OpNode, input_contracts):
+    def resolve_microtile(self, node: OpNode, directives, input_contracts):
         """Match the producer's microtile so the edge is direct; else choose our own."""
-        return inherited_microtile(node, input_contracts) or self.preferred_microtile(node)
+        return inherited_microtile(node, input_contracts) or self.preferred_microtile(node, directives)
 
-    def preferred_microtile(self, node: OpNode) -> MicrotileShape:
+    def preferred_microtile(self, node: OpNode, directives) -> MicrotileShape:
         """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary).
 
         A `microtiling` directive pins it (microtile_m -> row band, microtile_n -> feature block);
         otherwise 4x8.
         """
-        mt = node.directives.get('microtiling')
+        mt = directives.get('microtiling')
         if mt is None:
             return MicrotileShape(outer=4, inner=8)
         if set(mt) != {'microtile_m', 'microtile_n'}:

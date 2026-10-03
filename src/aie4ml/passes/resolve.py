@@ -35,12 +35,10 @@ def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
     return contracts
 
 
-def resolve_instance(node, device, input_contracts, parallelism=None) -> ExecutionInstance:
-    """The kernel graph that implements `node`, given the contracts its inputs arrive in and, when given, the
-    parallelism to resolve it under instead of its own directive. Pure: nothing is registered."""
-    directives = dict(node.directives or {})
-    if parallelism is not None:
-        directives['parallelism'] = dict(parallelism)
+def resolve_instance(node, device, input_contracts, choice=None) -> ExecutionInstance:
+    """The kernel graph that implements `node`, given the contracts its inputs arrive in and, when given, a design
+    search's choice of directives to resolve it under instead of its own. Pure: nothing is registered."""
+    directives = {**(node.directives or {}), **(choice or {})}
     directives['io_route'] = resolve_io_route(node)  # user intents
 
     check_io_view(node, device.generation)
@@ -174,8 +172,13 @@ class Resolve(AIEPass):
             inputs = {
                 t.name: execution.tensor_contracts[t.name] for t in node.inputs if t.name in execution.tensor_contracts
             }
-            # the design search's choice where it made one; otherwise the node's own directive
-            inst = resolve_instance(node, ctx.device, inputs, ctx.ir.optimizer.get('parallelism', {}).get(node.name))
+            # the design search's choices where it made them; otherwise the node's own directives
+            choice = {
+                key: chosen[node.name]
+                for key in ('parallelism', 'microtiling')
+                if node.name in (chosen := ctx.ir.optimizer.get(key, {}))
+            }
+            inst = resolve_instance(node, ctx.device, inputs, choice)
             execution.add(inst)
             execution.tensor_contracts.update(output_contracts(inst))
 

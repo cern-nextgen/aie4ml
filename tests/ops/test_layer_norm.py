@@ -188,7 +188,7 @@ def test_boundary_layernorm_splits_rows_across_tiles(tmp_path, cas_num):
 @pytest.mark.parametrize('cas_num', [1, 4])
 def test_dense_to_layernorm_only_reshards_a_partitioned_edge(tmp_path, cas_num):
     """A single tiled producer connects directly; an inner split must still be re-sharded."""
-    directives = {'d': parallelism(cas_num), 'ln': parallelism(cas_num)}
+    directives = {'d': parallelism(cas_num, contract='inner'), 'ln': parallelism(cas_num)}
     ctx = lower(_after_dense_model(), tmp_path, directives)
     if cas_num == 1:
         assert ('d_aie', 'ln_aie') in direct_edges(ctx)

@@ -2,9 +2,29 @@
 #include <adf.h>
 #include <cstdint>
 #include "matmul.h"
+#include "matmul_vector.h"
 #include "parameters.h"
 
 using namespace adf;
+
+// The kernels by row microtiles per step: 2 (matmul.cpp) or 1 (matmul_vector.cpp).
+template<typename ConfigT, int ROW_BLOCKS>
+struct matmul_kernels {
+  using single = matmul_single<ConfigT>;
+  using first = matmul_first<ConfigT>;
+  using middle = matmul_middle<ConfigT>;
+  using last = matmul_last<ConfigT>;
+  static constexpr const char* source = "matmul.cpp";
+};
+
+template<typename ConfigT>
+struct matmul_kernels<ConfigT, 1> {
+  using single = matmul_vector_single<ConfigT>;
+  using first = matmul_vector_first<ConfigT>;
+  using middle = matmul_vector_middle<ConfigT>;
+  using last = matmul_vector_last<ConfigT>;
+  static constexpr const char* source = "matmul_vector.cpp";
+};
 
 template<typename ConfigT>
 class matmul_graph : public graph {
@@ -23,6 +43,7 @@ public:
   using a_t = typename ConfigT::a_t;
   using b_t = typename ConfigT::b_t;
   using c_t = typename ConfigT::c_t;
+  using Kernels = matmul_kernels<ConfigT, ConfigT::ROW_BLOCKS>;
 
   static constexpr std::uint32_t BANK_BYTES        = 16 * 1024;
   static constexpr std::uint32_t STACK_BYTES       = 1024; // reserve 1 KiB for compiler stack
@@ -104,19 +125,20 @@ public:
   matmul_graph() {
     for (int row = 0; row < CAS_NUM; ++row) {
       if constexpr (CAS_LENGTH == 1) {
-        kk[row * CAS_LENGTH] = kernel::create_object<matmul_single<ConfigT>>();
+        kk[row * CAS_LENGTH] = kernel::create_object<typename Kernels::single>();
       } else {
-        kk[row * CAS_LENGTH] = kernel::create_object<matmul_first<ConfigT>>();
+        kk[row * CAS_LENGTH] = kernel::create_object<typename Kernels::first>();
         if constexpr (CAS_LENGTH > 2) {
-          for (int c = 1; c < CAS_LENGTH - 1; ++c)
-            kk[row * CAS_LENGTH + c] = kernel::create_object<matmul_middle<ConfigT>>();
+          for (int c = 1; c < CAS_LENGTH - 1; ++c) {
+            kk[row * CAS_LENGTH + c] = kernel::create_object<typename Kernels::middle>();
+          }
         }
-        kk[row * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<matmul_last<ConfigT>>();
+        kk[row * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<typename Kernels::last>();
       }
     }
 
     for (int idx = 0; idx < CAS_NUM * CAS_LENGTH; ++idx) {
-      source(kk[idx]) = "matmul.cpp";
+      source(kk[idx]) = Kernels::source;
       runtime<ratio>(kk[idx]) = 1.0;
     }
 

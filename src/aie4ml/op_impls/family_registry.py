@@ -24,6 +24,11 @@ class FamilyResolver:
         which follows its producer. Whether a candidate is legal is resolution's call, not this list's."""
         return ()
 
+    def microtiling_candidates(self, _node: Any, _device: Any) -> Tuple[Dict[str, Any], ...]:
+        """The `microtiling` directives a design search may resolve the node under, which differ only in the rows of
+        their blocks; () leaves it to resolution. Legality is resolution's call."""
+        return ()
+
     def spatial_access(self, _node: Any):
         """The 2-D window read around each output pixel (sizes its producer's frame), or None."""
         return None

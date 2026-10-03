@@ -754,6 +754,7 @@ def test_aie1_staging_mismatch_requires_an_explicit_relayout(tmp_path):
             tmp_path,
             directives={
                 'root': {'microtiling': {'microtile_m': 4, 'microtile_k': 8, 'microtile_n': 4}},
+                'left': {'parallelism': {'contract': 'inner'}},
             },
             project='aie1_mismatch',
         )

@@ -44,8 +44,10 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
     def resolve(self, node: OpNode, device, directives, input_contracts) -> MatmulConfig:
         io_route, parallel_cfg = parse_directives(directives)
         precision, accumulator_tag = resolve_operand_precision(node, device)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract, parallel_cfg)
+        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], directives.get('microtiling'))
+        tiling = _resolve_parallelism(
+            node, device, microtiling, precision, self.contract, parallel_cfg, one_block_chains=True
+        )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
         check_register_transpose(node, io_views, device)
 
@@ -76,6 +78,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
                 transpose_rhs=io_views[rhs_tensor.name].is_transposed,
             ),
+            row_blocks=tiling.row_blocks,
         )
 
     def validate_config(self, node: OpNode, config: MatmulConfig, _device) -> None:

@@ -98,7 +98,7 @@ class _LayerNormVariantBase(OpImplVariant):
         out_prec = resolve_exact_storage_dtype(node.outputs[0].precision, namespace='output', layer_name=node.name)
         return int(in_prec.width) == 8 and bool(in_prec.signed) and int(out_prec.width) == 8 and bool(out_prec.signed)
 
-    def resolve_microtile(self, _node: OpNode, _input_contracts):
+    def resolve_microtile(self, _node: OpNode, _directives, _input_contracts):
         """The microtile this variant normalises in, or None when it works on whole rows."""
         return None
 
@@ -147,7 +147,7 @@ class _LayerNormVariantBase(OpImplVariant):
             descending=True,
         )
 
-        microtile = self.resolve_microtile(node, input_contracts)
+        microtile = self.resolve_microtile(node, directives, input_contracts)
         io_views = build_io_views(
             node,
             [in_tensor],
@@ -301,17 +301,17 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
     plevel = 11
     kernel_transposes_microtile = True
 
-    def resolve_microtile(self, node: OpNode, input_contracts):
+    def resolve_microtile(self, node: OpNode, directives, input_contracts):
         """Match the producer's microtile so the edge is direct; else choose our own."""
-        return inherited_microtile(node, input_contracts) or self.preferred_microtile(node)
+        return inherited_microtile(node, input_contracts) or self.preferred_microtile(node, directives)
 
-    def preferred_microtile(self, node: OpNode) -> MicrotileShape:
+    def preferred_microtile(self, node: OpNode, directives) -> MicrotileShape:
         """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary).
 
         A `microtiling` directive pins it (microtile_m -> row band, microtile_n -> feature block);
         otherwise 4x8.
         """
-        mt = node.directives.get('microtiling')
+        mt = directives.get('microtiling')
         if mt is None:
             return MicrotileShape(outer=4, inner=8)
         if set(mt) != {'microtile_m', 'microtile_n'}:

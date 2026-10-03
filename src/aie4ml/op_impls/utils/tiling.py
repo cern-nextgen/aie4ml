@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Tuple
+from typing import Callable, Dict, Tuple
 
 from ...errors import ConfigRefused
 from ...ir.graph import TENSOR_LAYOUTS, input_tensor_for_role
@@ -79,6 +79,25 @@ def layout_variant_matches(node, layout: str) -> bool:
     if 'layout' in node.directives:
         return requested_layout(node) == layout
     return True
+
+
+# The row heights a design search may give a generation's int8 ops, per (lhs, rhs) format: a matmul's microtile_m and
+# the row bands of the row-wise ops between, so each reads its neighbour directly. Those whose mmul runs at one speed
+# a row: int8 Dense on AIE-ML, 64x64x64: 4x8x8 1122 cc, 8x8x8 1050, where 2x8x8 runs 2.3x slower a row; AIE-MLv2's
+# 4x8x8 runs 2x slower than its 8x8x8, so it offers one height.
+ROW_HEIGHTS: Dict[str, Dict[Tuple[str, str], Tuple[int, ...]]] = {
+    'AIE-ML': {('int8', 'int8'): (4, 8)},
+    'AIE-MLV2': {('int8', 'int8'): (8,)},
+}
+
+
+def band_microtiling_candidates(node, device) -> Tuple[dict, ...]:
+    """The 8-wide row bands of ROW_HEIGHTS a tiled int8 row-wise kernel may work in where no producer fixes one, so a
+    matmul on either side reads them directly; none where its layout is pinned to whole rows."""
+    if 'layout' in node.directives and requested_layout(node) != 'tiled':
+        return ()
+    heights = ROW_HEIGHTS.get(device.generation, {}).get(('int8', 'int8'), ())
+    return tuple({'microtile_m': m, 'microtile_n': 8} for m in heights)
 
 
 def inherited_microtile(node, input_contracts):

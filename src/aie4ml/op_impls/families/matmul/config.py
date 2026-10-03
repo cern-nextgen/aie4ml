@@ -46,6 +46,7 @@ class DenseConfig:
     alternating_horizontal: bool
     flags: DenseFlags
     lhs_inner_shards: Optional[Tuple[int, int]] = None  # the producer's shard-by-shard K order, adopted
+    row_blocks: int = 2  # row microtiles its kernel computes a step: 2 (dense_bias_relu.cpp) or 1 (dense_vector.cpp)
 
 
 @dataclass(frozen=True)
@@ -60,3 +61,4 @@ class MatmulConfig:
     rounding_mode: Optional[str]
     alternating_horizontal: bool
     flags: MatmulFlags
+    row_blocks: int = 2  # row microtiles its kernel computes a step: 2 (matmul.cpp) or 1 (matmul_vector.cpp)

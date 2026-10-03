@@ -18,6 +18,7 @@ struct {{L.struct_name}} {
   static constexpr bool TRANSPOSE_B = {{ 'true' if P.flags.transpose_rhs else 'false' }};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr int M = {{P.microtiling.microtile_m}}, K = {{P.microtiling.microtile_k}}, N = {{P.microtiling.microtile_n}};
+  static constexpr int ROW_BLOCKS = {{P.row_blocks}};
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};
   static constexpr int padded_M = {{P.full_outer}};

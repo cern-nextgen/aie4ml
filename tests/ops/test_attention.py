@@ -74,9 +74,9 @@ CASES = {
     'aie-mlv2': (AIE_MLV2, 16, 16, 16, {}),
     'aie-mlv2-split': (AIE_MLV2, 16, 16, 32, SPLIT),
 }
-# The projections write K and V in the blocks the matmuls read them in: AIE-MLv2's 8x8 microtiles. AIE-ML's 4x8x8
-# writes 4-row blocks that its 8-row reads would have to stack, so a memory tile re-tiles them.
-THROUGH_MEMTILES = {'aie-ml': {'k_mm', 'v_mm'}, 'aie-mlv2': set(), 'aie-mlv2-split': set()}
+# The projections write K and V in the blocks the matmuls read them in, 8x8: the search takes 8x8x8 on AIE-ML too,
+# whose 4x8x8 would write 4-row blocks a memory tile re-tiles for the 8-row reads.
+THROUGH_MEMTILES = {'aie-ml': set(), 'aie-mlv2': set(), 'aie-mlv2-split': set()}
 
 
 @pytest.mark.parametrize('case', CASES)

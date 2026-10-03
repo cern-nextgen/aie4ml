@@ -14,6 +14,7 @@ from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
 from ...utils.io import view_shape
 from ...utils.precision import element_bytes, resolve_operand_precision
+from ...utils.tiling import ROW_HEIGHTS
 from .common import MICROTILE_OPTIONS, select_generation_key
 from .config import MatmulMicrotileConfig
 
@@ -37,6 +38,7 @@ class MatmulTiling:
     contract: str = 'inner'
     tile_outer: int = 0
     tile_outer_raw: int = 0
+    row_blocks: int = 2  # row microtiles the kernel computes a step, which the rows are aligned to
 
 
 def _bank_capacity_bytes(device: Any) -> int:
@@ -79,9 +81,16 @@ def _supported_microtile_options(generation: str, lhs_dtype, rhs_dtype):
 
 
 def _resolve_tile_cfg(
-    node, device, lhs_dtype, rhs_dtype, required_lhs_microtile=None, preferred_lhs_microtile=None, fewest_rows=False
+    node,
+    device,
+    lhs_dtype,
+    rhs_dtype,
+    microtiling_cfg=None,
+    required_lhs_microtile=None,
+    preferred_lhs_microtile=None,
+    fewest_rows=False,
 ) -> MatmulMicrotileConfig:
-    """The microtile a directive pins, else one the producer's must match (`required_lhs_microtile`), else the
+    """The microtile a `microtiling` directive pins, else one the producer's must match (`required_lhs_microtile`), else the
     producer's where the part offers it (`preferred_lhs_microtile`), else the first -- or, `fewest_rows`, the fewest
     rows among those whose output a Dense of the same microtile reads directly (K == N).
 
@@ -89,7 +98,6 @@ def _resolve_tile_cfg(
     cc against 4x8x8's 1122). Operands are read in whole microtiles, and a hand-over whose producer writes other
     blocks goes through a memory tile: stacking the producer's smaller blocks into one operand instead kept it direct
     but ran 3x to 8x slower (8x8x8 reading 4x8 blocks: 127 cc against 38 at 16x16x16, 8484 against 1050 at 64^3)."""
-    microtiling_cfg = node.directives.get('microtiling')
     if microtiling_cfg is not None and len(microtiling_cfg) != 3:
         raise ValueError(f'{node.name}: microtiling needs microtile_m, microtile_k and microtile_n.')
     options = _supported_microtile_options(device.generation, lhs_dtype, rhs_dtype)
@@ -150,9 +158,11 @@ def _parallelism_candidate(
     full_outer: int,
     cas_num: int,
     cas_length: int,
-    outer_granularity: int,
+    row_blocks: int,
+    microtile_m: int,
     contract: str = 'inner',
 ) -> Optional[MatmulTiling]:
+    outer_granularity = row_blocks * microtile_m
     row_wise = contract == 'outer'
     tile_inner_rhs_raw = out_shape if row_wise else ((out_shape + cas_num - 1) // cas_num if cas_num else out_shape)
     tile_inner_lhs_raw = (in_shape + cas_length - 1) // cas_length if cas_length else in_shape
@@ -194,6 +204,7 @@ def _parallelism_candidate(
         contract=str(contract),
         tile_outer=int(tile_outer),
         tile_outer_raw=int(tile_outer_raw),
+        row_blocks=int(row_blocks),
     )
 
 
@@ -242,6 +253,24 @@ def matmul_parallelism_candidates(node, device) -> tuple[Dict[str, Any], ...]:
     return tuple({'contract': c, 'cas_num': n, 'cas_length': k} for c, n, k in sorted(found))
 
 
+def matmul_microtiling_candidates(node, device) -> tuple[Dict[str, Any], ...]:
+    """The generation's first microtile at each row height of ROW_HEIGHTS, of those computing the fewest rows two row
+    blocks a step: they run its multiply-accumulates at one speed, so the estimate tells them apart by the rows each
+    computes. None where the generation offers one height."""
+    precision, _ = resolve_operand_precision(node, device)
+    key = (legality_format(precision['lhs'].format), legality_format(precision['rhs'].format))
+    heights = ROW_HEIGHTS.get(select_generation_key(device.generation), {}).get(key, ())
+    if len(heights) < 2:
+        return ()
+    _, k, n = _supported_microtile_options(device.generation, precision['lhs'], precision['rhs'])[0]
+    lhs_shape = view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')
+    rows = int(lhs_shape[-2]) if len(lhs_shape) > 1 else 1
+    fewest = min(align_up(rows, 2 * m) for m in heights)
+    return tuple(
+        {'microtile_m': m, 'microtile_k': k, 'microtile_n': n} for m in heights if align_up(rows, 2 * m) == fewest
+    )
+
+
 def _resolve_parallelism(
     node,
     device,
@@ -250,7 +279,10 @@ def _resolve_parallelism(
     contract: str,
     parallel_cfg: Dict[str, Any],
     row_blocks: int = 2,
+    one_block_chains: bool = False,
 ) -> MatmulTiling:
+    """The tiling `parallel_cfg` asks for, its rows aligned to `row_blocks` row microtiles; or, with
+    `one_block_chains`, to one where only a kernel computing one row block a step can split them so."""
     lhs_tensor = input_tensor_for_role(node, 'lhs')
     lhs_shape = view_shape(node, lhs_tensor, 'inputs')
     in_shape = lhs_shape[-1]
@@ -266,31 +298,33 @@ def _resolve_parallelism(
     rhs_bytes = element_bytes(precision['rhs'])
     output_bytes = element_bytes(precision['output'])
 
-    lhs_align = 2 * microtiling.microtile_k
-    rhs_align = 2 * microtiling.microtile_n
-    outer_granularity = row_blocks * microtiling.microtile_m
-
     last_outer = int(lhs_shape[-2]) if len(lhs_shape) > 1 else 1
     outer_extent = int(math.prod(lhs_shape[:-1]))
-    padded_last_outer = align_up(last_outer, outer_granularity)
-    full_outer = (outer_extent // max(1, last_outer)) * padded_last_outer
 
-    tiling = _parallelism_candidate(
-        op_type=node.op_type,
-        device=device,
-        in_shape=int(in_shape),
-        out_shape=int(out_shape),
-        lhs_align=int(lhs_align),
-        rhs_align=int(rhs_align),
-        lhs_bytes=int(lhs_bytes),
-        rhs_bytes=int(rhs_bytes),
-        output_bytes=int(output_bytes),
-        full_outer=int(full_outer),
-        cas_num=int(cas_num),
-        cas_length=int(cas_length),
-        outer_granularity=int(outer_granularity),
-        contract=contract,
-    )
+    def candidate(blocks: int) -> Optional[MatmulTiling]:
+        full_outer = (outer_extent // max(1, last_outer)) * align_up(last_outer, blocks * microtiling.microtile_m)
+        return _parallelism_candidate(
+            op_type=node.op_type,
+            device=device,
+            in_shape=int(in_shape),
+            out_shape=int(out_shape),
+            lhs_align=2 * microtiling.microtile_k,
+            rhs_align=2 * microtiling.microtile_n,
+            lhs_bytes=int(lhs_bytes),
+            rhs_bytes=int(rhs_bytes),
+            output_bytes=int(output_bytes),
+            full_outer=int(full_outer),
+            cas_num=int(cas_num),
+            cas_length=int(cas_length),
+            row_blocks=blocks,
+            microtile_m=int(microtiling.microtile_m),
+            contract=contract,
+        )
+
+    tiling = candidate(row_blocks)
+    if tiling is None and one_block_chains and contract == 'outer' and row_blocks > 1:
+        # rows the two-block kernel cannot split this many ways, as one row block a step
+        tiling = candidate(1)
     if tiling is None:
         raise ConfigRefused(
             f'{node.name}: cas_num={cas_num} x cas_length={cas_length} does not tile it under the {contract!r} '
@@ -299,15 +333,13 @@ def _resolve_parallelism(
     return tiling
 
 
-def _build_matmul_io_views(
-    node, microtiling: MatmulMicrotileConfig, tiling: MatmulTiling, row_blocks: int = 2
-) -> Dict[str, TensorView]:
+def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: MatmulTiling) -> Dict[str, TensorView]:
     # 'outer' slices the rows across cas_num tiles and keeps N whole, so the output's inner
     # extent is one tile's N (not cas_num of them) and lhs/output carry a per-tile row slice.
     row_wise = tiling.contract == 'outer'
     full_inner_lhs = tiling.tile_inner_lhs * tiling.cas_length
     full_inner_out = tiling.tile_inner_rhs if row_wise else tiling.tile_inner_rhs * tiling.cas_num
-    outer_granularity = row_blocks * microtiling.microtile_m
+    outer_granularity = tiling.row_blocks * microtiling.microtile_m
 
     lhs_microtile = MicrotileShape(outer=int(microtiling.microtile_m), inner=int(microtiling.microtile_k))
     rhs_microtile = MicrotileShape(outer=int(microtiling.microtile_k), inner=int(microtiling.microtile_n))
@@ -409,6 +441,9 @@ class _MatmulFamilyBase(FamilyResolver):
 
     def parallelism_candidates(self, node, device):
         return matmul_parallelism_candidates(node, device)
+
+    def microtiling_candidates(self, node, device):
+        return matmul_microtiling_candidates(node, device)
 
     def reorder_reduction_rows(self, node, tensor, order) -> None:
         rhs = input_tensor_for_role(node, 'rhs')

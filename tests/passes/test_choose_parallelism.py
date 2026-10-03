@@ -205,7 +205,7 @@ def test_dense_offers_splits_its_tiling_pads(tmp_path):
     (node,) = [n for n in ctx.ir.logical if n.op_type == 'dense']
     split = {'contract': 'inner', 'cas_num': 3, 'cas_length': 1}
     assert split in get_family_resolver_registry().get('dense').parallelism_candidates(node, ctx.device)
-    inst = resolve_instance(node, ctx.device, {}, split)
+    inst = resolve_instance(node, ctx.device, {}, {'parallelism': split})
     assert inst.config.io_views[node.outputs[0].name].tile[-1] * 3 > 40
 
 

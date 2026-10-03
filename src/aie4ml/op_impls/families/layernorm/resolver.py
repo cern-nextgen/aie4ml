@@ -5,7 +5,7 @@ import math
 from ....ir import input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils.io import view_shape
-from ...utils.tiling import row_band_candidates
+from ...utils.tiling import band_microtiling_candidates, row_band_candidates
 
 
 @family_resolver('layer_norm')
@@ -14,6 +14,9 @@ class LayerNormFamilyResolver(FamilyResolver):
 
     def parallelism_candidates(self, node, device):
         return row_band_candidates(node, device)
+
+    def microtiling_candidates(self, node, device):
+        return band_microtiling_candidates(node, device)
 
     def validate_structure(self, node, _device) -> None:
         in_tensor = input_tensor_for_role(node, 'lhs')
