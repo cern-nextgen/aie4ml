@@ -1068,6 +1068,34 @@ def _assign_branch_bands(
 # ---------------------------------------------------------------------------
 
 
+def _first_fit(
+    graph: GraphSpec, preplaced: Dict[str, Placed], W: int, H: int
+) -> Optional[Dict[str, Placed]]:
+    """A placement found without search, or None: each op in dataflow order at the leftmost, then lowest, position
+    legal beside those placed before it. It packs an array the cost-led search, which sets each op by its
+    neighbours, leaves gaps in that no op fits; as that search's incumbent it can only make its result cheaper."""
+    placed = dict(preplaced)
+    for name in graph.order:
+        if name in placed:
+            continue
+        spec = graph.specs[name]
+        x_lo, x_hi = spec.x_range or (0, W - spec.rect.w)
+        y_lo, y_hi = spec.y_range or (0, H - spec.rect.h)
+        fit = next(
+            (
+                candidate
+                for x in range(x_lo, x_hi + 1)
+                for y in range(y_lo, y_hi + 1)
+                if _feasible(candidate := Placed(name=name, x=x, y=y, rect=spec.rect), placed, graph, W, H)
+            ),
+            None,
+        )
+        if fit is None:
+            return None
+        placed[name] = fit
+    return placed
+
+
 def _bnb_place_graph(
     graph: GraphSpec,
     W: int,
@@ -1083,8 +1111,9 @@ def _bnb_place_graph(
 
     Nodes are selected frontier-first (most placed neighbors) and candidates
     are ordered by proximity to the median ideal position from placed neighbors.
-    The first complete path through the DFS tree acts as the initial incumbent,
-    after which cost pruning fires. Backtracking handles infeasibility.
+    A first fit (`_first_fit`) is the initial incumbent where one exists, else
+    the first complete path through the DFS tree; cost pruning fires from it.
+    Backtracking handles infeasibility.
 
     Exact search when candidate_limit=None (exponential on large grids).
     Heuristic bounded search when candidate_limit is an int (recommended: 32).
@@ -1094,8 +1123,8 @@ def _bnb_place_graph(
 
     preplaced = _validate_and_preplace_anchors(graph, W, H)
 
-    best_cost = float('inf')
-    best: Dict[str, Placed] = {}
+    best = _first_fit(graph, preplaced, W, H) or {}
+    best_cost = _full_cost(graph, best, lam, mu) if best else float('inf')
     states_visited = 0
     budget_exhausted = False
     # Tiles the placed ops occupy: two ops never share one, so a candidate on any of them is refused before the

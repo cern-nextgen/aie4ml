@@ -34,6 +34,7 @@ from .legalize_layouts import convert_inputs
 from .resolve import logical_values, output_contracts, resolve_instance
 from .transport.classify import classify_connection
 from .transport.collect import TransportCollector
+from .transport.memtile import check_memtile_leg
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ class _Design:
 
     memtile: int
     tiles: int
+    reserved: int  # tiles beside the kernels that their input buffers keep every other op off (`_reserved_tiles`)
     interval: int  # estimated cycles: the slowest kernel or leg so far
     latency: int  # estimated cycles: the last kernel or graph output so far to finish
     chosen: Tuple[Tuple[str, Any], ...]  # (layer, instance)
@@ -60,6 +62,32 @@ class _Design:
 def _step(cycles: int) -> int:
     """`cycles` on a geometric grid INTERVAL_TOLERANCE apart."""
     return int(math.log1p(cycles) / math.log1p(INTERVAL_TOLERANCE))
+
+
+def _reserved_tiles(inst, shared_ports: set) -> int:
+    """Tiles outside the kernel's footprint whose memory its input buffers pin, less those holding a buffer it may
+    share with its producer: placement keeps every other op's tiles and buffers off them (`placement`'s conflict
+    rule), so they are taken as surely as the footprint. The fewer over the anchor rows' parities (AIE1 mirrors
+    its banks on odd rows)."""
+    footprint = inst.variant.footprint(inst.node, inst.config)
+    inputs = {binding.group for binding in inst.ports.inputs.values()}
+    counts = []
+    for anchor_row in (0, 1):
+        outside, excused = set(), set()
+        for loc in inst.variant.buffer_locations(inst.node, inst.config, anchor_row):
+            col, row = loc.rel_col, loc.rel_row
+            if loc.port_group not in inputs or (0 <= col < footprint.width and 0 <= row < footprint.height):
+                continue
+            if not (-1 <= col <= footprint.width and -1 <= row <= footprint.height):
+                raise RuntimeError(
+                    f'{inst.name}: buffer {loc.port_group}[{loc.port}] pinned at ({col}, {row}), beyond the tiles next '
+                    'to its footprint that the design search accounts for.'
+                )
+            outside.add((col, row))
+            if (loc.port_group, loc.port) in shared_ports:
+                excused.add((col, row))
+        counts.append(len(outside - excused))
+    return min(counts)
 
 
 def _fewest_live(layers: List[OpNode], reads: Dict[str, Tuple[str, ...]]) -> List[OpNode]:
@@ -144,6 +172,10 @@ class _Search:
         self.ctx = ctx
         self.mode = mode
         self.max_tiles = max_tiles
+        device = ctx.device
+        # the tiles kernels and their buffers may take: the placement region, and the column west and row south of
+        # it where the device has them, which only buffers may use
+        self.room = int(device.columns - max(0, device.column_start - 1)) * int(device.rows - max(0, device.row_start - 1))
         self.values = logical_values(ctx.ir.logical)
         # what each layer's legs read: its inputs, or the sources of a folded view it reads
         self.reads: Dict[str, Tuple[str, ...]] = {}
@@ -258,9 +290,10 @@ class _Search:
         return footprint.width * footprint.height
 
     def _legs(self, node: OpNode, kernels, live: Dict[str, Any]):
-        """(memtile, arrivals, departure) for `node`'s kernels: how many of their legs a memory tile carries, the
-        (source tensor, latency, interval) legs into each kernel, and the (latency, interval) its graph-boundary
-        outputs take to leave -- or None when the transport classifier refuses a leg."""
+        """(memtile, arrivals, departure, reserved) for `node`'s kernels: how many of their legs a memory tile
+        carries, the (source tensor, latency, interval) legs into each kernel, the (latency, interval) its
+        graph-boundary outputs take to leave, and the tiles their input buffers reserve (`_reserved_tiles`) -- or
+        None when the transport classifier refuses a leg."""
         producers = {id(live[t]): live[t] for t in self.reads[node.name] if t in live}
         key = (id(kernels[-1]), tuple(sorted(producers)))
         if key not in self._legs_cache:
@@ -274,20 +307,36 @@ class _Search:
             )
             collector = TransportCollector(execution)
             memtile = 0
+            may_share = defaultdict(set)  # kernel -> its input ports a producer's buffer may coincide with
 
             def cost(leg):
                 nonlocal memtile
                 realization = classify_connection(leg, execution, self.ctx.device).realization
-                memtile += realization == 'memtile'
+                if realization == 'memtile':
+                    check_memtile_leg(leg, execution, self.ctx.device)
+                    memtile += 1
                 readers = self.readers.get(leg.producer.tensor, 0)
                 shared = shareable(leg, realization, execution, readers)
+                # Placement shares a direct leg's buffer unless its producer's ports are surely read by another
+                # leg too: a whole tensor read by several layers, or a graph output.
+                if (
+                    leg.consumer is not None
+                    and realization == 'direct'
+                    and leg.producer.node is not None
+                    and leg.producer.tensor not in self.graph_outputs
+                    and (readers == 1 or leg.consumer.tensor != leg.producer.tensor)
+                ):
+                    sink = execution.get(leg.consumer.node.name)
+                    ports = leg.consumer.selected_ports(sink.ports.inputs[leg.consumer.tensor].count)
+                    may_share[sink.name].update((leg.consumer.group, port) for port in ports)
                 return (leg.producer.tensor, *leg_cycles(leg, realization, shared, execution, self.ctx.device))
 
             try:
                 arrivals = tuple(tuple(cost(leg) for leg in collector.input_connections(kernel)) for kernel in kernels)
                 leaving = [cost(leg)[1:] for leg in collector.output_connections(kernels[-1], self.last_read)]
                 departure = tuple(max(cc, default=0) for cc in zip(*leaving)) or (0, 0)
-                self._legs_cache[key] = (memtile, arrivals, departure)
+                reserved = sum(_reserved_tiles(kernel, may_share[kernel.name]) for kernel in kernels)
+                self._legs_cache[key] = (memtile, arrivals, departure, reserved)
             except ConfigRefused as refusal:
                 self.refusals[node.name][str(refusal)] += 1
                 self._legs_cache[key] = None
@@ -297,8 +346,9 @@ class _Search:
 
     def designs(self, bound: Optional[int] = None, fewest: bool = False) -> List[_Design]:
         """The complete designs whose estimated interval stays within `bound`, as the program keeps them; with
-        `fewest`, only each state's fewest-tile one, which tells whether any design completes within the budget."""
-        frontier = {(): [_Design(0, 0, 0, 0, (), (), ())]}
+        `fewest`, only each state's designs no other beats on both tiles and area, which tells whether any design
+        completes within the budget and the array."""
+        frontier = {(): [_Design(0, 0, 0, 0, 0, (), (), ())]}
         for position, node in enumerate(self.layers):
             grown: Dict[Any, List[_Design]] = defaultdict(list)
             for designs in frontier.values():
@@ -311,7 +361,7 @@ class _Search:
                     legs = self._legs(node, kernels, live)
                     if legs is None:
                         continue
-                    memtile, arrivals, departure = legs
+                    memtile, arrivals, departure, reserved = legs
                     slowest = max(*cycles, *(cc for legs_in in arrivals for *_, cc in legs_in), departure[1])
                     self.intervals.add(slowest)
                     if bound is not None and slowest > bound:
@@ -322,7 +372,7 @@ class _Search:
                     state = tuple(sorted((t, self._signature(i, t)) for t, i in kept.items()))
                     for design in designs:
                         total = design.tiles + tiles
-                        if total > self.max_tiles:
+                        if total > self.max_tiles or total + design.reserved + reserved > self.room:
                             continue
                         ready = dict(design.ready)
                         for kernel, legs_in, kernel_cc in zip(kernels, arrivals, cycles):
@@ -333,6 +383,7 @@ class _Search:
                             _Design(
                                 design.memtile + memtile,
                                 total,
+                                design.reserved + reserved,
                                 max(design.interval, slowest),
                                 max(design.latency, finish + departure[0]),
                                 design.chosen + ((node.name, inst),),
@@ -346,8 +397,9 @@ class _Search:
         return [design for found in frontier.values() for design in found]
 
     def _narrow(self, node: OpNode, frontier: Dict[Any, List[_Design]]) -> Dict[Any, List[_Design]]:
-        """MAX_PARTIALS of the designs: each state's fewest-tile one, which can be completed within the budget
-        whenever any of its state's can, so narrowing loses no feasible design, then the best of the others."""
+        """MAX_PARTIALS of the designs: each state's designs no other beats on tiles and area, of which one can be
+        completed within the budget and the array whenever any of its state's can, so narrowing loses no feasible
+        design, then the best of the others."""
         if len(frontier) > MAX_PARTIALS:
             raise RuntimeError(
                 f'choose_parallelism: over {MAX_PARTIALS} search states at {node.name}; give some layers a '
@@ -355,33 +407,40 @@ class _Search:
             )
         self.narrowed.add(node.name)
         self.truncated = True
-        kept = {state: [min(found, key=lambda design: design.tiles)] for state, found in frontier.items()}
+        kept = {state: self._kept(found, fewest=True) for state, found in frontier.items()}
         others = sorted(
-            ((state, design) for state, found in frontier.items() for design in found if design is not kept[state][0]),
+            (
+                (state, design)
+                for state, found in frontier.items()
+                for design in found
+                if all(design is not k for k in kept[state])
+            ),
             key=lambda item: self._rank(item[1]),
         )
-        for state, design in others[: MAX_PARTIALS - len(kept)]:
+        for state, design in others[: max(0, MAX_PARTIALS - sum(map(len, kept.values())))]:
             kept[state].append(design)
         return kept
 
     def _kept(self, designs: List[_Design], fewest: bool) -> List[_Design]:
-        """The designs of one state the search carries on: those no other beats on tiles, latency and memory-tile
-        legs at once, latencies to within INTERVAL_TOLERANCE, or with `fewest` the fewest-tile one alone. Designs
-        sharing a state have the same futures, so this keeps every trade of tiles spent here against tiles left for
-        later layers, and a direct design beside a cheaper one through memory tiles: one beaten on all three only
-        completes as a design beaten on all three, and the fewest-tile one completes within the budget whenever any
-        does. Intervals need no such trade: `best_buildable` bounds them. One design per point of the front: ties
-        placement refuses alike would spend its trials on one failure."""
-        ordered = sorted(designs, key=lambda d: (d.tiles, _step(d.latency), d.memtile, *self._rank(d)))
-        if fewest:
-            return ordered[:1]
-        kept: List[Tuple[int, int, _Design]] = []
+        """The designs of one state the search carries on: those no other beats on tiles, area (tiles and reserved
+        tiles), latency and memory-tile legs at once, latencies to within INTERVAL_TOLERANCE -- or with `fewest`, on
+        tiles and area alone. Designs sharing a state have the same futures, so this keeps every trade of tiles and
+        area spent here against what later layers need, and a direct design beside a cheaper one through memory
+        tiles: one beaten on all of them only completes as a design beaten on all of them, and with `fewest` some
+        design kept completes within the budget and the array whenever any does. Intervals need no such trade:
+        `best_buildable` bounds them. One design per point of the front: ties placement refuses alike would spend
+        its trials on one failure."""
+        ordered = sorted(
+            designs, key=lambda d: (d.tiles, d.tiles + d.reserved, _step(d.latency), d.memtile, *self._rank(d))
+        )
+        kept: List[Tuple[Tuple[int, ...], _Design]] = []
         for design in ordered:
-            latency = _step(design.latency)
-            if not any(other <= latency and memtile <= design.memtile for other, memtile, _ in kept):
-                kept.append((latency, design.memtile, design))
-        self.truncated |= len(designs) > len(kept)
-        return [design for *_, design in kept]
+            area = design.tiles + design.reserved
+            point = (area,) if fewest else (area, _step(design.latency), design.memtile)
+            if not any(all(a <= b for a, b in zip(other, point)) for other, _ in kept):
+                kept.append((point, design))
+        self.truncated |= not fewest and len(designs) > len(kept)
+        return [design for _, design in kept]
 
     def _rank(self, design: _Design) -> tuple:
         if self.mode == 'resource':

@@ -27,9 +27,9 @@ def direct_boundary_access(
     return descriptor, descriptor.pop('transfer_shape', None)
 
 
-def graph_input_port_descs(entry, ctx, port_base: int) -> Dict[int, Dict[str, Any]]:
+def graph_input_port_descs(entry, execution, port_base: int) -> Dict[int, Dict[str, Any]]:
     consumer = entry.single_consumer()
-    inst = ctx.ir.execution.get(consumer.node.name)
+    inst = execution.get(consumer.node.name)
     binding = inst.ports.inputs[consumer.tensor]
     consumer_ports = consumer.selected_ports(binding.count)
     count = len(consumer_ports)
