@@ -8,7 +8,7 @@ from ....aie_types import FloatIntent
 from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role, shard_major_order
 from ....passes.utils import sanitize_identifier
-from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant, StreamLocation, cascade_ports
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
@@ -238,20 +238,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         )
 
     def buffer_locations(self, _node, config, anchor_row):
-        locations = []
-        cas_num = int(config.parallelism.cas_num)
-        cas_length = int(config.parallelism.cas_length)
-        outer = config.parallelism.contract == 'outer'
-        for chain in range(cas_num):
-            flow = row_flow(config.alternating_horizontal, int(anchor_row) + chain, cas_length)
-            for pos in range(cas_length):
-                idx = chain * cas_length + pos
-                tile_col = cas_length - 1 - pos if flow.reversed else pos
-                port = idx if outer else pos
-                locations.append(BufferLocation('in1', port, tile_col + flow.input_col, chain, (0, 3)))
-            last = 0 if flow.reversed else cas_length - 1
-            locations.append(BufferLocation('out1', chain, last + flow.output_col, chain, (0, 3)))
-        return tuple(locations)
+        return tuple(BufferLocation(g, p, col, row, (0, 3)) for g, p, row, _, col in cascade_ports(config, anchor_row))
 
     def get_artifacts(self, inst: ExecutionInstance):
         inst_name = sanitize_identifier(inst.name)
@@ -455,6 +442,10 @@ def _check_stream_rows(node, config: DenseConfig, axes) -> None:
         )
 
 
+def _stream_locations(config, anchor_row, group: str) -> tuple:
+    return tuple(StreamLocation(g, p, col, row) for g, p, row, col, _ in cascade_ports(config, anchor_row) if g == group)
+
+
 class _StreamInputDenseMixin:
     """Dense whose LHS arrives on a core stream in row order, re-tiled in registers instead of by a DMA."""
 
@@ -462,6 +453,9 @@ class _StreamInputDenseMixin:
 
     def buffer_locations(self, node, config, anchor_row):
         return tuple(loc for loc in super().buffer_locations(node, config, anchor_row) if loc.port_group != 'in1')
+
+    def stream_locations(self, node, config, anchor_row):
+        return super().stream_locations(node, config, anchor_row) + _stream_locations(config, anchor_row, 'in1')
 
     def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
         return describe_stream_staging(
@@ -480,6 +474,9 @@ class _StreamOutputDenseMixin:
 
     def buffer_locations(self, node, config, anchor_row):
         return tuple(loc for loc in super().buffer_locations(node, config, anchor_row) if loc.port_group != 'out1')
+
+    def stream_locations(self, node, config, anchor_row):
+        return super().stream_locations(node, config, anchor_row) + _stream_locations(config, anchor_row, 'out1')
 
     def describe_output_staging(self, _node, config, tensor_name, port):
         return describe_stream_staging(config.io_views[tensor_name], port, 'write', self.contract)

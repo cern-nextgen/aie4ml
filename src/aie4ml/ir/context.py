@@ -67,6 +67,9 @@ class DeviceSpec:
     core_stream_inputs: int
     core_stream_outputs: int
     stream_switch_width_bits: int
+    # Streams one switch drives to each neighbour ('North', 'South', 'East', 'West'); memory tiles have no east or
+    # west links.
+    stream_switch_ports: Dict[str, int]
     cascade_width_bits: int
     bank_mem_bytes: int
     max_mem_in_ports: int
@@ -137,6 +140,9 @@ class DeviceSpec:
             core_stream_inputs=int(require(cfg, 'CoreStreamInputs')),
             core_stream_outputs=int(require(cfg, 'CoreStreamOutputs')),
             stream_switch_width_bits=int(require(cfg, 'StreamSwitchWidthBits')),
+            stream_switch_ports={
+                side: int(require(require(cfg, 'StreamSwitchPorts'), side)) for side in ('North', 'South', 'East', 'West')
+            },
             cascade_width_bits=int(require(cfg, 'CascadeWidthBits')),
             bank_mem_bytes=int(require(require(cfg, 'Memory'), 'BankMemBytes')),
             max_mem_in_ports=int(require(cfg, 'MaxMemTileInPorts')),

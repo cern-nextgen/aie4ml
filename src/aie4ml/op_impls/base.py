@@ -31,6 +31,16 @@ class BufferLocation:
 
 
 @dataclass(frozen=True)
+class StreamLocation:
+    """A core stream port's footprint-relative tile: the kernel the stream reaches."""
+
+    port_group: str
+    port: int
+    rel_col: int
+    rel_row: int
+
+
+@dataclass(frozen=True)
 class RowFlow:
     """Hand-over geometry of one row. `input_col`/`output_col` offset the tile holding a kernel's input
     (a chain's output) from that kernel's (the chain's last kernel's) column; `reversed` marks a cascade
@@ -49,6 +59,21 @@ def row_flow(alternating_horizontal: bool, row: int, cas_length: int) -> RowFlow
     if reaches_east:
         return RowFlow(reversed=False, input_col=0, output_col=1)
     return RowFlow(reversed=False, input_col=-1, output_col=0)
+
+
+def cascade_ports(config, anchor_row: int):
+    """The hand-over ports of a grid of cascades, chain c on row c, as (group, port, row, kernel column, buffer
+    column): each kernel's input `in1` (a port per kernel 'outer', per position 'inner'), each chain's output `out1`
+    at its last kernel, its buffer where `row_flow` puts the hand-over."""
+    cas_num, cas_length = int(config.parallelism.cas_num), int(config.parallelism.cas_length)
+    outer = config.parallelism.contract == 'outer'
+    for chain in range(cas_num):
+        flow = row_flow(config.alternating_horizontal, int(anchor_row) + chain, cas_length)
+        for pos in range(cas_length):
+            col = cas_length - 1 - pos if flow.reversed else pos
+            yield 'in1', chain * cas_length + pos if outer else pos, chain, col, col + flow.input_col
+        last = 0 if flow.reversed else cas_length - 1
+        yield 'out1', chain, chain, last, last + flow.output_col
 
 
 @dataclass(frozen=True)
@@ -130,6 +155,11 @@ class OpImplVariant:
         Repeated group/port pairs describe multicast graph ports. A shared-memory edge lists both of its
         ports at the same place.
         """
+        return ()
+
+    def stream_locations(self, _node: OpNode, _config: Any, _anchor_row: int) -> Tuple[StreamLocation, ...]:
+        """Where each core stream port's kernel sits relative to the op anchor; a variant with stream ports lists
+        every one."""
         return ()
 
     def output_staging_contract(self, _node: OpNode, _config: Any, _tensor_name: str) -> Optional[str]:

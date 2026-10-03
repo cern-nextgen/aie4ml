@@ -41,6 +41,7 @@ from .resolve import logical_values, output_contracts, resolve_instance
 from .transport.classify import classify_connection
 from .transport.collect import TransportCollector
 from .transport.memtile import check_memtile_leg
+from .transport.routing import BELOW, port_tiles, route_overflow
 
 log = logging.getLogger(__name__)
 
@@ -363,6 +364,7 @@ class _Search:
             collector = TransportCollector(execution)
             memtile = 0
             may_share = defaultdict(set)  # kernel -> its input ports a producer's buffer may coincide with
+            below = defaultdict(dict)  # kernel -> its streams from or to below (a memory tile or PLIO), at (0, 0)
 
             def cost(leg):
                 nonlocal memtile
@@ -370,6 +372,18 @@ class _Search:
                 if realization == 'memtile':
                     check_memtile_leg(leg, execution, self.ctx.device)
                     memtile += 1
+                if leg.consumer is not None and (realization == 'memtile' or leg.producer.node is None):
+                    sink = execution.get(leg.consumer.node.name)
+                    binding = sink.ports.inputs[leg.consumer.tensor]
+                    for port in leg.consumer.selected_ports(binding.count):
+                        tiles = port_tiles(sink, 'inputs', binding.group, port, 0, 0)
+                        below[sink.name][(binding.group, port)] = (BELOW, tuple(tiles))
+                if leg.producer.node is not None and (realization == 'memtile' or leg.consumer is None):
+                    source = execution.get(leg.producer.node.name)
+                    binding = source.ports.outputs[leg.producer.tensor]
+                    for port in leg.producer.selected_ports(binding.count):
+                        (tile,) = port_tiles(source, 'outputs', binding.group, port, 0, 0)
+                        below[source.name][(binding.group, port)] = (tile, (BELOW,))
                 readers = self.readers.get(leg.producer.tensor, 0)
                 shared = shareable(leg, realization, execution, readers)
                 # Placement shares a direct leg's buffer unless its producer's ports are surely read by another
@@ -391,6 +405,10 @@ class _Search:
                 leaving = [cost(leg)[1:] for leg in collector.output_connections(kernels[-1], self.last_read)]
                 departure = tuple(max(cc, default=0) for cc in zip(*leaving)) or (0, 0)
                 reserved = sum(_reserved_tiles(kernel, may_share[kernel.name]) for kernel in kernels)
+                for name, streams in below.items():
+                    problem = route_overflow(streams, self.ctx.device.stream_switch_ports)
+                    if problem:
+                        raise ConfigRefused(f'{name}: its memory-tile and PLIO streams alone: {problem}.')
                 self._legs_cache[key] = (memtile, arrivals, departure, reserved)
             except ConfigRefused as refusal:
                 self.refusals[node.name][str(refusal)] += 1

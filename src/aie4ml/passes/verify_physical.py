@@ -17,9 +17,11 @@ from ..op_impls.common_types import PORT_KIND_BUFFER
 from .base import AIEPass
 from .shared_buffer import SHARED_MEMORY, location_problem, pinned_locations, static_problem
 from .transport.dma_resources import KERNEL_BUFFERS, memtile_port_bds, pool_use, tile_port_bds
+from .transport.routing import BELOW, port_tiles, route_overflow
 from .utils import sanitize_identifier
 
 _PORT = re.compile(r'^(?P<graph>\w+)\.(?P<group>\w+)\[(?P<port>\d+)\]$')
+_PLIO = re.compile(r'^(ifm|ofm)\[\d+\]$')
 
 
 def _port(endpoint: str, graphs):
@@ -180,6 +182,45 @@ def verify_tile_dma_channels(ctx, graphs, shared) -> None:
                 )
 
 
+def verify_stream_routes(ctx) -> None:
+    """Every stream within the switches' ports (`transport.routing`): each hand-over not in shared memory -- a DMA
+    between tiles, each memory-tile writer and reader, each PLIO -- from its source port to all its targets."""
+    physical = ctx.ir.physical
+    graphs = {sanitize_identifier(inst.name): inst for inst in ctx.ir.execution}
+    buffers = {buffer['name'] for buffer in physical.plan.get('buffers', ())}
+
+    def tiles(endpoint: str, direction: str):
+        match = _PORT.match(endpoint)
+        if match is not None and match['graph'] in graphs:
+            inst = graphs[match['graph']]
+            placement = physical.placements[inst.name]
+            col, row = int(placement['col']), int(placement['row'])
+            return port_tiles(inst, direction, match['group'], int(match['port']), col, row)
+        if _PLIO.match(endpoint) or (match is not None and match['graph'] in buffers):
+            return {BELOW}
+        raise RuntimeError(f'stream endpoint {endpoint!r} names no kernel graph, memory-tile buffer or PLIO port.')
+
+    streams = {}
+
+    def add(source: str, target: str) -> None:
+        if source not in streams:
+            origin = tiles(source, 'outputs')
+            if len(origin) != 1:
+                raise RuntimeError(f'{source}: one stream source on the tiles {sorted(origin)}.')
+            streams[source] = (next(iter(origin)), set())
+        streams[source][1].update(tiles(target, 'inputs'))
+
+    for edge in physical.plan.get('direct_edges', ()):
+        if edge.get('realization') != SHARED_MEMORY:
+            add(edge['source'], edge['target'])
+    for buffer in physical.plan.get('buffers', ()):
+        for port in (*buffer['writers'], *buffer['readers']):
+            add(port['source'], port['target'])
+    problem = route_overflow(streams, ctx.device.stream_switch_ports, ctx.device.columns)
+    if problem:
+        raise ConfigRefused(f'stream routes: {problem}.')
+
+
 class VerifyPhysicalPlan(AIEPass):
     def __init__(self):
         self.name = 'verify_physical_plan'
@@ -188,4 +229,5 @@ class VerifyPhysicalPlan(AIEPass):
         ctx = get_backend_context(model_or_ctx)
         verify_physical(ctx)
         verify_dma_resources(ctx)
+        verify_stream_routes(ctx)
         return False
