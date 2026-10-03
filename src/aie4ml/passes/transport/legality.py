@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional, Tuple
+
 from ...op_impls.common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM
 from .layout import port_layout
 from .model import Endpoint
@@ -56,14 +58,19 @@ def memtile_staging_failure(execution, endpoints) -> str | None:
     return None
 
 
-def direct_transport_failure(
-    execution,
-    logical_tensor: str,
-    producer: Endpoint,
-    consumer: Endpoint,
-) -> str | None:
+def direct_transport_failure(execution, logical_tensor: str, producer: Endpoint, consumer: Endpoint) -> str | None:
+    return direct_pairing(execution, logical_tensor, producer, consumer)[0]
+
+
+def direct_pairing(
+    execution, logical_tensor: str, producer: Endpoint, consumer: Endpoint
+) -> Tuple[Optional[str], Tuple[int, ...]]:
+    """(why the leg cannot be direct or None, the producer port each consumer port reads in consumer-port order).
+    Port i reads producer port i where the counts agree; with fewer producer ports, each consumer port reads the
+    producer port whose buffer it holds whole, a producer port read by several being broadcast, and every producer
+    port is read."""
     if producer.node is None or consumer.node is None:
-        return 'direct transport requires resolved kernel endpoints'
+        return 'direct transport requires resolved kernel endpoints', ()
     producer_inst = execution.get(producer.node.name)
     consumer_inst = execution.get(consumer.node.name)
     if producer_inst is None or consumer_inst is None:
@@ -76,20 +83,20 @@ def direct_transport_failure(
         return (
             f'producer {producer.node.name}.{producer.group} is a {producer_kind} port but consumer '
             f'{consumer.node.name}.{consumer.group} is a {consumer_kind} port'
-        )
+        ), ()
 
     producer_ports = producer.selected_ports(producer_inst.ports.outputs[producer.tensor].count)
     consumer_ports = consumer.selected_ports(consumer_inst.ports.inputs[consumer.tensor].count)
-    if len(producer_ports) != len(consumer_ports):
-        return f'producer ports {producer_ports} do not match consumer ports {consumer_ports}'
+    if len(producer_ports) > len(consumer_ports):
+        return f'producer ports {producer_ports} do not match consumer ports {consumer_ports}', ()
 
     tc = execution.tensor_contracts.get(producer.tensor)
     if tc is not None:
         if any(int(port) < 0 or int(port) >= len(tc.port_staging) for port in producer_ports):
-            return f'producer ports {producer_ports} exceed the published staging contract'
+            return f'producer ports {producer_ports} exceed the published staging contract', ()
 
-    # One buffer serves both kernels when every position holds the same element, as data or as padding, for both.
-    for p_port, c_port in zip(producer_ports, consumer_ports):
+    def mismatch(p_port, c_port) -> Optional[str]:
+        """Why one buffer cannot serve both ports: some position holds a different element, as data or padding."""
         written = producer_inst.variant.describe_output_staging(
             producer.node, producer_inst.config, producer.tensor, int(p_port)
         )
@@ -105,4 +112,17 @@ def direct_transport_failure(
             return f'staging mismatch at {where}: the ports hold different parts of the tensor as data'
         if source != target:
             return f'staging mismatch at {where}: the buffers hold the tensor in different orders'
-    return None
+        return None
+
+    one_to_one = len(producer_ports) == len(consumer_ports)
+    paired = []
+    for index, c_port in enumerate(consumer_ports):
+        candidates = [producer_ports[index]] if one_to_one else producer_ports
+        problems = [mismatch(p_port, c_port) for p_port in candidates]
+        if all(problems):
+            return problems[0], ()
+        paired.append(int(candidates[problems.index(None)]))
+    unread = sorted(set(int(p) for p in producer_ports) - set(paired))
+    if unread:
+        return f'producer ports {unread} are read by no consumer port', ()
+    return None, tuple(paired)

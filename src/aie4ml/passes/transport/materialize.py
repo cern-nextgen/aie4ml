@@ -181,8 +181,10 @@ class _MemoryPlanMaterializer:
                         f'{edge["source"]} -> {edge["target"]}: a buffer port without a buffer location; every '
                         'buffer-port op lists where its graph pins them.'
                     )
-                shared = not location_problem(written, read) and not static_problem(
-                    self.ctx, p.tensor, producer, p.group, p_port, consumer, c.group, c_port
+                shared = (
+                    list(p_ports).count(p_port) == 1  # a port broadcast to several readers copies to each
+                    and not location_problem(written, read)
+                    and not static_problem(self.ctx, p.tensor, producer, p.group, p_port, consumer, c.group, c_port)
                 )
                 edge['realization'] = SHARED_MEMORY if shared else DMA
             self.direct_edges.append(edge)

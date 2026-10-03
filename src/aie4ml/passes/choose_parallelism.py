@@ -398,7 +398,11 @@ class _Search:
                 ):
                     sink = execution.get(leg.consumer.node.name)
                     ports = leg.consumer.selected_ports(sink.ports.inputs[leg.consumer.tensor].count)
-                    may_share[sink.name].update((leg.consumer.group, port) for port in ports)
+                    written = leg.producer.selected_ports(
+                        execution.get(leg.producer.node.name).ports.outputs[leg.producer.tensor].count
+                    )
+                    if len(written) == len(ports):  # a broadcast copies to each reader
+                        may_share[sink.name].update((leg.consumer.group, port) for port in ports)
                 return (leg.producer.tensor, *leg_cycles(leg, realization, shared, execution, self.ctx.device))
 
             try:

@@ -591,7 +591,7 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                     dst_group=consumer.group,
                     port_pairs=tuple(zip(entry_producer_ports, entry_consumer_ports)) if direct else (),
                     shared=shared,
-                    shareable=direct and not problems,
+                    shareable=direct and producer_exclusive and not problems,
                 )
             )
     return edges

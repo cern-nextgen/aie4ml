@@ -41,7 +41,8 @@ class LegalizeMemtilePortLimits(AIEPass):
                 )
 
             if entry.decision.realization == 'direct':
-                entry.unit = TransportUnit(_writer_ports(entry, execution), _consumer_ports(entry, execution))
+                if entry.unit is None:  # a graph boundary's: kernel-to-kernel legs are paired by classification
+                    entry.unit = TransportUnit(_writer_ports(entry, execution), _consumer_ports(entry, execution))
                 rewritten.append(entry)
                 continue
             if max_in <= 0 or max_out <= 0:

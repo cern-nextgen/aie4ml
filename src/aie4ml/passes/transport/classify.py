@@ -8,8 +8,8 @@ from ..base import AIEPass
 from .boundary import direct_boundary_access
 from .descriptors import describes_natural_order, rebase_descriptor_offset
 from .dma_resources import KERNEL_BUFFERS, tile_port_bds
-from .legality import direct_transport_failure, memtile_staging_failure, uses_stream
-from .model import Connection, TransportDecision
+from .legality import direct_pairing, direct_transport_failure, memtile_staging_failure, uses_stream
+from .model import Connection, TransportDecision, TransportUnit
 
 
 class ClassifyTransportEntries(AIEPass):
@@ -28,6 +28,8 @@ class ClassifyTransportEntries(AIEPass):
             decision = classify_connection(leg, ctx.ir.execution, ctx.device)
             changed = changed or entry.decision != decision
             entry.decision = decision
+            kernels = entry.producer.node is not None and entry.consumers
+            entry.unit = direct_unit(ctx.ir.execution, leg) if decision.realization == 'direct' and kernels else None
         return changed
 
     @staticmethod
@@ -42,6 +44,16 @@ class ClassifyTransportEntries(AIEPass):
             )
         if entry.producer.node is not None and not entry.graph_output and not entry.consumers:
             raise RuntimeError(f'{entry.logical_tensor}: internal transport entry has no consumer.')
+
+
+def direct_unit(execution, leg: Connection) -> TransportUnit:
+    """The ports a direct kernel-to-kernel leg joins, in consumer-port order: each with the producer port it reads
+    (`direct_pairing`), a port broadcast to several readers listed once per reader."""
+    failure, paired = direct_pairing(execution, leg.logical_tensor, leg.producer, leg.consumer)
+    if failure:
+        raise RuntimeError(f'{leg.logical_tensor}: classified direct, but {failure}.')
+    sink = execution.get(leg.consumer.node.name)
+    return TransportUnit(paired, leg.consumer.selected_ports(sink.ports.inputs[leg.consumer.tensor].count))
 
 
 def classify_connection(leg: Connection, execution, device) -> TransportDecision:
