@@ -24,6 +24,9 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
   constexpr int M = ConfigT::M, MB = ConfigT::MB;
   constexpr int SA = G::SA, SB = G::SB;
   using MMUL = aie::mmul<M, 8, 8, data_t, weight_t, acc_scalar_t>;
+  // Constants, not expressions in the calls: chess folds only those into aligned loads.
+  constexpr int ALIGN_2 = std::min(2 * SA, G::A_ALIGN), ALIGN_4 = std::min(4 * SA, G::A_ALIGN);
+  constexpr int ALIGN_64 = std::min(64, G::A_ALIGN);
   static_assert(ConfigT::NB == 1 && ConfigT::NBP == 1, "one output block, unpadded");
 
   if constexpr (ConfigT::FILLS_BORDER) conv2d_zero_border<ConfigT>(frame);
@@ -68,15 +71,15 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
           aie::vector<weight_t, SB> B = aie::load_v<SB>(pB);
           pB += SB;
           if constexpr (MB == 2) {
-            aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, 8);
+            aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, ALIGN_2);
             C0.mac(w.template extract<SA>(0), B);
             C1.mac(w.template extract<SA>(1), B);
           } else {
             aie::vector<data_t, 4 * SA> w;
             if constexpr (4 * SA <= 64) {
-              w = aie::load_unaligned_v<4 * SA>(a, 8);
+              w = aie::load_unaligned_v<4 * SA>(a, ALIGN_4);
             } else {
-              for (int q = 0; q < 4 * SA / 64; ++q) w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, 8));
+              for (int q = 0; q < 4 * SA / 64; ++q) w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, ALIGN_64));
             }
             C0.mac(w.template extract<SA>(0), B);
             C1.mac(w.template extract<SA>(1), B);

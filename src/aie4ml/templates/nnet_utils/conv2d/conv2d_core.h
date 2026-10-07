@@ -10,6 +10,7 @@
 #include <aie_api/aie.hpp>
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include "parameters.h"
 
 using namespace adf;
@@ -197,6 +198,26 @@ struct conv2d_geometry {
     return r;
   }
   static constexpr table TBL = build();
+
+  // What every tap's window start is aligned to, in elements: its loads are told no less, so an aligned window reads
+  // no further than it needs. A tap that starts on a load granule while others do not still reads one granule past
+  // its window, which the frame keeps (frame_view); the assert states it for the last window.
+  static constexpr int align() {
+    int a = std::gcd(MB * M * 8, RB);
+    for (int t = 0; t < T; ++t) a = std::gcd(a, off(t));
+    return a;
+  }
+  static constexpr int A_ALIGN = align();
+  static constexpr bool loads_stay_in_frame() {
+    constexpr int granule = aie::vector_decl_align / int(sizeof(typename ConfigT::data_t));
+    const int last = (conv2d_rows<ConfigT> - 1) * ConfigT::STRIDE_H * RB + (ConfigT::OUT_W_COMPUTED - MB * M) * 8;
+    for (int t = 0; t < T; ++t) {
+      const int start = last + off(t);
+      if (A_ALIGN < granule && start % granule == 0 && start + MB * SA + granule > ConfigT::IN_ELEMENTS) return false;
+    }
+    return true;
+  }
+  static_assert(ConfigT::DEPTHWISE_CORE || loads_stay_in_frame(), "the last window's loads stay in the frame");
 };
 
 // The DMA delivers only the image; the border of the frame is whatever the buffer held before.
@@ -253,6 +274,9 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
   constexpr int M = ConfigT::M, MB = ConfigT::MB, NB = ConfigT::NB, NBP = ConfigT::NBP;
   constexpr int SA = G::SA, SB = G::SB;
   using MMUL = aie::mmul<M, 8, 8, data_t, weight_t, acc_scalar_t>;
+  // Constants, not expressions in the calls: chess folds only those into aligned loads.
+  constexpr int ALIGN_2 = std::min(2 * SA, G::A_ALIGN), ALIGN_4 = std::min(4 * SA, G::A_ALIGN);
+  constexpr int ALIGN_64 = std::min(64, G::A_ALIGN);
 
   if constexpr (ConfigT::FILLS_BORDER) conv2d_zero_border<ConfigT>(frame);
   if constexpr (ConfigT::POOL && !ConfigT::FLATTEN && !CASC_OUT) conv2d_pool_fill<ConfigT>(out);
@@ -307,17 +331,17 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
             aie::vector<weight_t, SB> B1 = aie::load_v<SB>(pB + SB);
             pB += NBP * SB;
             if constexpr (MB == 2) {
-              aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, 8);
+              aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, ALIGN_2);
               aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
               aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
               C00.mac(A0, B0); C01.mac(A0, B1); C10.mac(A1, B0); C11.mac(A1, B1);
             } else {
               aie::vector<data_t, 4 * SA> w;
               if constexpr (4 * SA <= 64) {
-                w = aie::load_unaligned_v<4 * SA>(a, 8);
+                w = aie::load_unaligned_v<4 * SA>(a, ALIGN_4);
               } else {
                 for (int q = 0; q < 4 * SA / 64; ++q)
-                  w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, 8));
+                  w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, ALIGN_64));
               }
               aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
               aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
@@ -353,6 +377,12 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
               conv2d_merge_pooled<ConfigT>(out, oy, z + 2 * M, j, C20, C30);
               if (j + 1 < NB) conv2d_merge_pooled<ConfigT>(out, oy, z + 2 * M, j + 1, C21, C31);
             }
+#if defined(__AIENGINE__) && __AIE_ARCH__ == 10
+            // The AIE1 compiler crashed folding this merge into the next output block's few taps (a 1x1 window) once
+            // their loads were aligned ("missing anti-dependency"); a separator keeps them apart, 12% faster there. A
+            // larger window measured 7% slower with it.
+            if constexpr (ConfigT::KH * ConfigT::KW == 1) chess_separator_scheduler();
+#endif
           } else {
             // Inlined: an outlined call would spill every accumulator it takes by reference (MLv2 outlines it).
             auto store_tile = [&](int nb, int mm, MMUL& acc) __attribute__((always_inline)) {

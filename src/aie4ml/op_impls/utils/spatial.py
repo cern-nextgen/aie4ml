@@ -96,6 +96,13 @@ def build_padded_spatial_view(
         origin_col + align_up(width, int(column_block)),
         origin_col - left + (computed_w - 1) * stride_w + span_w,
     )
+    if span_w > 1 and stride_w == 1 and int(row_bytes_align) > 1:
+        # The window's taps start at mixed alignments, so the kernel loads them all as the least aligned one: a tap
+        # that starts on a row-alignment granule then reads one granule past its window, which must stay in the row.
+        start = origin_col - left
+        granule = int(row_bytes_align)
+        ends = [start + kx + computed_w for kx in range(span_w) if (start + kx) % granule == 0]
+        columns = max(columns, max(ends, default=0) + granule)
     if stride_w > 1:
         # A strided frame holds its columns in `stride_w` polyphase classes, so every class must be
         # long enough for the computed width plus the taps that reach past it, and the row must
