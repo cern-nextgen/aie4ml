@@ -727,7 +727,7 @@ def format_report(report: Dict[str, Any]) -> str:
     split = report.get('latency_split') or {}
     if first_cc is not None or critical:
         add('')
-        add('Latency  (first input beat to output complete; excludes configuration and weight loading)')
+        add('Latency  (first input beat to output complete; excludes start-up and initial weight initialization)')
         if first_cc is not None:
             add(
                 f'    latency        {first_cc:12,d} cc  {ns(first_cc):12,.1f} ns   '
