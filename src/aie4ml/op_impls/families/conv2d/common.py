@@ -70,7 +70,7 @@ def frame_view(
     """The padded frame of one activation laid out for the window `access` reads (None: no window). A producer
     lays its output out for the window its consumers share (`shared_consumer_spatial_access`); a consumer reads its
     input with its own window, the same frame whenever the two agree."""
-    return build_padded_spatial_view(
+    view = build_padded_spatial_view(
         tensor.shape,
         access,
         column_block=column_block,
@@ -81,6 +81,12 @@ def frame_view(
         # A producer stores whole register tiles of `column_align` pixels, so every row starts on one.
         row_bytes_align=math.lcm(ROW_ALIGN_PIXELS, column_align),
     )
+    if tensor.producer is not None and int(row_slices) == 1 and view.tile[1] < view.full[1]:
+        # A kernel writes every row, also the last ones a vertical stride never reads; the boundary sends only those
+        # its reader reads.
+        rows = (*view.tile[:1], view.full[1], *view.tile[2:])
+        view = dataclasses.replace(view, tile=rows, tile_raw=rows)
+    return view
 
 
 class HaloPort(NamedTuple):

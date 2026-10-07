@@ -872,6 +872,31 @@ def _strided_chain_model(size=16, first_stride=1, name='conv_strided_chain'):
     )
 
 
+def test_a_frame_a_kernel_writes_holds_the_rows_a_stride_skips(tmp_path):
+    """A 1x1 stride-2 conv reads rows 0, 2, .., 14 of 16, but its producer writes all 16: the frame between them
+    holds every row (it held the 15 its reader reads, and the producer wrote past it)."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'first', 8, 16, 3, pad=1, relu=True, seed=5)
+    _conv(nodes, inits, 'a', 'b', 'second', 16, 8, 1, pad=0, relu=True, seed=6, stride=2)
+    nodes.append(helper.make_node('Transpose', ['b'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    model = make_model(
+        'conv_strided_1x1',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, 16, 16, 8])],
+        outputs=[('y', TensorProto.FLOAT, [1, 8, 8, 8])],
+        initializers=inits,
+    )
+    ctx = lower(model, tmp_path, part=AIE1_PART)
+    first = ctx.ir.execution.get('first_aie')
+    params = first.variant.build_template_params(first.node, first.config, {'row': 0, 'col': 0})
+    assert params['out_rows'] >= params['out_origin_r'] + params['out_h'] == 16
+    second = ctx.ir.execution.get('second_aie')
+    frame = first.node.outputs[0].name
+    assert second.config.io_views[frame].tile == first.config.io_views[frame].tile
+
+
 def test_strided_conv_retiles_its_producers_frame(tmp_path):
     """A producer writes whole register tiles, which span every residue group, so a retiler -- a
     kernel of its own in the execution graph, not in the model -- reads the frame as written and
