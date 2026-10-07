@@ -101,8 +101,7 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
         } else {
           // Inlined: an outlined call would spill every accumulator it takes by reference (MLv2 outlines it).
           auto store_tile = [&](int mm, MMUL& acc) __attribute__((always_inline)) {
-            aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
-            if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));
+            aie::vector<result_t, SA> tile = conv2d_activate<ConfigT>(acc);
             if constexpr (ConfigT::FLATTEN) {
               // Dense LHS row: chunk (pixel, 0) sits at row 0 of its M-row slot; the pad rows are
               // don't-care, so each pixel stores the tile rotated to start at itself.

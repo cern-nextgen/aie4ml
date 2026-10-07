@@ -97,6 +97,23 @@ __attribute__((always_inline)) static inline aie::vector<T, ConfigT::M * 8> conv
   return aie::broadcast<T, ConfigT::M * 8>(ConfigT::USE_RELU ? T(0) : std::numeric_limits<T>::lowest());
 }
 
+// A register tile's output. AIE1 applies a fused ReLU in int16 and packs once: an int8 max there went through the
+// stack. Saturating to int16, then to int8, equals saturating to int8.
+template<typename ConfigT, typename MMUL>
+__attribute__((always_inline)) static inline aie::vector<typename ConfigT::result_t, ConfigT::M * 8>
+conv2d_activate(MMUL& acc)
+{
+  using result_t = typename ConfigT::result_t;
+  using pool_t = conv2d_pool_t<ConfigT>;
+  if constexpr (ConfigT::USE_RELU && !std::is_same_v<pool_t, result_t>) {
+    return aie::max(acc.template to_vector<pool_t>(ConfigT::SHIFT), pool_t(0)).template pack<result_t>();
+  } else {
+    aie::vector<result_t, ConfigT::M * 8> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
+    if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));
+    return tile;
+  }
+}
+
 // A pooled frame: the kernel fills it with the identity, then merges each row into it as it goes.
 template<typename ConfigT>
 static inline void conv2d_pool_fill(typename ConfigT::result_t* out)
@@ -340,8 +357,7 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
             // Inlined: an outlined call would spill every accumulator it takes by reference (MLv2 outlines it).
             auto store_tile = [&](int nb, int mm, MMUL& acc) __attribute__((always_inline)) {
               if (nb >= NB) return;
-              aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
-              if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));
+              aie::vector<result_t, SA> tile = conv2d_activate<ConfigT>(acc);
               if constexpr (ConfigT::FLATTEN) {
                 // Dense LHS row: chunk (pixel, nb) sits at row 0 of its M-row slot; the pad rows are
                 // don't-care, so each pixel stores the tile rotated to start at itself.
