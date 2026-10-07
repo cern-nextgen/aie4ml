@@ -7,6 +7,7 @@
 #pragma once
 #include "conv2d_core.h"
 #include "conv2d_core_pointwise.h"
+#include "conv2d_core_rows.h"
 
 template<typename ConfigT, bool CASC_IN, bool CASC_OUT>
 static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
@@ -135,13 +136,15 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
   }
 }
 
-// The core a tile runs: the pointwise one where the resolver chose it, its own schedule for one output block, the
-// paired one otherwise.
+// The core a tile runs: the pointwise one where the resolver chose it, for one output block two rows a step where they
+// pair or else its own schedule, the paired one otherwise.
 template<typename ConfigT, bool CASC_IN, bool CASC_OUT, typename... Args>
 static inline void conv2d_compute(Args... args)
 {
   if constexpr (ConfigT::POINTWISE_CORE)
     conv2d_tile_pointwise<ConfigT, CASC_IN, CASC_OUT>(args...);
+  else if constexpr (conv2d_uses_rows_core<ConfigT>)
+    conv2d_tile_rows<ConfigT, CASC_IN, CASC_OUT>(args...);
   else if constexpr (ConfigT::NB == 1)
     conv2d_tile_one_block<ConfigT, CASC_IN, CASC_OUT>(args...);
   else
