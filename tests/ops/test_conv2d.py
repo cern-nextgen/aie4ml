@@ -657,6 +657,14 @@ HALO_CHAIN = {
 }
 
 
+def test_a_chain_of_row_bands_is_placed_with_room_to_share_every_hand_over(tmp_path):
+    """Banded convs hand their rows on west, so the first of three must leave room for the other two beside it: placed
+    without it, the middle conv's band sent its rows and both halos by DMA from one tile, which has two channels."""
+    ctx = lower(_halo_chain_model(), tmp_path, HALO_CHAIN)
+    legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['source'].startswith(('b_aie', 'd_aie'))]
+    assert len(legs) == 14 and {e['realization'] for e in legs} == {'shared_memory'}
+
+
 @pytest.mark.parametrize('bands', [4, 8])
 def test_row_bands_down_to_one_row_share_every_halo(tmp_path, bands):
     """Any band count that splits the rows, down to bands of one row -- the halo of a 3x3 window: every band but
@@ -1387,10 +1395,10 @@ def test_row_bands_on_aie1_do_not_relay_a_halo(tmp_path):
 
 def test_row_bands_on_aie1_refuse_a_tile_short_of_dma_channels(tmp_path, monkeypatch):
     """On AIE1 the halo rows of an odd-row band travel by DMA, and a relaying middle conv's odd row sends two of them
-    beside its output to the Dense: three MM2S buffers on one tile, which has two channels. Refused before Vitis,
-    whose placer would only report a failed placement."""
+    beside its output to the Dense: three MM2S buffers on one tile, which has two channels. Refused at placement,
+    before Vitis, whose placer would only report a failed placement."""
     monkeypatch.setattr(halo, 'RELAYING_BANDS', halo.RELAYING_BANDS | {'AIE'})
-    with pytest.raises(ConfigRefused, match=r'3 buffers need its MM2S DMA .* which has 2 channels'):
+    with pytest.raises(ConfigRefused, match=r'needs more than the 2 DMA channels a tile has each way'):
         lower(_halo_chain_model(), tmp_path, HALO_CHAIN, part=AIE1_PART)
 
 

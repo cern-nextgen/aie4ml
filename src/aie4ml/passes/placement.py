@@ -74,6 +74,7 @@ class NodeSpec:
     index: int
     rect: Rect
     anchor: Optional[Tuple[int, int]] = None  # local device coordinates
+    outputs: frozenset = frozenset()  # its output port groups: their unshared buffers take an MM2S channel
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class GraphSpec:
     edges: List[EdgeSpec]
     preds: Dict[str, List[str]]
     succs: Dict[str, List[str]]
+    dma_channels: int = 0  # a tile DMA's channels each way; 0 counts none
     _between: Dict[Tuple[str, str], Tuple[EdgeSpec, ...]] = field(default_factory=dict, repr=False, compare=False)
 
     def edges_between(self, src: str, dst: str) -> Tuple[EdgeSpec, ...]:
@@ -110,6 +112,18 @@ class GraphSpec:
             for edge in self.edges:
                 self._between[(edge.src, edge.dst)] = self._between.get((edge.src, edge.dst), ()) + (edge,)
         return self._between.get((src, dst), ())
+
+    @cached_property
+    def partners(self) -> Dict[Tuple[str, str, int], Tuple[str, str, int]]:
+        """By kernel buffer port (op, group, port), the port it may hand one shared buffer to; a port not listed is
+        copied by a DMA wherever the two are placed."""
+        partners = {}
+        for edge in self.edges:
+            if edge.shareable:
+                for src_port, dst_port in edge.port_pairs:
+                    partners[edge.src, edge.src_group, src_port] = (edge.dst, edge.dst_group, dst_port)
+                    partners[edge.dst, edge.dst_group, dst_port] = (edge.src, edge.src_group, src_port)
+        return partners
 
 
 @dataclass
@@ -539,6 +553,7 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
             index=idx,
             rect=rect,
             anchor=anchor,
+            outputs=frozenset(binding.group for binding in inst.ports.outputs.values()),
         )
         stable_index[node.name] = idx
 
@@ -559,6 +574,7 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
         edges=edges,
         preds=preds,
         succs=succs,
+        dma_channels=int(ctx.device.tile_dma.channels),
     )
 
 
@@ -576,17 +592,29 @@ class _State:
     compactness: int
     placed: Dict[str, Placed]
     claims: Dict[Tuple[int, int], Tuple[str, ...]]
+    dma: Dict[Tuple[Tuple[int, int], str], int] = field(default_factory=dict)  # (tile, MM2S|S2MM) -> buffers
 
-    def extend(self, p: Placed, cost: float, compactness: int) -> '_State':
+    def extend(self, p: Placed, cost: float, compactness: int, graph: GraphSpec) -> '_State':
         """This placement with `p` added, which brings it to `cost` and `compactness`."""
         claims = dict(self.claims)
         for cell in p.tiles | p.memory:
             claims[cell] = claims.get(cell, ()) + (p.name,)
-        return _State(cost, compactness, {**self.placed, p.name: p}, claims)
+        dma = dict(self.dma)
+        for key, count in self._dma_use(p, graph).items():
+            dma[key] = dma.get(key, 0) + count
+        return _State(cost, compactness, {**self.placed, p.name: p}, claims, dma)
 
     def fits(self, p: Placed, graph: GraphSpec) -> bool:
-        """Whether `p` is legal beside the ops placed: only an op claiming one of its tiles can conflict with it,
-        and only a neighbour can share a buffer with it."""
+        """Whether `p` is legal beside the ops placed (`fits_memory`) with no tile's DMA needing more channels than
+        it has."""
+        return self.fits_memory(p, graph) and (
+            not graph.dma_channels
+            or all(self.dma.get(key, 0) + n <= graph.dma_channels for key, n in self._dma_use(p, graph).items())
+        )
+
+    def fits_memory(self, p: Placed, graph: GraphSpec) -> bool:
+        """Whether `p`'s tiles and buffers are legal beside the ops placed: only an op claiming one of its tiles can
+        conflict with it, and only a neighbour can share a buffer with it."""
         if any(_placements_conflict(p, self.placed[name], graph) for name in self._claimants(p)):
             return False
         return all(
@@ -594,6 +622,35 @@ class _State:
             for name in (*graph.preds[p.name], *graph.succs[p.name])
             if name in self.placed
         )
+
+    def _dma_use(self, p: Placed, graph: GraphSpec) -> Dict[Tuple[Tuple[int, int], str], int]:
+        """The DMA channels placing `p` decides, by (tile, direction): each kernel buffer that is not one shared
+        buffer takes a channel on the tile holding it (`verify_tile_dma_channels`). A port with no partner to
+        share with is decided now; one with a partner when both are placed, for both of them."""
+        if not graph.dma_channels:
+            return {}
+        use: Dict[Tuple[Tuple[int, int], str], int] = {}
+
+        def take(op: Placed, group: str, port: int) -> None:
+            direction = 'MM2S' if group in graph.specs[op.name].outputs else 'S2MM'
+            for location in op.rect.locations_at(op.y):
+                if location.port_group == group and location.port == port:
+                    key = ((op.x + location.rel_col, op.y + location.rel_row), direction)
+                    use[key] = use.get(key, 0) + 1
+
+        for group, port in sorted({(loc.port_group, int(loc.port)) for loc in p.rect.locations_at(p.y)}):
+            partner = graph.partners.get((p.name, group, port))
+            if partner is None:
+                take(p, group, port)
+                continue
+            other = self.placed.get(partner[0])
+            if other is None:
+                continue
+            written = p.banks(group, port)
+            if not written or written != other.banks(partner[1], partner[2]):
+                take(p, group, port)
+                take(other, partner[1], partner[2])
+        return use
 
     def _claimants(self, p: Placed) -> set:
         return {name for cell in p.tiles | p.memory for name in self.claims.get(cell, ())}
@@ -611,10 +668,13 @@ def _places(spec: NodeSpec, W: int, H: int) -> List[List[Placed]]:
     return [places for row in rows if (places := [p for p in row if _in_bounds(p, W, H)])]
 
 
-def _share_slots(graph: GraphSpec, H: int) -> Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]]:
+def _share_slots(
+    graph: GraphSpec, H: int, *, whole: bool = False
+) -> Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]]:
     """Where an op's neighbour may sit to share a buffer of a shareable edge between them: by (op, neighbour) and
     the op's anchor row, the neighbour's (column offset, anchor row) places. An op's buffer locations depend on its
-    anchor row alone, so each port's pair of rows lines its two buffers up at one column offset or none."""
+    anchor row alone, so each port's pair of rows lines its two buffers up at one column offset or none. `whole`:
+    only the places sharing every buffer of the edge."""
     slots: Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]] = {}
     for edge in graph.edges:
         if not edge.shareable:
@@ -624,7 +684,10 @@ def _share_slots(graph: GraphSpec, H: int) -> Dict[Tuple[str, str], Dict[int, Li
             written = [Placed(edge.src, 0, src_row, src).banks(edge.src_group, port) for port, _ in edge.port_pairs]
             for dst_row in range(H - dst.h + 1):
                 read = [Placed(edge.dst, 0, dst_row, dst).banks(edge.dst_group, port) for _, port in edge.port_pairs]
-                for offset in sorted({_alignment(*buffers) for buffers in zip(written, read)} - {None}):
+                offsets = [_alignment(*buffers) for buffers in zip(written, read)]
+                if whole:
+                    offsets = offsets[:1] if len(set(offsets)) == 1 else []
+                for offset in sorted(set(offsets) - {None}):
                     slots.setdefault((edge.src, edge.dst), {}).setdefault(src_row, []).append((offset, dst_row))
                     slots.setdefault((edge.dst, edge.src), {}).setdefault(dst_row, []).append((-offset, src_row))
     return slots
@@ -681,13 +744,19 @@ def _keep(children: List[tuple], width: int) -> List[tuple]:
 def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: int) -> Dict[str, Placed]:
     """
     Place the ops one at a time (`_placement_order`), keeping `width` partial placements (`_keep`). Each grows by
-    up to three places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
+    up to four places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
     and the row bias; and the westmost legal one that leaves each neighbour still to place a free place sharing its
-    buffers (`_share_slots`), on whichever side that is. The cheapest complete placement wins.
+    buffers (`_share_slots`), on whichever side that is, and the one that leaves that room along a whole chain of such
+    neighbours (`leaves_room`). Legal includes each tile's DMA channels. The cheapest complete placement wins.
     """
     places = {name: _places(spec, W, H) for name, spec in graph.specs.items()}
     slots = _share_slots(graph, H)
+    whole = _share_slots(graph, H, whole=True)
     incident = {name: [edge for edge in graph.edges if name in (edge.src, edge.dst)] for name in graph.specs}
+    partners_of = {
+        name: [other for other in sorted({*graph.preds[name], *graph.succs[name]}) if (name, other) in slots]
+        for name in graph.specs
+    }
 
     def added_cost(p: Placed, placed: Dict[str, Placed]) -> float:
         cost = mu * p.y
@@ -698,21 +767,32 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
                 cost += _edge_cost(edge, placed[edge.src], p, lam)
         return cost
 
-    def leaves_room(p: Placed, state: _State, partners: List[str]) -> bool:
-        """Whether each of `partners` has an in-bounds place sharing `p`'s buffers whose tiles nothing holds yet."""
-        held = set(state.claims) | p.tiles
-        return all(
-            any(
-                _in_bounds(q := Placed(other, p.x + offset, row, graph.specs[other].rect), W, H) and not q.tiles & held
-                for offset, row in slots[p.name, other].get(p.y, ())
-            )
-            for other in partners
-        )
+    def leaves_room(p: Placed, state: _State, partners: List[str], chained: bool) -> bool:
+        """Whether each of `partners` has an in-bounds place sharing `p`'s buffers whose tiles nothing holds yet;
+        `chained`: and so on along each edge sharing all of its buffers, as a chain of row bands handing its rows on
+        west in shared memory needs room for all of it."""
+
+        def room(at: Placed, other: str, held: frozenset, chain: frozenset, among) -> bool:
+            for offset, row in among[at.name, other].get(at.y, ()):
+                q = Placed(other, at.x + offset, row, graph.specs[other].rect)
+                if not _in_bounds(q, W, H) or q.tiles & held:
+                    continue
+                onward = [
+                    n
+                    for n in partners_of[other]
+                    if chained and n not in state.placed and n not in chain and (other, n) in whole
+                ]
+                if all(room(q, n, held | q.tiles, chain | {n}, whole) for n in onward):
+                    return True
+            return False
+
+        held = frozenset(state.claims) | p.tiles
+        return all(room(p, other, held, frozenset((p.name, other)), slots) for other in partners)
 
     states = [_State(0.0, 0, {}, {})]
     for name in _placement_order(graph, slots):
         neighbours = sorted(set(graph.preds[name]) | set(graph.succs[name]))
-        sharers = [other for other in neighbours if (name, other) in slots]
+        sharers = partners_of[name]
         costs: Dict[tuple, Dict[Tuple[int, int], float]] = {}  # by the places of the op's placed neighbours
         children = []
         for rank, state in enumerate(states):
@@ -733,9 +813,12 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
                 cheapest = next(p for p in sorted(row, key=lambda p: (cost(p), p.x)) if state.fits(p, graph))
                 grown.update({(p.x, p.y): p for p in (westmost, cheapest)})
                 if partners:
-                    roomy = next((p for p in row if leaves_room(p, state, partners) and state.fits(p, graph)), None)
-                    if roomy is not None:
-                        grown[roomy.x, roomy.y] = roomy
+                    for chained in (False, True):
+                        roomy = next(
+                            (p for p in row if leaves_room(p, state, partners, chained) and state.fits(p, graph)), None
+                        )
+                        if roomy is not None:
+                            grown[roomy.x, roomy.y] = roomy
             children.extend(
                 (state.cost + cost(p), state.compactness + p.x * H + p.y, rank, p.x, p.y, state, p)
                 for p in grown.values()
@@ -743,11 +826,19 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
         if not children:
             if graph.specs[name].anchor is not None:
                 raise PlacementInfeasibleError(f'Invalid fixed anchor for {name}: conflicts with another anchor.')
+            if any(state.fits_memory(p, graph) for state in states for row in places[name] for p in row):
+                raise PlacementInfeasibleError(
+                    f'{name}: every place left beside the {len(states[0].placed)} ops placed before it needs more '
+                    f'than the {graph.dma_channels} DMA channels a tile has each way (each kernel buffer not shared '
+                    'with the kernel at its other end takes one).'
+                )
             raise PlacementInfeasibleError(
                 f'{name}: no legal place left beside the {len(states[0].placed)} ops placed before it, in any of '
                 f'the {len(states)} partial placements kept.'
             )
-        states = [state.extend(p, cost, compactness) for cost, compactness, *_, state, p in _keep(children, width)]
+        states = [
+            state.extend(p, cost, compactness, graph) for cost, compactness, *_, state, p in _keep(children, width)
+        ]
     return min(states, key=lambda state: (state.cost, state.compactness)).placed
 
 
