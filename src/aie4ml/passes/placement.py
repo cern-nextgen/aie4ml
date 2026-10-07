@@ -5,21 +5,15 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from functools import cached_property
-from itertools import permutations
-from statistics import median
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..errors import ConfigRefused
 from ..ir import get_backend_context
 from ..op_impls.base import BufferLocation
 from .base import AIEPass
 from .shared_buffer import location_problem, static_problem
-
-log = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Geometry model
@@ -80,11 +74,6 @@ class NodeSpec:
     index: int
     rect: Rect
     anchor: Optional[Tuple[int, int]] = None  # local device coordinates
-    x_range: Optional[Tuple[int, int]] = None
-    y_range: Optional[Tuple[int, int]] = None
-    _domains: Dict[Tuple[PortFace, int, int], Tuple[float, float, float, float]] = field(
-        default_factory=dict, repr=False, compare=False
-    )
 
 
 @dataclass(frozen=True)
@@ -121,26 +110,6 @@ class GraphSpec:
             for edge in self.edges:
                 self._between[(edge.src, edge.dst)] = self._between.get((edge.src, edge.dst), ()) + (edge,)
         return self._between.get((src, dst), ())
-
-
-@dataclass(frozen=True)
-class BranchBand:
-    child: str
-    names: Tuple[str, ...]
-    inner_height: int
-
-
-@dataclass(frozen=True)
-class PlacementHeuristics:
-    """
-    Search-order heuristics only.
-
-    These do not change legality or the final objective; they only bias the
-    order in which candidates are explored.
-    """
-
-    low_row_weight: float = 0.05
-    rightward_progress_weight: float = 0.25
 
 
 @dataclass
@@ -234,16 +203,10 @@ def _coerce_rect(footprint: Any) -> Rect:
       output_face: {"side": ..., "start": ..., "end": ...}
       input_side:  "left" | "right" | "top" | "bottom"
       output_side: "left" | "right" | "top" | "bottom"
-      row_parity: 0 for even starting rows or 1 for odd starting rows
     """
     w = int(getattr(footprint, 'width'))
     h = int(getattr(footprint, 'height'))
     extras = dict(getattr(footprint, 'extras', {}) or {})
-    if extras.get('row_parity') is not None:
-        row_parity = int(extras['row_parity'])
-        if row_parity not in (0, 1):
-            raise ValueError(f'Invalid row_parity: {row_parity}; expected 0 or 1.')
-        extras['row_parity'] = row_parity
 
     input_face = _parse_face(
         extras.get('input_face'),
@@ -270,27 +233,6 @@ def _coerce_rect(footprint: Any) -> Rect:
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-
-
-def _face_local_center(rect: Rect, face: PortFace) -> Tuple[float, float]:
-    """Local center point of a face span."""
-    mid = 0.5 * (face.start + face.end)
-
-    if face.side == 'left':
-        return (0.0, mid)
-    if face.side == 'right':
-        return (float(rect.w - 1), mid)
-    if face.side == 'top':
-        return (mid, 0.0)
-    if face.side == 'bottom':
-        return (mid, float(rect.h - 1))
-
-    raise ValueError(f'Unsupported face side: {face.side!r}')
-
-
-def _face_abs_center(placed: Placed, face: PortFace) -> Tuple[float, float]:
-    lx, ly = _face_local_center(placed.rect, face)
-    return (placed.x + lx, placed.y + ly)
 
 
 def _face_abs_box(placed: Placed, face: PortFace) -> Tuple[float, float, float, float]:
@@ -414,72 +356,6 @@ def _in_bounds(p: Placed, W: int, H: int) -> bool:
         # never past its far edges, where the device ends.
         and all(col < W and row < H for col, row in p.memory)
     )
-
-
-def _feasible(p: Placed, placed: Dict[str, Placed], graph: GraphSpec, W: int, H: int) -> bool:
-    if not _in_bounds(p, W, H):
-        return False
-    return all(not _placements_conflict(p, q, graph) and _shared_edges_coincide(p, q, graph) for q in placed.values())
-
-
-def _possible_face_domain(
-    spec: NodeSpec,
-    face: PortFace,
-    W: int,
-    H: int,
-) -> Tuple[float, float, float, float]:
-    """
-    Bounding box of the union of all possible absolute face positions for `spec`.
-
-    This intentionally ignores occupancy conflicts and uses only bounds/anchors.
-    That makes it an admissible lower-bound domain for cut-edge estimates. It depends on the op and the grid
-    alone, and the bound asks for it at every state, so each is computed once.
-    """
-    key = (face, W, H)
-    if key not in spec._domains:
-        spec._domains[key] = _face_domain(spec, face, W, H)
-    return spec._domains[key]
-
-
-def _face_domain(spec: NodeSpec, face: PortFace, W: int, H: int) -> Tuple[float, float, float, float]:
-    rect = spec.rect
-
-    if spec.anchor is not None:
-        ax, ay = spec.anchor
-        return _face_abs_box(Placed(spec.name, ax, ay, rect), face)
-
-    max_x = W - rect.w
-    max_y = H - rect.h
-    if max_x < 0 or max_y < 0:
-        raise RuntimeError(f'Node {spec.name} footprint ({rect.w}x{rect.h}) does not fit device ({W}x{H}).')
-
-    min_x = 0 if spec.x_range is None else spec.x_range[0]
-    max_x = max_x if spec.x_range is None else spec.x_range[1]
-    min_y = 0 if spec.y_range is None else spec.y_range[0]
-    max_y = max_y if spec.y_range is None else spec.y_range[1]
-    if max_x < min_x or max_y < min_y:
-        raise RuntimeError(f'Node {spec.name} has no legal placement domain within device ({W}x{H}).')
-
-    if face.side == 'left':
-        return (float(min_x), float(max_x), float(min_y + face.start), float(max_y + face.end))
-    if face.side == 'right':
-        return (
-            float(min_x + rect.w - 1),
-            float(max_x + rect.w - 1),
-            float(min_y + face.start),
-            float(max_y + face.end),
-        )
-    if face.side == 'top':
-        return (float(min_x + face.start), float(max_x + face.end), float(min_y), float(max_y))
-    if face.side == 'bottom':
-        return (
-            float(min_x + face.start),
-            float(max_x + face.end),
-            float(min_y + rect.h - 1),
-            float(max_y + rect.h - 1),
-        )
-
-    raise ValueError(f'Unsupported face side: {face.side!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -648,8 +524,6 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
         rect.buffer_locations = lambda anchor_row, inst=inst, node=node: inst.variant.buffer_locations(
             node, inst.config, int(anchor_row) + row_offset
         )
-        if rect.extras.get('row_parity') is not None:
-            rect.extras['row_parity'] = (int(rect.extras['row_parity']) - row_offset) % 2
 
         placement_hint = _placement_hint(ctx, node)
         anchor: Optional[Tuple[int, int]] = None
@@ -689,653 +563,192 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
 
 
 # ---------------------------------------------------------------------------
-# Cost model and lower bound
+# Beam search
 # ---------------------------------------------------------------------------
 
 
-def _edge_lower_bound(
-    edge: EdgeSpec,
-    graph: GraphSpec,
-    placed: Dict[str, Placed],
-    W: int,
-    H: int,
-    lam: float,
-) -> float:
-    """
-    Admissible lower bound for a single edge.
+@dataclass
+class _State:
+    """A partial placement: its cost, its compactness (the sum of col * H + row over its ops: smaller packs the
+    array tighter, from the west and the bottom), its ops, and which ops claim each tile, by its core or memory."""
 
-    - both placed: exact edge cost
-    - one placed: min cost from exact placed face to the bounded domain of the
-      unplaced endpoint's face
-    - neither placed: 0
-    """
-    src_p = placed.get(edge.src)
-    dst_p = placed.get(edge.dst)
+    cost: float
+    compactness: int
+    placed: Dict[str, Placed]
+    claims: Dict[Tuple[int, int], Tuple[str, ...]]
 
-    if src_p is not None and dst_p is not None:
-        return _edge_cost(edge, src_p, dst_p, lam)
+    def extend(self, p: Placed, cost: float, compactness: int) -> '_State':
+        """This placement with `p` added, which brings it to `cost` and `compactness`."""
+        claims = dict(self.claims)
+        for cell in p.tiles | p.memory:
+            claims[cell] = claims.get(cell, ()) + (p.name,)
+        return _State(cost, compactness, {**self.placed, p.name: p}, claims)
 
-    if src_p is not None:
-        dst_spec = graph.specs[edge.dst]
-        return _face_cost(
-            _face_abs_box(src_p, src_p.rect.output_face),
-            _possible_face_domain(dst_spec, dst_spec.rect.input_face, W, H),
-            lam,
+    def fits(self, p: Placed, graph: GraphSpec) -> bool:
+        """Whether `p` is legal beside the ops placed: only an op claiming one of its tiles can conflict with it,
+        and only a neighbour can share a buffer with it."""
+        if any(_placements_conflict(p, self.placed[name], graph) for name in self._claimants(p)):
+            return False
+        return all(
+            _shared_edges_coincide(p, self.placed[name], graph)
+            for name in (*graph.preds[p.name], *graph.succs[p.name])
+            if name in self.placed
         )
 
-    if dst_p is not None:
-        src_spec = graph.specs[edge.src]
-        return _face_cost(
-            _possible_face_domain(src_spec, src_spec.rect.output_face, W, H),
-            _face_abs_box(dst_p, dst_p.rect.input_face),
-            lam,
-        )
-
-    return 0.0
+    def _claimants(self, p: Placed) -> set:
+        return {name for cell in p.tiles | p.memory for name in self.claims.get(cell, ())}
 
 
-def _lower_bound(
-    graph: GraphSpec,
-    placed: Dict[str, Placed],
-    W: int,
-    H: int,
-    lam: float,
-    mu: float,
-) -> float:
-    edge_cost = sum(_edge_lower_bound(e, graph, placed, W, H, lam) for e in graph.edges)
-    row_bias = sum(mu * p.y for p in placed.values())
-    return edge_cost + row_bias
-
-
-def _full_cost(
-    graph: GraphSpec,
-    placed: Dict[str, Placed],
-    lam: float,
-    mu: float,
-) -> float:
-    edge_cost = sum(_edge_cost(e, placed[e.src], placed[e.dst], lam) for e in graph.edges)
-    row_bias = sum(mu * p.y for p in placed.values())
-    return edge_cost + row_bias
-
-
-# ---------------------------------------------------------------------------
-# Search heuristics
-# ---------------------------------------------------------------------------
-
-
-def _placed_neighbor_count(graph: GraphSpec, name: str, placed_names: set[str]) -> int:
-    return sum(1 for n in graph.preds[name] + graph.succs[name] if n in placed_names)
-
-
-def _select_next_node(graph: GraphSpec, placed: Dict[str, Placed]) -> str:
-    """
-    Frontier-first branching:
-      0. when nothing is placed yet, start from a graph source
-      1. maximize number of already-placed neighbors
-      2. maximize total degree
-      3. maximize area (larger boxes earlier tend to prune sooner)
-      4. stabilize with the original logical order
-    """
-    placed_names = set(placed)
-    candidates = [name for name in graph.order if name not in placed_names]
-
-    if not placed_names:
-        sources = [name for name in candidates if not graph.preds[name]]
-        if sources:
-            return min(sources, key=lambda name: graph.specs[name].index)
-
-    def key(name: str) -> Tuple[int, int, int, int]:
-        rect = graph.specs[name].rect
-        frontier = _placed_neighbor_count(graph, name, placed_names)
-        degree = len(graph.preds[name]) + len(graph.succs[name])
-        area = rect.w * rect.h
-        return (frontier, degree, area, -graph.specs[name].index)
-
-    return max(candidates, key=key)
-
-
-def _ideal_anchor_from_neighbors(
-    spec: NodeSpec,
-    graph: GraphSpec,
-    placed: Dict[str, Placed],
-) -> Tuple[float, float]:
-    """
-    Compute an ideal local (x,y) for the node anchor by projecting from already
-    placed neighbors onto this node's input/output faces and taking medians.
-    """
-    target_xs: List[float] = []
-    target_ys: List[float] = []
-
-    in_lx, in_ly = _face_local_center(spec.rect, spec.rect.input_face)
-    out_lx, out_ly = _face_local_center(spec.rect, spec.rect.output_face)
-
-    for pred in graph.preds[spec.name]:
-        pred_p = placed.get(pred)
-        if pred_p is None:
-            continue
-        px, py = _face_abs_center(pred_p, pred_p.rect.output_face)
-        target_xs.append(px - in_lx)
-        target_ys.append(py - in_ly)
-
-    for succ in graph.succs[spec.name]:
-        succ_p = placed.get(succ)
-        if succ_p is None:
-            continue
-        sx, sy = _face_abs_center(succ_p, succ_p.rect.input_face)
-        target_xs.append(sx - out_lx)
-        target_ys.append(sy - out_ly)
-
-    if not target_xs:
-        return (0.0, 0.0)
-
-    return (float(median(target_xs)), float(median(target_ys)))
-
-
-def _rightward_progress_penalty(
-    spec: NodeSpec,
-    graph: GraphSpec,
-    placed: Dict[str, Placed],
-    x: int,
-) -> float:
-    penalty = 0.0
-    for pred in graph.preds[spec.name]:
-        pred_p = placed.get(pred)
-        if pred_p is None:
-            continue
-        desired_x = pred_p.x + pred_p.rect.w
-        if x < desired_x:
-            penalty += desired_x - x
-    return penalty
-
-
-def _enumerate_candidate_positions(
-    spec: NodeSpec,
-    graph: GraphSpec,
-    placed: Dict[str, Placed],
-    W: int,
-    H: int,
-    candidate_limit: Optional[int],
-    heuristics: PlacementHeuristics,
-) -> Iterable[Tuple[int, int]]:
-    """
-    Enumerate candidate local placements for a node, ordered by proximity to the
-    median ideal location induced by placed neighbors.
-
-    candidate_limit:
-      - None: exact search over all in-bounds positions
-      - int : heuristic search over the top-N closest positions
-    """
+def _places(spec: NodeSpec, W: int, H: int) -> List[List[Placed]]:
+    """Every in-bounds place of an op, a list per anchor row, west to east; its pinned place alone where it has one."""
     if spec.anchor is not None:
-        yield spec.anchor
-        return
+        pinned = Placed(spec.name, spec.anchor[0], spec.anchor[1], spec.rect)
+        if not _in_bounds(pinned, W, H):
+            raise PlacementInfeasibleError(f'Invalid fixed anchor for {spec.name}: out of bounds.')
+        return [[pinned]]
+    xs, ys = range(W - spec.rect.w + 1), range(H - spec.rect.h + 1)
+    rows = ([Placed(spec.name, x, y, spec.rect) for x in xs] for y in ys)
+    return [places for row in rows if (places := [p for p in row if _in_bounds(p, W, H)])]
 
-    min_x = 0 if spec.x_range is None else spec.x_range[0]
-    max_x = (W - spec.rect.w) if spec.x_range is None else spec.x_range[1]
-    min_y = 0 if spec.y_range is None else spec.y_range[0]
-    max_y = (H - spec.rect.h) if spec.y_range is None else spec.y_range[1]
-    if max_x < 0 or max_y < 0:
-        return
-    if max_x < min_x or max_y < min_y:
-        return
 
-    ideal_x, ideal_y = _ideal_anchor_from_neighbors(spec, graph, placed)
-    row_parity = spec.rect.extras.get('row_parity')
-
-    def eligible_row(y: int) -> bool:
-        return row_parity is None or y % 2 == int(row_parity)
-
-    # Exact mode: enumerate all legal coordinates, biased toward the ideal.
-    if candidate_limit is None:
-        xs = list(range(min_x, max_x + 1))
-        ys = [y for y in range(min_y, max_y + 1) if eligible_row(y)]
-        xs.sort(key=lambda x: (abs(x - ideal_x), x))
-        ys.sort(key=lambda y: (abs(y - ideal_y), y))
-        for y in ys:
-            for x in xs:
-                yield (x, y)
-        return
-
-    # Heuristic mode: score the full domain and keep the best N.
-    scored: List[Tuple[float, int, int, int]] = []
-    for y in range(min_y, max_y + 1):
-        if not eligible_row(y):
+def _share_slots(graph: GraphSpec, H: int) -> Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]]:
+    """Where an op's neighbour may sit to share a buffer of a shareable edge between them: by (op, neighbour) and
+    the op's anchor row, the neighbour's (column offset, anchor row) places. An op's buffer locations depend on its
+    anchor row alone, so each port's pair of rows lines its two buffers up at one column offset or none."""
+    slots: Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]] = {}
+    for edge in graph.edges:
+        if not edge.shareable:
             continue
-        for x in range(min_x, max_x + 1):
-            score = abs(x - ideal_x) + abs(y - ideal_y)
-            score += heuristics.low_row_weight * y
-            score += heuristics.rightward_progress_weight * _rightward_progress_penalty(
-                spec,
-                graph,
-                placed,
-                x,
+        src, dst = graph.specs[edge.src].rect, graph.specs[edge.dst].rect
+        for src_row in range(H - src.h + 1):
+            written = [Placed(edge.src, 0, src_row, src).banks(edge.src_group, port) for port, _ in edge.port_pairs]
+            for dst_row in range(H - dst.h + 1):
+                read = [Placed(edge.dst, 0, dst_row, dst).banks(edge.dst_group, port) for _, port in edge.port_pairs]
+                for offset in sorted({_alignment(*buffers) for buffers in zip(written, read)} - {None}):
+                    slots.setdefault((edge.src, edge.dst), {}).setdefault(src_row, []).append((offset, dst_row))
+                    slots.setdefault((edge.dst, edge.src), {}).setdefault(dst_row, []).append((-offset, src_row))
+    return slots
+
+
+def _alignment(written: frozenset, read: frozenset) -> Optional[int]:
+    """The column offset that moves a read buffer's locations onto its written one's, or None."""
+    if not written or not read:
+        return None
+    offset = min(written)[0] - min(read)[0]
+    return offset if frozenset((col + offset, row, banks) for col, row, banks in read) == written else None
+
+
+def _placement_order(graph: GraphSpec, slots: Dict[Tuple[str, str], Any]) -> List[str]:
+    """The order the beam places ops in: the pinned ones, then each time the op that may share the most buffers with
+    the ops placed (`_share_slots`), then with the most neighbours among them, earliest in dataflow first. A consumer
+    that may share its producer's buffer thus follows it."""
+    shares: Dict[Tuple[str, str], int] = {}
+    for edge in graph.edges:
+        pairs = len(edge.port_pairs) if (edge.src, edge.dst) in slots else 0
+        shares[edge.src, edge.dst] = shares.get((edge.src, edge.dst), 0) + pairs
+        shares[edge.dst, edge.src] = shares.get((edge.dst, edge.src), 0) + pairs
+    neighbours = {name: set(graph.preds[name]) | set(graph.succs[name]) for name in graph.specs}
+    position = {name: i for i, name in enumerate(graph.order)}
+
+    order = [name for name in graph.order if graph.specs[name].anchor is not None]
+    placed = set(order)
+    while len(order) < len(graph.order):
+
+        def affinity(name: str) -> Tuple[int, int, int]:
+            near = neighbours[name] & placed
+            return (sum(shares[name, other] for other in near), len(near), -position[name])
+
+        name = max((name for name in graph.order if name not in placed), key=affinity)
+        order.append(name)
+        placed.add(name)
+    return order
+
+
+def _keep(children: List[tuple], width: int) -> List[tuple]:
+    """The partial placements the beam keeps of `children` (cost, compactness, ...): those no other is both cheaper
+    and more compact than, from the cheapest to the most compact, spread evenly when there are more than `width`;
+    then the cheapest of the rest. A cost-led placement can leave gaps no later op fits in; the compact ones keep a
+    packed array placeable."""
+    children.sort(key=lambda child: child[:5])
+    front, rest = [], []
+    for child in children:
+        (front if not front or child[1] < front[-1][1] else rest).append(child)
+    if len(front) > width:
+        return [front[round(i * (len(front) - 1) / (width - 1))] for i in range(width)]
+    return front + rest[: width - len(front)]
+
+
+def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: int) -> Dict[str, Placed]:
+    """
+    Place the ops one at a time (`_placement_order`), keeping `width` partial placements (`_keep`). Each grows by
+    up to three places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
+    and the row bias; and the westmost legal one that leaves each neighbour still to place a free place sharing its
+    buffers (`_share_slots`), on whichever side that is. The cheapest complete placement wins.
+    """
+    places = {name: _places(spec, W, H) for name, spec in graph.specs.items()}
+    slots = _share_slots(graph, H)
+    incident = {name: [edge for edge in graph.edges if name in (edge.src, edge.dst)] for name in graph.specs}
+
+    def added_cost(p: Placed, placed: Dict[str, Placed]) -> float:
+        cost = mu * p.y
+        for edge in incident[p.name]:
+            if edge.src == p.name and edge.dst in placed:
+                cost += _edge_cost(edge, p, placed[edge.dst], lam)
+            elif edge.dst == p.name and edge.src in placed:
+                cost += _edge_cost(edge, placed[edge.src], p, lam)
+        return cost
+
+    def leaves_room(p: Placed, state: _State, partners: List[str]) -> bool:
+        """Whether each of `partners` has an in-bounds place sharing `p`'s buffers whose tiles nothing holds yet."""
+        held = set(state.claims) | p.tiles
+        return all(
+            any(
+                _in_bounds(q := Placed(other, p.x + offset, row, graph.specs[other].rect), W, H) and not q.tiles & held
+                for offset, row in slots[p.name, other].get(p.y, ())
             )
-            scored.append((score, y, -x, x))
-    scored.sort()
-
-    for _, y, _, x in scored[:candidate_limit]:
-        yield (x, y)
-
-
-def _validate_and_preplace_anchors(
-    graph: GraphSpec,
-    W: int,
-    H: int,
-) -> Dict[str, Placed]:
-    """
-    Validate all fixed anchors and pre-place them before the search starts.
-    """
-    placed: Dict[str, Placed] = {}
-
-    for name in graph.order:
-        spec = graph.specs[name]
-        if spec.anchor is None:
-            continue
-
-        p = Placed(name=name, x=spec.anchor[0], y=spec.anchor[1], rect=spec.rect)
-        if not _feasible(p, placed, graph, W, H):
-            raise PlacementInfeasibleError(
-                f'Invalid fixed anchor for {name}: out of bounds or conflicts with another anchor.'
-            )
-        placed[name] = p
-
-    return placed
-
-
-def _subgraph(
-    graph: GraphSpec,
-    names: Sequence[str],
-    spec_overrides: Optional[Dict[str, NodeSpec]] = None,
-) -> GraphSpec:
-    selected = set(names)
-    specs = {
-        name: (spec_overrides[name] if spec_overrides and name in spec_overrides else graph.specs[name])
-        for name in graph.order
-        if name in selected
-    }
-    edges = [e for e in graph.edges if e.src in selected and e.dst in selected]
-    preds = {name: [] for name in specs}
-    succs = {name: [] for name in specs}
-    for e in edges:
-        preds[e.dst].append(e.src)
-        succs[e.src].append(e.dst)
-    order = [name for name in graph.order if name in selected]
-    return GraphSpec(order=order, specs=specs, edges=edges, preds=preds, succs=succs)
-
-
-def _collect_descendants(graph: GraphSpec, root: str) -> set[str]:
-    pending = [root]
-    out: set[str] = set()
-    while pending:
-        name = pending.pop()
-        if name in out:
-            continue
-        out.add(name)
-        pending.extend(graph.succs[name])
-    return out
-
-
-def _detect_disjoint_fanout(
-    graph: GraphSpec,
-) -> Optional[Tuple[str, Dict[str, Tuple[str, ...]]]]:
-    all_names = set(graph.specs)
-
-    for root in graph.order:
-        children = list(graph.succs[root])
-        if len(children) <= 1 or graph.preds[root]:
-            continue
-
-        branch_sets: Dict[str, set[str]] = {}
-        union: set[str] = set()
-        valid = True
-
-        for child in children:
-            branch = _collect_descendants(graph, child)
-            if union & branch:
-                valid = False
-                break
-            union |= branch
-            branch_sets[child] = branch
-
-        if not valid or union | {root} != all_names:
-            continue
-
-        for child, branch in branch_sets.items():
-            for name in branch:
-                if graph.specs[name].anchor is not None:
-                    valid = False
-                    break
-                allowed_preds = set(branch)
-                if name == child:
-                    allowed_preds.add(root)
-                if any(pred not in allowed_preds for pred in graph.preds[name]):
-                    valid = False
-                    break
-                if any(succ not in branch for succ in graph.succs[name]):
-                    valid = False
-                    break
-            if not valid:
-                break
-
-        if valid:
-            branches = {child: tuple(name for name in graph.order if name in branch_sets[child]) for child in children}
-            return root, branches
-
-    return None
-
-
-def _branch_band(graph: GraphSpec, names: Sequence[str], child: str) -> BranchBand:
-    rects = [graph.specs[name].rect for name in names]
-    return BranchBand(
-        child=child,
-        names=tuple(names),
-        inner_height=max(rect.h for rect in rects),
-    )
-
-
-def _assign_branch_bands(
-    graph: GraphSpec,
-    branches: Dict[str, Tuple[str, ...]],
-    order: Sequence[str],
-    start_row: int,
-    H: int,
-) -> Optional[Dict[str, Tuple[int, int, int]]]:
-    """
-    Pack branch bands tightly above the shared fanout root.
-
-    The goal is to keep compute close to row 0 / memtile-facing rows and avoid
-    spare vertical room that would encourage unnecessary vertical chains.
-    """
-    bands = {child: _branch_band(graph, names, child) for child, names in branches.items()}
-    base_heights = {child: band.inner_height for child, band in bands.items()}
-    required = sum(base_heights.values())
-    if start_row + required > H:
-        return None
-
-    band_rows: Dict[str, Tuple[int, int, int]] = {}
-    current_top = start_row
-    for child in order:
-        band = bands[child]
-        band_height = base_heights[child]
-        band_top = current_top
-        inner_top = band_top
-        inner_height = band.inner_height
-        band_rows[child] = (inner_top, inner_height, band_top)
-        current_top = band_top + band_height
-
-    return band_rows
-
-
-# ---------------------------------------------------------------------------
-# Branch-and-bound search
-# ---------------------------------------------------------------------------
-
-
-def _first_fit(graph: GraphSpec, preplaced: Dict[str, Placed], W: int, H: int) -> Optional[Dict[str, Placed]]:
-    """A placement found without search, or None: each op in dataflow order at the leftmost, then lowest, position
-    legal beside those placed before it. It packs an array the cost-led search, which sets each op by its
-    neighbours, leaves gaps in that no op fits; as that search's incumbent it can only make its result cheaper."""
-    placed = dict(preplaced)
-    for name in graph.order:
-        if name in placed:
-            continue
-        spec = graph.specs[name]
-        x_lo, x_hi = spec.x_range or (0, W - spec.rect.w)
-        y_lo, y_hi = spec.y_range or (0, H - spec.rect.h)
-        fit = next(
-            (
-                candidate
-                for x in range(x_lo, x_hi + 1)
-                for y in range(y_lo, y_hi + 1)
-                if _feasible(candidate := Placed(name=name, x=x, y=y, rect=spec.rect), placed, graph, W, H)
-            ),
-            None,
+            for other in partners
         )
-        if fit is None:
-            return None
-        placed[name] = fit
-    return placed
 
+    states = [_State(0.0, 0, {}, {})]
+    for name in _placement_order(graph, slots):
+        neighbours = sorted(set(graph.preds[name]) | set(graph.succs[name]))
+        sharers = [other for other in neighbours if (name, other) in slots]
+        costs: Dict[tuple, Dict[Tuple[int, int], float]] = {}  # by the places of the op's placed neighbours
+        children = []
+        for rank, state in enumerate(states):
+            near = tuple((n, state.placed[n].x, state.placed[n].y) for n in neighbours if n in state.placed)
+            known = costs.setdefault(near, {})
 
-def _bnb_place_graph(
-    graph: GraphSpec,
-    W: int,
-    H: int,
-    lam: float,
-    mu: float,
-    candidate_limit: Optional[int],
-    heuristics: PlacementHeuristics,
-    max_states: Optional[int],
-) -> Dict[str, Placed]:
-    """
-    BnB placement over the kernel DAG.
+            def cost(p: Placed) -> float:
+                if (p.x, p.y) not in known:
+                    known[p.x, p.y] = added_cost(p, state.placed)
+                return known[p.x, p.y]
 
-    Nodes are selected frontier-first (most placed neighbors) and candidates
-    are ordered by proximity to the median ideal position from placed neighbors.
-    A first fit (`_first_fit`) is the initial incumbent where one exists, else
-    the first complete path through the DFS tree; cost pruning fires from it.
-    Backtracking handles infeasibility.
-
-    Exact search when candidate_limit=None (exponential on large grids).
-    Heuristic bounded search when candidate_limit is an int (recommended: 32).
-    """
-    if mu < 0:
-        raise ValueError('mu must be non-negative for the lower bound to remain admissible.')
-
-    preplaced = _validate_and_preplace_anchors(graph, W, H)
-
-    best = _first_fit(graph, preplaced, W, H) or {}
-    best_cost = _full_cost(graph, best, lam, mu) if best else float('inf')
-    states_visited = 0
-    budget_exhausted = False
-    # Tiles the placed ops occupy: two ops never share one, so a candidate on any of them is refused before the
-    # pairwise checks, which most candidates of a packed array would otherwise each run.
-    taken = set().union(*(placed.tiles for placed in preplaced.values()))
-
-    def dfs(placed: Dict[str, Placed]) -> None:
-        nonlocal best, best_cost, states_visited, budget_exhausted
-
-        if budget_exhausted:
-            return
-        states_visited += 1
-        if max_states is not None and states_visited > max_states:
-            budget_exhausted = True
-            return
-
-        lb = _lower_bound(graph, placed, W, H, lam, mu)
-        if lb >= best_cost:
-            return
-
-        if len(placed) == len(graph.specs):
-            total = _full_cost(graph, placed, lam, mu)
-            if total < best_cost:
-                best_cost = total
-                best = dict(placed)
-            return
-
-        name = _select_next_node(graph, placed)
-        spec = graph.specs[name]
-
-        for x, y in _enumerate_candidate_positions(
-            spec,
-            graph,
-            placed,
-            W,
-            H,
-            candidate_limit,
-            heuristics,
-        ):
-            cand = Placed(name=name, x=x, y=y, rect=spec.rect)
-            if cand.tiles & taken or not _feasible(cand, placed, graph, W, H):
-                continue
-
-            placed[name] = cand
-            taken.update(cand.tiles)
-            dfs(placed)
-            taken.difference_update(cand.tiles)
-            del placed[name]
-
-    dfs(dict(preplaced))
-
-    if len(best) != len(graph.specs):
-        if budget_exhausted:
-            raise PlacementInfeasibleError(f'No feasible placement found within search budget ({max_states} states).')
-        raise PlacementInfeasibleError('No feasible placement found for the given graph and device.')
-
-    return best
-
-
-def _place_graph_with_fallback(
-    graph: GraphSpec,
-    W: int,
-    H: int,
-    lam: float,
-    mu: float,
-    candidate_limit: Optional[int],
-    heuristics: PlacementHeuristics,
-    max_states: Optional[int],
-) -> Dict[str, Placed]:
-    if candidate_limit is None:
-        return _bnb_place_graph(graph, W, H, lam, mu, None, heuristics, max_states)
-
-    try:
-        return _bnb_place_graph(graph, W, H, lam, mu, candidate_limit, heuristics, max_states)
-    except PlacementInfeasibleError:
-        log.warning(
-            'AIE placement: bounded search (candidate_limit=%d) found no feasible placement; '
-            'retrying with exact search.',
-            candidate_limit,
-        )
-        return _bnb_place_graph(graph, W, H, lam, mu, None, heuristics, max_states)
-
-
-def _place_disjoint_fanout(
-    graph: GraphSpec,
-    W: int,
-    H: int,
-    lam: float,
-    mu: float,
-    candidate_limit: Optional[int],
-    heuristics: PlacementHeuristics,
-    max_states: Optional[int],
-) -> Optional[Dict[str, Placed]]:
-    """
-    Fast path for strict disjoint fanout trees.
-
-    Known limitation: branch bands are allocated only below the shared root.
-    This matches the common case where the root is already placed near row 0,
-    but it intentionally leaves rows above the root unused.
-    """
-    detected = _detect_disjoint_fanout(graph)
-    if detected is None:
-        log.debug('AIE placement: disjoint-fanout fast path not applicable.')
-        return None
-
-    root, branches = detected
-    if len(branches) > 4:
-        log.debug(
-            'AIE placement: disjoint-fanout fast path skipped for root %s with %d branches.',
-            root,
-            len(branches),
-        )
-        return None
-
-    root_graph = _subgraph(graph, [root])
-    root_placed = _place_graph_with_fallback(
-        root_graph,
-        W,
-        H,
-        lam,
-        mu,
-        candidate_limit,
-        heuristics,
-        max_states,
-    )
-    root_pos = root_placed[root]
-    start_row = root_pos.y + root_pos.rect.h
-    if start_row >= H:
-        log.debug(
-            """AIE placement: disjoint-fanout fast path skipped for root %s
-                because branches would start at row %d outside device height %d.""",
-            root,
-            start_row,
-            H,
-        )
-        return None
-
-    log.debug(
-        'AIE placement: using disjoint-fanout fast path for root %s with %d branches.',
-        root,
-        len(branches),
-    )
-
-    branch_children = list(branches)
-    placement_orders = list(permutations(branch_children))
-
-    for order in placement_orders:
-        band_rows = _assign_branch_bands(graph, branches, order, start_row, H)
-        if band_rows is None:
-            continue
-
-        placed = dict(root_placed)
-        valid = True
-
-        for child in order:
-            inner_top, inner_height, _ = band_rows[child]
-            specs: Dict[str, NodeSpec] = {}
-            for name in [root, *branches[child]]:
-                spec = graph.specs[name]
-                if name == root:
-                    specs[name] = NodeSpec(
-                        node=spec.node,
-                        name=spec.name,
-                        index=spec.index,
-                        rect=spec.rect,
-                        anchor=(root_pos.x, root_pos.y),
-                    )
+            partners = [other for other in sharers if other not in state.placed]
+            grown = {}
+            for row in places[name]:
+                westmost = next((p for p in row if state.fits(p, graph)), None)
+                if westmost is None:
                     continue
-
-                max_y = inner_top + inner_height - spec.rect.h
-                if max_y < inner_top:
-                    valid = False
-                    break
-                specs[name] = NodeSpec(
-                    node=spec.node,
-                    name=spec.name,
-                    index=spec.index,
-                    rect=spec.rect,
-                    x_range=spec.x_range,
-                    y_range=(inner_top, max_y),
-                )
-
-            if not valid:
-                break
-
-            sub_graph = _subgraph(graph, [root, *branches[child]], spec_overrides=specs)
-
-            try:
-                branch_placed = _place_graph_with_fallback(
-                    sub_graph,
-                    W,
-                    H,
-                    lam,
-                    mu,
-                    candidate_limit,
-                    heuristics,
-                    max_states,
-                )
-            except PlacementInfeasibleError:
-                valid = False
-                break
-
-            for name, pos in branch_placed.items():
-                if name != root:
-                    placed[name] = pos
-
-        if valid and len(placed) == len(graph.specs):
-            return placed
-
-    log.debug('AIE placement: disjoint-fanout fast path failed; falling back to global placement.')
-    return None
+                cheapest = next(p for p in sorted(row, key=lambda p: (cost(p), p.x)) if state.fits(p, graph))
+                grown.update({(p.x, p.y): p for p in (westmost, cheapest)})
+                if partners:
+                    roomy = next((p for p in row if leaves_room(p, state, partners) and state.fits(p, graph)), None)
+                    if roomy is not None:
+                        grown[roomy.x, roomy.y] = roomy
+            children.extend(
+                (state.cost + cost(p), state.compactness + p.x * H + p.y, rank, p.x, p.y, state, p)
+                for p in grown.values()
+            )
+        if not children:
+            if graph.specs[name].anchor is not None:
+                raise PlacementInfeasibleError(f'Invalid fixed anchor for {name}: conflicts with another anchor.')
+            raise PlacementInfeasibleError(
+                f'{name}: no legal place left beside the {len(states[0].placed)} ops placed before it, in any of '
+                f'the {len(states)} partial placements kept.'
+            )
+        states = [state.extend(p, cost, compactness) for cost, compactness, *_, state, p in _keep(children, width)]
+    return min(states, key=lambda state: (state.cost, state.compactness)).placed
 
 
 # ---------------------------------------------------------------------------
@@ -1357,45 +770,17 @@ class PlaceKernels(AIEPass):
         Row-bias weight in the objective:
           + mu * Σ(node.row)
 
-    candidate_limit:
-        Maximum number of candidate positions tried per node in the BnB search,
-        ordered by proximity to the ideal position from placed neighbors.
-        - int (default 64): heuristic bounded search; fast for any model size.
-          If it finds no feasible placement, the placer retries with exact
-          search before failing.
-        - None: exact search over all in-bounds positions — only feasible on
-          very small grids (e.g. W*H < 30); exponential on typical AIE arrays.
-
-    max_states:
-        Maximum DFS states explored per placement solve. If the budget is
-        exhausted, the best complete placement found so far is returned; if no
-        complete placement was found, placement fails hard.
-
-    low_row_weight / rightward_progress_weight:
-        Search-order heuristics only. They bias candidate exploration toward
-        lower rows and left-to-right growth without changing legality or the
-        final placement objective.
-
+    width:
+        Partial placements the beam search keeps (`_beam_place`), at least 2: the cheapest and the most compact.
     """
 
-    def __init__(
-        self,
-        lam: float = 1.0,
-        mu: float = 0.05,
-        candidate_limit: Optional[int] = 64,
-        max_states: Optional[int] = 50000,
-        low_row_weight: float = 0.05,
-        rightward_progress_weight: float = 0.25,
-    ):
+    def __init__(self, lam: float = 1.0, mu: float = 0.05, width: int = 16):
+        if int(width) < 2:
+            raise ValueError('PlaceKernels: width must be at least 2, to keep the cheapest and the most compact.')
         self.name = 'place_kernels'
         self._lam = float(lam)
         self._mu = float(mu)
-        self._candidate_limit = candidate_limit
-        self._max_states = max_states
-        self._heuristics = PlacementHeuristics(
-            low_row_weight=float(low_row_weight),
-            rightward_progress_weight=float(rightward_progress_weight),
-        )
+        self._width = int(width)
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
@@ -1432,27 +817,7 @@ class PlaceKernels(AIEPass):
         if not graph.specs:
             return None
 
-        placed = _place_disjoint_fanout(
-            graph=graph,
-            W=W,
-            H=H,
-            lam=self._lam,
-            mu=self._mu,
-            candidate_limit=self._candidate_limit,
-            heuristics=self._heuristics,
-            max_states=self._max_states,
-        )
-        if placed is None:
-            placed = _place_graph_with_fallback(
-                graph=graph,
-                W=W,
-                H=H,
-                lam=self._lam,
-                mu=self._mu,
-                candidate_limit=self._candidate_limit,
-                heuristics=self._heuristics,
-                max_states=self._max_states,
-            )
+        placed = _beam_place(graph, W, H, self._lam, self._mu, self._width)
         return {
             name: {
                 'col': int(p.x + col_offset),
