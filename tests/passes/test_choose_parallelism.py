@@ -323,6 +323,20 @@ def test_row_chains_gather_through_ordered_merges(tmp_path):
     assert direct_pairing(ctx.ir.execution, leg.logical_tensor, leg.producer, leg.consumer, merge=False)[0]
 
 
+def test_a_direct_route_one_end_asks_for_is_honoured(tmp_path):
+    """io_route names a mode at one end; the other end's default leaves it in force. LayerNorm's gather into the
+    single-chain Q takes a memory tile (above): asked to be direct, it is refused rather than staged."""
+    split = {'parallelism': {'cas_num': 2, 'cas_length': 1, 'contract': 'outer'}}
+    whole = {'parallelism': {'cas_num': 1, 'cas_length': 1, 'contract': 'outer'}}
+    one = {'parallelism': {'cas_num': 1, 'cas_length': 1, 'contract': 'inner'}}
+    directives = {
+        'ln1': split, 'k': split, 'v': split, 'q': {**one, 'io_route': {'inputs': {'ln1_ln': 'direct'}}},
+        'scores': whole, 'softmax': whole, 'ctx': whole, 'proj': one, 'ln2': one, 'fc1': one, 'fc2': one,
+    }  # fmt: skip
+    with pytest.raises(ConfigRefused, match='io_route=direct requested'):
+        lower(_encoder_model(), tmp_path, directives)
+
+
 def test_a_transformer_block_is_searched_in_both_modes(tmp_path):
     """Q, K and V alive at once once overflowed the search, and a LayerNorm left to split itself cut its rows below
     a microtile band; both modes now find a design, and 'performance' splits the row-wise layers by rows."""

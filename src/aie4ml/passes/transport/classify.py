@@ -223,6 +223,7 @@ def _route_policy(leg: Connection, execution) -> str:
     bad = [mode for mode in modes if mode not in ROUTE_MODES]
     if bad:
         raise ValueError(f'{leg.logical_tensor}: unsupported io_route mode(s) {bad}.')
+    modes.discard('auto')  # the default of a port nothing was asked of: it leaves the other end's request
     if 'memtile' in modes:
         return 'memtile'
     if modes == {'direct'}:
