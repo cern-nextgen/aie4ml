@@ -444,6 +444,10 @@ def test_conv_rejects_partitions_it_cannot_cut(conv_model, tmp_path):
     with pytest.raises(ConfigRefused, match='split it into the same row bands'):
         split = {'c1': {'parallelism': {'contract': 'outer', 'cas_num': 2}}, 'c2': {'parallelism': {'cas_num': 1}}}
         lower(conv_model, tmp_path, split, part=AIE1_PART)
+    # A 1x1 conv reads its producer's row slices one per tile, never another count it was asked for.
+    with pytest.raises(ConfigRefused, match='cas_num=4 conflicts with the 2 row slices'):
+        split = {name: {'parallelism': {'contract': 'outer', 'cas_num': n}} for name, n in (('b', 2), ('d', 4))}
+        lower(_padded_pair_model(pad=0, k=1), tmp_path, split, part=AIE1_PART)
 
 
 def test_conv_refuses_a_split_taller_than_the_array(tmp_path):

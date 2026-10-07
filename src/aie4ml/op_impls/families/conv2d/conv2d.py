@@ -290,7 +290,14 @@ class Conv2dOpImplVariant(OpImplVariant):
                     f"{node.name}: its input arrives split by rows (contract 'outer'), but a flattened output is one "
                     'row that the consuming Dense reads whole.'
                 )
-            return ParallelismConfig(cas_num=len(producer.port_staging), cas_length=1, contract='outer')
+            bands = len(producer.port_staging)
+            for name, value in (('cas_num', bands), ('cas_length', 1)):
+                if name in parallel_cfg and int(parallel_cfg[name]) != value:
+                    raise ConfigRefused(
+                        f'{node.name}: {name}={parallel_cfg[name]} conflicts with the {bands} row slices its producer '
+                        f'writes, which it reads one per tile ({name}={value}).'
+                    )
+            return ParallelismConfig(cas_num=bands, cas_length=1, contract='outer')
         if producer is not None:
             # A frame is never re-staged on the way, so a chain reads exactly the slices its
             # producer wrote -- the same rule the Dense 'inner' contract follows.
