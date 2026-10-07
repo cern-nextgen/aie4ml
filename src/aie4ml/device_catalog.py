@@ -29,15 +29,18 @@ _RELEASE_SUFFIX = re.compile(r'_\d{6}_\d+$')
 
 
 def lookup_device(part_name: str) -> Dict[str, Any]:
-    """The facts of a Vitis platform or device part and its AIECompilerTarget; {} for a name the catalog lacks."""
+    """The facts of a Vitis platform or device part and its AIECompilerTarget; {} for a name the catalog lacks.
+    Names match in any case; the catalog spells each part as AMD does, and that spelling is the one emitted: Vitis
+    reads the speed grade from it, and a part it does not recognise compiles at a lower default AIE clock."""
     catalog = load_device_catalog()
     name = str(part_name).lower()
+    parts = {part.lower(): part for part in catalog['parts']}
     for key in (name, _RELEASE_SUFFIX.sub('', name)):
         if key in catalog['platforms']:
             platform = dict(catalog['platforms'][key])
             return _facts(catalog, platform.pop('Part'), platform, 'platform')
-        if key in catalog['parts']:
-            return _facts(catalog, key, {}, 'part')
+        if key in parts:
+            return _facts(catalog, parts[key], {}, 'part')
     return {}
 
 
@@ -104,4 +107,6 @@ def resolve_device(part_name: Any, aie_cfg: Dict[str, Any]) -> tuple[DeviceSpec,
             )
         part_name = releases[0]
 
+    if merged.get('AIECompilerTarget') == 'part':
+        part_name = merged['Part']  # AMD's spelling, whatever case it was named in
     return DeviceSpec.from_config(str(part_name), merged), merged

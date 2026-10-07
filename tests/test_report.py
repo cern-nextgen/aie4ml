@@ -113,7 +113,7 @@ def test_report_layout_modes_need_no_build_or_profile_artifacts(tmp_path, capsys
     (tmp_path / 'aie_pipeline.json').write_text(json.dumps(_layout_pipeline()))
     rendered = layout(tmp_path)
     assert 'AIE layout' in repr(rendered)
-    assert rendered['device']['part'] == 'xcve2802-vsvh1760-2mp-e-s'
+    assert rendered['device']['part'] == 'xcve2802-vsvh1760-2MP-e-S'  # AMD's spelling, as the catalog gives it
     assert rendered._repr_html_().startswith('<div style="max-width:100%; overflow-x:auto"><svg')
 
     assert main([str(tmp_path), '--layout']) == 0

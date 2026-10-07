@@ -94,6 +94,12 @@ def test_a_platform_named_without_its_release_is_the_installed_one(monkeypatch):
         resolve_device('xilinx_vek280_base_202520_1', {})
 
 
+def test_a_part_named_in_any_case_is_emitted_as_amd_spells_it():
+    """Vitis reads the AIE clock from the part's speed grade: lowercase, VP2802 compiled at 1000 MHz, not 1250."""
+    for name in ('xcvp2802-vsva5601-2mhp-e-s', 'XCVP2802-VSVA5601-2MHP-E-S'):
+        assert resolve_device(name, {})[0].platform == 'xcvp2802-vsva5601-2MHP-e-S'
+
+
 def test_the_batch_is_the_model_inputs_leading_axis(tmp_path):
     with pytest.raises(ValueError, match='AIEConfig.BatchSize is not read'):
         from_onnx(
