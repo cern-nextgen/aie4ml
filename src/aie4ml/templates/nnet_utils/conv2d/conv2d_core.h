@@ -28,8 +28,10 @@ template<typename ConfigT>
 inline void conv2d_check_contract() {
   static_assert(ConfigT::K == 8 && ConfigT::N == 8, "conv2d taps are 8-channel blocks");
   static_assert(ConfigT::MB == 2 || ConfigT::MB == 4, "conv2d blocks 2 or 4 mmul row tiles");
-  static_assert(ConfigT::NB == 1 ? ConfigT::NBP == 1 : ConfigT::NBP % 2 == 0 && ConfigT::NBP >= ConfigT::NB,
-                "NBP pads NB to an even block count; one block, which the one-block core runs, is not padded");
+  static_assert(ConfigT::NB == 1 || ConfigT::POINTWISE_CORE
+                    ? ConfigT::NBP == ConfigT::NB
+                    : ConfigT::NBP % 2 == 0 && ConfigT::NBP >= ConfigT::NB,
+                "NBP pads NB to an even block count for the paired core; the one-block and pointwise cores need none");
   static_assert(ConfigT::DEPTHWISE_CORE || ConfigT::WN == ConfigT::KH * ConfigT::KW * ConfigT::CB * ConfigT::NBP * 64,
                 "weights hold one B tile per tap and output block of this tile; the depthwise core checks its own");
   static_assert(ConfigT::BN == ConfigT::NBP * 8, "bias holds one value per padded output channel");

@@ -88,10 +88,26 @@ def _depthwise_rows(compact: np.ndarray) -> np.ndarray:
     return taps.reshape(kh, -1, blocks, CHANNEL_BLOCK).transpose(2, 0, 1, 3)
 
 
-def _padded_blocks(blocks: int) -> int:
-    """Output blocks a tile's weights and bias hold: the paired core steps blocks two at a time, so it
-    pads an odd count; a tile of one block runs the one-block core, which needs no padding."""
-    return blocks if blocks == 1 else blocks + blocks % 2
+_POINTWISE_STEP_MMULS = 8
+"""Mmul issues the pointwise core unrolls in a step at most: its taps (input blocks) times its row tiles. Larger steps
+compile much slower on AIE-ML, and are left unpipelined."""
+
+
+def _uses_pointwise_core(config: Conv2dConfig, in_blocks: int, out_blocks: int) -> bool:
+    """Whether a tile runs the pointwise core (conv2d_core_pointwise.h): a 1x1 conv whose step fits
+    `_POINTWISE_STEP_MMULS` and where the other cores leave a short loop innermost -- several taps, or one tap over more
+    than one pair of output blocks. With one tap and one pair, their innermost loop is already the pixel loop."""
+    return (
+        tuple(config.spatial.kernel) == (1, 1)
+        and in_blocks * config.spatial_blocks <= _POINTWISE_STEP_MMULS
+        and (in_blocks > 1 or out_blocks > 2)
+    )
+
+
+def _padded_blocks(blocks: int, pointwise_core: bool) -> int:
+    """Output blocks a tile's weights and bias hold: the paired core steps blocks two at a time, so it pads an odd
+    count; a tile of one block, and the pointwise core, step one block at a time and need no padding."""
+    return blocks if blocks == 1 or pointwise_core else blocks + blocks % 2
 
 
 @register_variant
@@ -541,10 +557,11 @@ class Conv2dOpImplVariant(OpImplVariant):
         outer = config.parallelism.contract == 'outer'
         cout = int(input_tensor_for_role(node, 'rhs').shape[-1])
         in_blocks, out_blocks, out_h, out_w, out_w_computed = self._tile_extent(node, config)
-        out_blocks_padded = _padded_blocks(out_blocks)
         band = self.band_rows(node, config)
         streamed = self.input_port_kind == PORT_KIND_STREAM
         depthwise = self.uses_depthwise_core(node, config)
+        pointwise = not depthwise and _uses_pointwise_core(config, in_blocks, out_blocks)
+        out_blocks_padded = _padded_blocks(out_blocks, pointwise)
         # A band's window starts mid-image, so the image no longer sits at the frame's origin.
         whole_image = not outer
         params = {field: getattr(config, field) for field in config.__dataclass_fields__}
@@ -575,6 +592,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             ),
             bias_count=out_blocks_padded * CHANNEL_BLOCK,
             depthwise_core=depthwise,
+            pointwise_core=pointwise,
             stream_io=self.input_port_kind == PORT_KIND_STREAM,
             # aie_api's int16 x int8 mmul of 8-channel blocks accumulates in 64 bits whatever it is asked for
             cascade_accumulator_tag='acc64' if int(config.precision['lhs'].width) == 16 else config.accumulator_tag,
@@ -615,7 +633,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         kh, kw = config.spatial.kernel
         if self.uses_depthwise_core(node, config):
             return out_h * out_w_computed * kh * kw * out_blocks * CHANNEL_BLOCK
-        return out_h * out_w_computed * kh * kw * in_blocks * _padded_blocks(out_blocks) * CHANNEL_BLOCK**2
+        blocks = _padded_blocks(out_blocks, _uses_pointwise_core(config, in_blocks, out_blocks))
+        return out_h * out_w_computed * kh * kw * in_blocks * blocks * CHANNEL_BLOCK**2
 
     def output_staging_contract(self, _node, config, _tensor_name):
         return str(config.parallelism.contract)
@@ -730,8 +749,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         blocks = align_up(cout, CHANNEL_BLOCK) // CHANNEL_BLOCK
         outer = p.parallelism.contract == 'outer'
         chain_blocks = blocks if outer else blocks // cas_num
-        chain_blocks_padded = _padded_blocks(chain_blocks)
         column_blocks = in_channels // CHANNEL_BLOCK // cas_length
+        chain_blocks_padded = _padded_blocks(chain_blocks, _uses_pointwise_core(p, column_blocks, chain_blocks))
 
         if self.uses_depthwise_core(inst.node, p):
             packed_weights = np.tile(_depthwise_rows(compact).reshape(1, 1, -1), (cas_num, 1, 1))  # every band

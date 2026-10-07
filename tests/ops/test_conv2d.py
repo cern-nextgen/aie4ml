@@ -1366,6 +1366,50 @@ def test_conv_chain_matches_onnx(conv_model, tmp_path, part):
     )
 
 
+def _pointwise_model(size=4):
+    """An 8 -> 16 1x1 conv off the graph input (the boundary carries one channel block per port), then the one under
+    test, 16 -> 24 into flatten -> Gemm: two taps and three output blocks."""
+    nodes: list = []
+    inits: list = []
+    inits += [*_qparams('x', frac=FRAC)]
+    nodes.append(helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'))
+    nodes.append(helper.make_node('Transpose', ['x'], ['x_nchw'], perm=[0, 3, 1, 2], name='to_nchw'))
+    _conv(nodes, inits, 'x_nchw', 'a', 'q', 8, 16, 1, pad=0, relu=True, seed=51)
+    _conv(nodes, inits, 'a', 'b', 'p', 16, 24, 1, pad=0, relu=True, seed=52)
+    _head(nodes, inits, 'b', size * size * 24, seed=53)
+    return make_model(
+        'conv_pointwise',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, size, size, 8])],
+        outputs=[('y', TensorProto.FLOAT, [1, CLASSES])],
+        initializers=inits,
+    )
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
+def test_pointwise_core_matches_onnx(tmp_path, part):
+    """The pointwise core steps output blocks one at a time, so an odd count above two keeps its weights and bias
+    unpadded, and a flatten places every block's chunk of a pixel: three blocks reach both."""
+    one_tile = {name: {'parallelism': {'cas_num': 1, 'cas_length': 1}} for name in ('q', 'p')}
+    ctx = lower(_pointwise_model(), tmp_path / 'lowered', one_tile, part=part)
+    conv = ctx.ir.execution.get('p_aie')
+    params = conv.variant.build_template_params(conv.node, conv.config, {'row': 0, 'col': 0})
+    assert params['pointwise_core'] and params['out_blocks_padded'] == 3
+    feeds = np.random.default_rng(17).integers(-40, 40, size=(2, 1, 4, 4, 8), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _pointwise_model(),
+        {'x_q': feeds},
+        one_tile,
+        tmp_path / 'x86',
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=2,
+        per_iteration=True,
+    )
+
+
 @pytest.mark.requires_vitis
 @pytest.mark.parametrize('part', [AIE1_PART, PART, MLV2_PART], ids=['aie1', 'aie-ml', 'aie-mlv2'])
 def test_channel_chains_of_a_flattened_conv_match_onnx(tmp_path, part):
