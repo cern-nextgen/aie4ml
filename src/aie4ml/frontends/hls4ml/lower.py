@@ -224,6 +224,10 @@ class LowerToAieIr(ModelOptimizerPass):
             act = (layer.get_attr('activation', '') or '').lower()
             if act:
                 meta['activation'] = act
+        if layer.class_name == 'Merge':
+            merge_op = str(layer.get_attr('op', '')).lower()
+            if merge_op == 'add':
+                meta['input_roles'] = ['lhs', 'rhs']
         if layer.class_name == 'Transpose':
             meta['input_roles'] = ['lhs']
             perm = layer.get_attr('perm')
@@ -266,6 +270,13 @@ class LowerToAieIr(ModelOptimizerPass):
         return AIEBackendContext(device=device, policies=policies, project_config=project_config, aie_config=aie_cfg)
 
     def _map_op_type(self, layer) -> str:
+        if layer.class_name == 'Merge':
+            merge_op = str(layer.get_attr('op', '')).lower()
+            if merge_op == 'add':
+                return 'add'
+            raise NotImplementedError(
+                f'{layer.name}: hls4ml merge operation {merge_op!r} is not supported; only elementwise add is.'
+            )
         if layer.class_name in ('Dense',) or is_pointwise_dense(layer):
             return 'dense'
         if layer.class_name == 'SeparableConv2D':

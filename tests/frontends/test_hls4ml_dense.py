@@ -260,6 +260,33 @@ def test_a_permute_between_dense_layers_converts(tmp_path):
 
 
 @pytest.mark.aie_ir
+def test_a_keras_add_lowers_to_the_aie_add_and_other_merges_are_refused(tmp_path):
+    """hls4ml calls a Keras Add a Merge layer with op 'add': it lowers to the AIE add, its operands in order. No AIE
+    kernel implements another merge."""
+    _np, hls4ml, keras, qkeras = _imports()
+    q8 = qkeras.quantized_bits(8, 0, alpha=1)
+
+    def convert(merge, name):
+        x0 = keras.layers.Input((16,))
+        x = qkeras.QActivation(qkeras.quantized_bits(8, 2), name='in_q')(x0)
+        a = qkeras.QDense(16, kernel_quantizer=q8, bias_quantizer=q8, name='fc_a')(x)
+        b = qkeras.QDense(16, kernel_quantizer=q8, bias_quantizer=q8, name='fc_b')(x)
+        model = keras.Model(x0, merge(name='sum')([a, b]))
+        cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
+        for layer in ('fc_a', 'fc_b', 'sum'):  # the add keeps one int8 type in and out
+            cfg['LayerName'][layer]['Precision'] = {'result': 'fixed<8,3,RND_CONV,SAT>'}
+        return hls4ml.converters.convert_from_keras_model(
+            model, hls_config=cfg, output_dir=str(tmp_path / name), project_name=name, backend='aie', batch_size=8
+        )
+
+    add = get_backend_context(convert(keras.layers.Add, 'add')).ir.execution.get('sum_aie')
+    assert add.node.op_type == 'add'
+    assert [(item.tensor, item.role) for item in add.inputs] == [('layer3_out', 'lhs'), ('layer4_out', 'rhs')]
+    with pytest.raises(NotImplementedError, match="merge operation 'multiply' is not supported"):
+        convert(keras.layers.Multiply, 'multiply')
+
+
+@pytest.mark.aie_ir
 def test_a_conversion_lowers_one_sample_unless_asked_for_more(tmp_path):
     """Keras tensors carry no batch axis: the conversion's batch_size (default 1) is the leading axis the AIE sees."""
     _np, hls4ml, keras, qkeras = _imports()
