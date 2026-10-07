@@ -77,8 +77,8 @@ static inline void conv2d_tile_rows(typename ConfigT::data_t* frame,
         aie::vector<weight_t, SB> B = aie::load_v<SB>(pB);
         pB += SB;
         if constexpr (MB == 2) {
-          aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, ALIGN_2);
-          aie::vector<data_t, 2 * SA> v = aie::load_unaligned_v<2 * SA>(a + ROW, ALIGN_2);
+          aie::vector<data_t, 2 * SA> w = conv2d_load_window<2 * SA, ALIGN_2>(a);
+          aie::vector<data_t, 2 * SA> v = conv2d_load_window<2 * SA, ALIGN_2>(a + ROW);
           C0.mac(w.template extract<SA>(0), B);
           C1.mac(w.template extract<SA>(1), B);
           D0.mac(v.template extract<SA>(0), B);
@@ -86,12 +86,12 @@ static inline void conv2d_tile_rows(typename ConfigT::data_t* frame,
         } else {
           aie::vector<data_t, 4 * SA> w, v;
           if constexpr (4 * SA <= 64) {
-            w = aie::load_unaligned_v<4 * SA>(a, ALIGN_4);
-            v = aie::load_unaligned_v<4 * SA>(a + ROW, ALIGN_4);
+            w = conv2d_load_window<4 * SA, ALIGN_4>(a);
+            v = conv2d_load_window<4 * SA, ALIGN_4>(a + ROW);
           } else {
             for (int q = 0; q < 4 * SA / 64; ++q) {
-              w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, ALIGN_64));
-              v.template insert<64>(q, aie::load_unaligned_v<64>(a + ROW + q * 64, ALIGN_64));
+              w.template insert<64>(q, conv2d_load_window<64, ALIGN_64>(a + q * 64));
+              v.template insert<64>(q, conv2d_load_window<64, ALIGN_64>(a + ROW + q * 64));
             }
           }
           C0.mac(w.template extract<SA>(0), B);

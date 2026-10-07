@@ -79,15 +79,15 @@ static inline void conv2d_tile_pointwise(typename ConfigT::data_t* __restrict fr
           aie::vector<weight_t, SB> B = aie::load_v<SB>(pB);
           pB += NB * SB;
           if constexpr (MB == 2) {
-            aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, ALIGN_2);
+            aie::vector<data_t, 2 * SA> w = conv2d_load_window<2 * SA, ALIGN_2>(a);
             C0.mac(w.template extract<SA>(0), B);
             C1.mac(w.template extract<SA>(1), B);
           } else {
             aie::vector<data_t, 4 * SA> w;
             if constexpr (4 * SA <= 64) {
-              w = aie::load_unaligned_v<4 * SA>(a, ALIGN_4);
+              w = conv2d_load_window<4 * SA, ALIGN_4>(a);
             } else {
-              for (int q = 0; q < 4 * SA / 64; ++q) w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, ALIGN_64));
+              for (int q = 0; q < 4 * SA / 64; ++q) w.template insert<64>(q, conv2d_load_window<64, ALIGN_64>(a + q * 64));
             }
             C0.mac(w.template extract<SA>(0), B);
             C1.mac(w.template extract<SA>(1), B);

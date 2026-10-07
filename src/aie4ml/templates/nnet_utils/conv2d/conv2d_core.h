@@ -222,6 +222,23 @@ struct conv2d_geometry {
   static_assert(ConfigT::DEPTHWISE_CORE || loads_stay_in_frame(), "the last window's loads stay in the frame");
 };
 
+// A tap window load. On AIE1, load_unaligned_v told less than 16-byte alignment reads N + 32 bytes from the 16-byte
+// granule below the window, past what loads_stay_in_frame bounds: a frame ending at the end of the core's address
+// space then stalls the core. This reads N + 16.
+template<int N, int ALIGN, typename T>
+static inline aie::vector<T, N> conv2d_load_window(const T __aie_dm_resource_b* p) {
+#if defined(__AIENGINE__) && __AIE_ARCH__ == 10
+  if constexpr (ALIGN * sizeof(T) < 16) {
+    static_assert(N * sizeof(T) == 32 && ALIGN * sizeof(T) % 4 == 0, "an AIE1 window: two 2x8 row tiles of int8");
+    const unsigned frac = (unsigned(uintptr_t(p)) & 15) >> 2;  // each load truncates to its 16-byte granule
+    v16int32 t = xset_w(0, *(const v8int32 __aie_dm_resource_b*)p);
+    t = upd_v(t, 2, *(const v4int32 __aie_dm_resource_b*)(p + N));
+    return aie::vector<int32, 8>(ext_w(shuffle16(t, frac, 0x76543210, 0x00000000), 0)).template cast_to<T>();
+  }
+#endif
+  return aie::load_unaligned_v<N>(p, ALIGN);
+}
+
 // The DMA delivers only the image; the border of the frame is whatever the buffer held before.
 // Only the border the taps read is zeroed: rows [0, RR1), columns [RC0, RC1).
 template<typename ConfigT>
@@ -333,17 +350,17 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
             aie::vector<weight_t, SB> B1 = aie::load_v<SB>(pB + SB);
             pB += NBP * SB;
             if constexpr (MB == 2) {
-              aie::vector<data_t, 2 * SA> w = aie::load_unaligned_v<2 * SA>(a, ALIGN_2);
+              aie::vector<data_t, 2 * SA> w = conv2d_load_window<2 * SA, ALIGN_2>(a);
               aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
               aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
               C00.mac(A0, B0); C01.mac(A0, B1); C10.mac(A1, B0); C11.mac(A1, B1);
             } else {
               aie::vector<data_t, 4 * SA> w;
               if constexpr (4 * SA <= 64) {
-                w = aie::load_unaligned_v<4 * SA>(a, ALIGN_4);
+                w = conv2d_load_window<4 * SA, ALIGN_4>(a);
               } else {
                 for (int q = 0; q < 4 * SA / 64; ++q)
-                  w.template insert<64>(q, aie::load_unaligned_v<64>(a + q * 64, ALIGN_64));
+                  w.template insert<64>(q, conv2d_load_window<64, ALIGN_64>(a + q * 64));
               }
               aie::vector<data_t, SA> A0 = w.template extract<SA>(0);
               aie::vector<data_t, SA> A1 = w.template extract<SA>(1);
