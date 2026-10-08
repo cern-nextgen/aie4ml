@@ -601,7 +601,7 @@ HALO_SPLIT = {**ROW_SPLIT, 'd': {'parallelism': {'contract': 'outer', 'cas_num':
 
 @pytest.mark.parametrize(
     'part, shared',
-    [(PART, [True] * 4), (MLV2_PART, [True] * 4), (AIE1_PART, [True, True, True, False])],
+    [(PART, [True] * 4), (MLV2_PART, [True] * 4), (AIE1_PART, [True, True, False, True])],
     ids=['aie-ml', 'aie-mlv2', 'aie1'],
 )
 def test_row_bands_hand_their_neighbours_their_halo(tmp_path, part, shared):
@@ -747,8 +747,6 @@ def test_row_bands_refuse_a_halo_they_cannot_exchange(tmp_path):
     with pytest.raises(ConfigRefused, match='does not split 8 output rows'):
         odd = {name: {'parallelism': {'contract': 'outer', 'cas_num': 3}} for name in ('b', 'd')}
         lower(_padded_pair_model(), tmp_path / 'odd', odd)
-    with pytest.raises(ConfigRefused, match='window and output need 16512 B of bank 0 and 3'):
-        lower(_padded_pair_model(size=24), tmp_path / 'bank', HALO_SPLIT)
     with pytest.raises(ConfigRefused, match='reads 2 rows past a band, more than the bands of 1 rows'):
         ones = {name: {'parallelism': {'contract': 'outer', 'cas_num': 8}} for name in ('b', 'd')}
         lower(_padded_pair_model(k=5, pad=2), tmp_path / 'deep', ones)
@@ -1584,12 +1582,21 @@ def test_channel_chains_of_a_flattened_conv_match_onnx(tmp_path, part):
     )
 
 
-def test_row_bands_on_aie1_refuse_a_tile_short_of_dma_channels(tmp_path):
-    """On AIE1 the halo rows of an odd-row band travel by DMA, and a relaying middle conv's odd row sends two of them
-    beside its output to the Dense: three MM2S buffers on one tile, which has two channels. Refused at placement,
-    before Vitis, whose placer would only report a failed placement."""
-    with pytest.raises(ConfigRefused, match=r'needs more than the 2 DMA channels a tile has each way'):
-        lower(_halo_chain_model(), tmp_path, HALO_CHAIN, part=AIE1_PART)
+def test_row_bands_on_aie1_copy_only_the_halo_an_odd_row_reads(tmp_path):
+    """On AIE1 a band on an odd row reads in its own column, which the bands writing its halo do not reach: its halo
+    rows are planned DMA copies, and every other hand-over of the three-band chain is shared. Each copy takes a
+    channel on the tile writing it and on the one reading it, at most two each way, so the relaying middle conv
+    places."""
+    ctx = lower(_halo_chain_model(), tmp_path, HALO_CHAIN, part=AIE1_PART)
+    for name in ('d_aie', 'e_aie'):
+        inst = ctx.ir.execution.get(name)
+        row = ctx.ir.physical.placements[name]['row']
+        rows, halo = inst.variant._halo(inst.node, inst.config, 'lhs')
+        realized = {e['target']: e.get('realization') for e in ctx.ir.physical.plan['direct_edges']}
+        expected = ['shared_memory'] * 3 + [
+            'dma' if (row + port.reader) % 2 else 'shared_memory' for port in halo
+        ]
+        assert [realized[f'{name}.in1[{port}]'] for port in range(3 + len(halo))] == expected
 
 
 @pytest.mark.requires_vitis

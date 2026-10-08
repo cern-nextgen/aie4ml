@@ -42,16 +42,12 @@ class FrameRetileOpImplVariant(OpImplVariant):
 
     def buffer_locations(self, _node, config: FrameRetileConfig, anchor_row):
         """The op contract (`row_flow`), as for Dense and the conv it feeds: each kernel's input and frame
-        in banks 0 and 3 of the neighbouring tile both kernels of the hand-over reach; against the flow, of the
-        tile beside it on the other side, and its input where it would write."""
+        in banks 0 and 3 of the neighbouring tile both kernels of the hand-over reach."""
         locations = []
         for window in range(int(config.parallelism.cas_num)):
             flow = row_flow(config.alternating_horizontal, int(anchor_row) + window, 1)
-            read, written = (
-                (flow.output_col, flow.input_col) if config.against_flow else (flow.input_col, flow.output_col)
-            )
-            locations.append(BufferLocation('in1', window, read, window, (0, 3)))
-            locations.append(BufferLocation('out1', window, written, window, (0, 3)))
+            locations.append(BufferLocation('in1', window, flow.input_col, window, (0, 3)))
+            locations.append(BufferLocation('out1', window, flow.output_col, window, (0, 3)))
         return tuple(locations)
 
     def kernel_params(self, node, config: FrameRetileConfig):

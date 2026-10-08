@@ -75,7 +75,7 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
     Beside its own rows, a band writes the edge rows its neighbours' windows read of it, each a buffer of its own
     with a single reader (`halo_ports`); a band whose window reads its neighbours' rows takes them from those
     buffers and assembles its window on the tile (conv2d_halo.cpp). Every hand-over is then one buffer, shared
-    wherever both ends reach it: no memory tile, no copy, and no row computed twice.
+    wherever both ends reach it (`buffer_locations`): no memory tile, and no row computed twice.
     """
 
     variant_id = 'conv2d.b.r.halo.v1'
@@ -202,51 +202,50 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
 
     def validate_config(self, node: OpNode, config: Conv2dConfig, device) -> None:
         super().validate_config(node, config, device)
-        if not _reads_halo(node):
-            return
-        # A reading band's tile holds, per bank (ping and pong one bank apart): its window in banks 0 and 3, beside
-        # its output unless that goes on to the band that reads it; in banks 1 and 2 the halo rows its producer band
-        # writes there for the bands beside it, with the bias in bank 1 and the weights in bank 2.
+        # Each band's tile holds, per bank, the buffers it pins there (`buffer_locations`; a buffer two kernels share
+        # is pinned by both, and counted in the tile it is in), one copy each of ping and pong, beside the bias in
+        # bank 1 and the weights in bank 2. Where the buffers go depends on the row's parity on AIE1.
         params = self.build_template_params(node, config, {'row': 0, 'col': 0})
+        bands = int(config.parallelism.cas_num)
         window = self._frame_bytes(config, 'lhs', params['in_elements'])
-        out = 0 if any(_sent_rows(node)) else self._frame_bytes(config, 'output', params['out_elements'])
-        halo = window // int(params['in_rows']) * (int(params['in_rows']) - int(params['own_rows']))
-        bias = int(params['bias_count']) * int(config.precision['bias'].width) // 8
-        for banks, what, size in (
-            ('0 and 3', 'window and output', window + out),
-            ('1', 'halo rows and bias', halo + bias),
-            ('2', 'halo rows and weights', halo + int(params['weight_count'])),
-        ):
-            if size > int(config.bank_mem_bytes):
-                raise ConfigRefused(
-                    f"{node.name}: a band's {what} need {size} B of bank {banks}, which holds "
-                    f'{config.bank_mem_bytes} B; split it into more row bands.'
-                )
-
-    def reads_against_flow(self, node, config: Conv2dConfig) -> bool:
-        """Bands hand their rows on against the flow: a band reading its halo reads it there. So does a band whose
-        converter builds its input: the reader of the rows it sends sits on its input side, so the converter sits
-        on the other."""
-        return _reads_halo(node) or self.converts_input(config)
+        out = self._frame_bytes(config, 'output', params['out_elements'])
+        sizes = {('in1', band): window for band in range(bands)} | {('out1', band): out for band in range(bands)}
+        for group, rows, frame in (('in1', params['in_rows'], window), ('out1', params['out_rows'], out)):
+            ports = self._halo(node, config, 'lhs' if group == 'in1' else 'output')[1]
+            sizes.update({(group, index): port.rows * frame // int(rows) for index, port in enumerate(ports, bands)})
+        fixed = {1: int(params['bias_count']) * int(config.precision['bias'].width) // 8, 2: params['weight_count']}
+        for anchor in (0, 1) if config.alternating_horizontal else (0,):
+            used = {}
+            for location in self.buffer_locations(node, config, anchor):
+                if location.rel_col == 0:
+                    for bank in location.banks:
+                        key = (location.rel_row, bank)
+                        used[key] = used.get(key, fixed.get(bank, 0)) + sizes[location.port_group, location.port]
+            for (band, bank), size in sorted(used.items()):
+                if size > int(config.bank_mem_bytes):
+                    raise ConfigRefused(
+                        f"{node.name}: band {band}'s buffers need {size} B of bank {bank}, which holds "
+                        f'{config.bank_mem_bytes} B; split it into more row bands.'
+                    )
 
     def buffer_locations(self, node, config: Conv2dConfig, anchor_row):
-        """Band b on row b. The rows a band writes for its reader -- its own and its edge rows -- sit where the
-        band and its reader, one column west, both reach them (`row_flow`); the reader's neighbours reach them
-        north and south, and read them in their own column: on an AIE1 odd row that is not where the band writes
-        them, and a planned DMA carries them over."""
+        """Band b on row b, its window and its output where any op hands over (`row_flow`), so a chain of bands
+        flows east like the rest of the graph. A halo row sits in the row of the band reading it and the column of
+        the bands writing it, which reach it north and south: where the reader reads in that column -- every row
+        on AIE-ML, even rows on AIE1 -- it is one shared buffer; an AIE1 odd row reads in its own column, and a
+        planned DMA copies its halo there."""
         bands = int(config.parallelism.cas_num)
-        against, sends = self.reads_against_flow(node, config), any(_sent_rows(node))
         flows = [row_flow(config.alternating_horizontal, int(anchor_row) + band, 1) for band in range(bands)]
         locations = []
         for band, flow in enumerate(flows):
-            locations.append(BufferLocation('in1', band, flow.output_col if against else flow.input_col, band, (0, 3)))
-            locations.append(BufferLocation('out1', band, flow.input_col if sends else flow.output_col, band, (0, 3)))
+            locations.append(BufferLocation('in1', band, flow.input_col, band, (0, 3)))
+            locations.append(BufferLocation('out1', band, flow.output_col, band, (0, 3)))
         # Halo rows are a row or two: they go beside the stack, bias and weights, and leave banks 0 and 3 to the
         # windows.
         for index, port in enumerate(self._halo(node, config, 'lhs')[1], start=bands):
-            locations.append(BufferLocation('in1', index, 0, port.band, (1, 2)))
+            locations.append(BufferLocation('in1', index, flows[port.reader].input_col, port.reader, (1, 2)))
         for index, port in enumerate(self._halo(node, config, 'output')[1], start=bands):
-            locations.append(BufferLocation('out1', index, flows[port.band].input_col, port.band, (1, 2)))
+            locations.append(BufferLocation('out1', index, 0, port.reader, (1, 2)))
         return tuple(locations)
 
     def output_staging_contract(self, _node, config, _tensor_name):

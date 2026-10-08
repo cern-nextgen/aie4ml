@@ -561,7 +561,6 @@ class Conv2dOpImplVariant(OpImplVariant):
         from_boundary = source.producer is None
         row_slices = int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else 1
         frame = self.retiled_frame(node)
-        against_flow = self.reads_against_flow(node, config)
         fold = config.input_fold
         if fold is not None:
             name, variant = f'{node.name}_fold', FrameFoldOpImplVariant()
@@ -576,7 +575,6 @@ class Conv2dOpImplVariant(OpImplVariant):
                 channel_slices=int(config.parallelism.cas_length),
                 alternating_horizontal=config.alternating_horizontal,
                 bank_mem_bytes=config.bank_mem_bytes,
-                against_flow=against_flow,
             )
             source_view = converter.source_view
         else:
@@ -598,7 +596,6 @@ class Conv2dOpImplVariant(OpImplVariant):
                 channel_slices=int(config.parallelism.cas_length),
                 alternating_horizontal=config.alternating_horizontal,
                 bank_mem_bytes=config.bank_mem_bytes,
-                against_flow=against_flow,
             )
             source_view = view
         # A performance constraint, not a functional one: a converter beside its conv tile hands the frame
@@ -619,10 +616,6 @@ class Conv2dOpImplVariant(OpImplVariant):
                 source_view=source_view,
             ),
         )
-
-    def reads_against_flow(self, _node, _config: Conv2dConfig) -> bool:
-        """Whether its input buffers sit on its output side (`row_flow`), its producer beside it there."""
-        return False
 
     def buffer_locations(self, _node, config: Conv2dConfig, anchor_row):
         """Dense's contract (`cascade_ports`), mirroring `place_graph`: each hand-over in banks 0 and 3."""

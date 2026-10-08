@@ -668,13 +668,10 @@ def _places(spec: NodeSpec, W: int, H: int) -> List[List[Placed]]:
     return [places for row in rows if (places := [p for p in row if _in_bounds(p, W, H)])]
 
 
-def _share_slots(
-    graph: GraphSpec, H: int, *, whole: bool = False
-) -> Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]]:
+def _share_slots(graph: GraphSpec, H: int) -> Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]]:
     """Where an op's neighbour may sit to share a buffer of a shareable edge between them: by (op, neighbour) and
     the op's anchor row, the neighbour's (column offset, anchor row) places. An op's buffer locations depend on its
-    anchor row alone, so each port's pair of rows lines its two buffers up at one column offset or none. `whole`:
-    only the places sharing every buffer of the edge."""
+    anchor row alone, so each port's pair of rows lines its two buffers up at one column offset or none."""
     slots: Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]] = {}
     for edge in graph.edges:
         if not edge.shareable:
@@ -684,10 +681,7 @@ def _share_slots(
             written = [Placed(edge.src, 0, src_row, src).banks(edge.src_group, port) for port, _ in edge.port_pairs]
             for dst_row in range(H - dst.h + 1):
                 read = [Placed(edge.dst, 0, dst_row, dst).banks(edge.dst_group, port) for _, port in edge.port_pairs]
-                offsets = [_alignment(*buffers) for buffers in zip(written, read)]
-                if whole:
-                    offsets = offsets[:1] if len(set(offsets)) == 1 else []
-                for offset in sorted(set(offsets) - {None}):
+                for offset in sorted({_alignment(*buffers) for buffers in zip(written, read)} - {None}):
                     slots.setdefault((edge.src, edge.dst), {}).setdefault(src_row, []).append((offset, dst_row))
                     slots.setdefault((edge.dst, edge.src), {}).setdefault(dst_row, []).append((-offset, src_row))
     return slots
@@ -744,20 +738,14 @@ def _keep(children: List[tuple], width: int) -> List[tuple]:
 def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: int) -> Dict[str, Placed]:
     """
     Place the ops one at a time (`_placement_order`), keeping `width` partial placements (`_keep`). Each grows by
-    up to five places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
+    up to three places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
     and the row bias; and the westmost legal one that leaves each neighbour still to place a free place sharing its
-    buffers (`_share_slots`), on whichever side that is, and the ones that leave that room along a chain of such
-    neighbours sharing all of their buffers, or some (`leaves_room`). Legal includes each tile's DMA channels. The
+    buffers (`_share_slots`), on whichever side that is (`leaves_room`). Legal includes each tile's DMA channels. The
     cheapest complete placement wins.
     """
     places = {name: _places(spec, W, H) for name, spec in graph.specs.items()}
     slots = _share_slots(graph, H)
-    whole = _share_slots(graph, H, whole=True)
     incident = {name: [edge for edge in graph.edges if name in (edge.src, edge.dst)] for name in graph.specs}
-    partners_of = {
-        name: [other for other in sorted({*graph.preds[name], *graph.succs[name]}) if (name, other) in slots]
-        for name in graph.specs
-    }
 
     def added_cost(p: Placed, placed: Dict[str, Placed]) -> float:
         cost = mu * p.y
@@ -768,32 +756,21 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
                 cost += _edge_cost(edge, placed[edge.src], p, lam)
         return cost
 
-    def leaves_room(p: Placed, state: _State, partners: List[str], onward) -> bool:
-        """Whether each of `partners` has an in-bounds place sharing `p`'s buffers whose tiles nothing holds yet;
-        and so on along each edge with places in `onward` (`_share_slots`: sharing all of its buffers, or some), as a
-        chain of row bands handing its rows on west in shared memory needs room for all of it."""
-
-        def room(at: Placed, other: str, held: frozenset, chain: frozenset, among) -> bool:
-            for offset, row in among[at.name, other].get(at.y, ()):
-                q = Placed(other, at.x + offset, row, graph.specs[other].rect)
-                if not _in_bounds(q, W, H) or q.tiles & held:
-                    continue
-                ahead = [
-                    n
-                    for n in partners_of[other]
-                    if onward is not None and n not in state.placed and n not in chain and (other, n) in onward
-                ]
-                if all(room(q, n, held | q.tiles, chain | {n}, onward) for n in ahead):
-                    return True
-            return False
-
-        held = frozenset(state.claims) | p.tiles
-        return all(room(p, other, held, frozenset((p.name, other)), slots) for other in partners)
+    def leaves_room(p: Placed, state: _State, partners: List[str]) -> bool:
+        """Whether each of `partners` has an in-bounds place sharing `p`'s buffers whose tiles nothing holds yet."""
+        held = set(state.claims) | p.tiles
+        return all(
+            any(
+                _in_bounds(q := Placed(other, p.x + offset, row, graph.specs[other].rect), W, H) and not q.tiles & held
+                for offset, row in slots[p.name, other].get(p.y, ())
+            )
+            for other in partners
+        )
 
     states = [_State(0.0, 0, {}, {})]
     for name in _placement_order(graph, slots):
         neighbours = sorted(set(graph.preds[name]) | set(graph.succs[name]))
-        sharers = partners_of[name]
+        sharers = [other for other in neighbours if (name, other) in slots]
         costs: Dict[tuple, Dict[Tuple[int, int], float]] = {}  # by the places of the op's placed neighbours
         children = []
         for rank, state in enumerate(states):
@@ -814,12 +791,9 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
                 cheapest = next(p for p in sorted(row, key=lambda p: (cost(p), p.x)) if state.fits(p, graph))
                 grown.update({(p.x, p.y): p for p in (westmost, cheapest)})
                 if partners:
-                    for onward in (None, whole, slots):
-                        roomy = next(
-                            (p for p in row if leaves_room(p, state, partners, onward) and state.fits(p, graph)), None
-                        )
-                        if roomy is not None:
-                            grown[roomy.x, roomy.y] = roomy
+                    roomy = next((p for p in row if leaves_room(p, state, partners) and state.fits(p, graph)), None)
+                    if roomy is not None:
+                        grown[roomy.x, roomy.y] = roomy
             children.extend(
                 (state.cost + cost(p), state.compactness + p.x * H + p.y, rank, p.x, p.y, state, p)
                 for p in grown.values()

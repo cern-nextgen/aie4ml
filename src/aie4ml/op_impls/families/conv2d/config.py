@@ -99,7 +99,6 @@ class FrameRetileConfig:
     from_boundary: bool
     alternating_horizontal: bool  # AIE: odd-row cores reach their east neighbour's memory, not the west's
     bank_mem_bytes: int
-    against_flow: bool  # the frame on its reader's output side (`row_flow`), the converter beside it there
 
     def source_steps(self, window: RetileWindow) -> Dict[str, int]:
         """Byte addressing of a window's image in its source: channels per pixel, first-pixel base, and
@@ -133,7 +132,6 @@ class FrameRetileConfig:
         channel_slices: int,
         alternating_horizontal: bool,
         bank_mem_bytes: int,
-        against_flow: bool,
     ):
         _, height, width, channels = (int(x) for x in view.logical)
         rows, top, slice_channels = int(view.tile[1]), int(view.origin[1]), int(view.tile[3])
@@ -172,7 +170,6 @@ class FrameRetileConfig:
             from_boundary=from_boundary,
             alternating_horizontal=bool(alternating_horizontal),
             bank_mem_bytes=int(bank_mem_bytes),
-            against_flow=bool(against_flow),
         )
 
 
@@ -193,7 +190,6 @@ class FrameFoldConfig:
     parallelism: ParallelismConfig  # a kernel per window, no cascade
     alternating_horizontal: bool
     bank_mem_bytes: int
-    against_flow: bool  # the frame on its reader's output side (`row_flow`), the folder beside it there
 
     @property
     def transfer_bytes(self) -> int:
@@ -224,7 +220,6 @@ class FrameFoldConfig:
         channel_slices: int,
         alternating_horizontal: bool,
         bank_mem_bytes: int,
-        against_flow: bool,
     ):
         _, height, width, _ = (int(x) for x in shape)
         top, left, bottom, right = fold.window.pads
@@ -255,5 +250,4 @@ class FrameFoldConfig:
             ),
             alternating_horizontal=bool(alternating_horizontal),
             bank_mem_bytes=int(bank_mem_bytes),
-            against_flow=bool(against_flow),
         )

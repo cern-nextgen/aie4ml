@@ -14,7 +14,8 @@ using namespace adf;
 // array holds the bands' own rows, then per pair of neighbours (b, b + 1) band b's last rows (band b + 1's top halo)
 // and band b + 1's first rows (band b's bottom halo) -- in1 the rows this op's window reads, out1 the rows its
 // consumer's does (halo_ports in common.py). Every pair has the same ports, the first pair's (`conv2d_halo_role`).
-// Every port has one kernel on each end, pinned where the op contract lists it, so each is one buffer.
+// Every port has one kernel on each end, pinned where the op contract lists it: one buffer wherever both ends reach
+// it (halo.py `buffer_locations`).
 template<typename ConfigT>
 class conv2d_halo_graph : public graph {
 public:
