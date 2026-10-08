@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import numpy as np
@@ -20,7 +21,15 @@ from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, LayoutConversion, OpImplFootprint, OpImplVariant, StreamLocation, cascade_ports
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import MicrotileShape, ParallelismConfig, TensorView, parse_directives, shared_consumer_spatial_access
+from ...utils import (
+    MicrotileShape,
+    ParallelismConfig,
+    SpatialAccess2D,
+    TensorView,
+    build_padded_spatial_view,
+    parse_directives,
+    shared_consumer_spatial_access,
+)
 from ...utils.math import align_up
 from ...utils.precision import (
     aie_rounding_token,
@@ -48,7 +57,8 @@ from .common import (
     reads_neighbour_rows,
     spatial_access_of,
 )
-from .config import Conv2dConfig, Conv2dFlags, FrameRetileConfig
+from .config import FOLD_STEP_PIXELS, Conv2dConfig, Conv2dFlags, FrameFoldConfig, FrameRetileConfig, InputFold
+from .frame_fold import FrameFoldOpImplVariant
 from .frame_retile import FrameRetileOpImplVariant
 
 STREAM_BAND_ROWS = 4
@@ -104,6 +114,13 @@ def _uses_pointwise_core(config: Conv2dConfig, in_blocks: int, out_blocks: int) 
     )
 
 
+_FOLD_MIN_UNIT = {'AIE': 2, 'AIE-ML': 1, 'AIE-MLV2': 1}
+"""Bytes a folded conv's input pixel takes at least: AIE1 moves single bytes through 16-bit lanes, which costs its
+folder more than a padded byte costs its conv."""
+
+_POINTWISE_WINDOW = SpatialAccess2D(kernel=(1, 1), pads=(0, 0, 0, 0), strides=(1, 1), dilations=(1, 1))
+
+
 def _padded_blocks(blocks: int, pointwise_core: bool) -> int:
     """Output blocks a tile's weights and bias hold: the paired core steps blocks two at a time, so it pads an odd
     count; a tile of one block, and the pointwise core, step one block at a time and need no padding."""
@@ -125,7 +142,7 @@ class Conv2dOpImplVariant(OpImplVariant):
     graph_name = 'conv2d_graph'
     param_template = 'conv2d'
     plevel = 10
-    supported_directives: ClassVar[frozenset] = frozenset({'parallelism'})
+    supported_directives: ClassVar[frozenset] = frozenset({'parallelism', 'input_fold'})
 
     def matches(self, node: OpNode, device, _directives) -> bool:
         lhs = input_tensor_for_role(node, 'lhs')
@@ -145,6 +162,17 @@ class Conv2dOpImplVariant(OpImplVariant):
         return _core_microtile(select_generation_key(device.generation), max(lhs_width, out_width)) is not None
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> Conv2dConfig:
+        """A conv folds its input where it can and its folded frame fits a bank (`_fold_unit`), unless a design search
+        falls back on reading it as it is (`input_fold`, internal: see `fallback_kernels`)."""
+        config = self._resolve(node, device, directives, input_contracts, fold=directives.get('input_fold', True))
+        lhs = input_tensor_for_role(node, 'lhs')
+        if config.input_fold is not None and int(np.prod(config.io_views[lhs.name].tile)) > int(device.bank_mem_bytes):
+            # A folded frame holds each output pixel's whole window: where one tile's outgrows a memory bank, the
+            # conv reads its input as it is.
+            config = self._resolve(node, device, directives, input_contracts, fold=False)
+        return config
+
+    def _resolve(self, node: OpNode, device, directives, input_contracts, *, fold: bool) -> Conv2dConfig:
         io_route, parallel_cfg = parse_directives(directives)
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')
@@ -175,12 +203,15 @@ class Conv2dOpImplVariant(OpImplVariant):
         generation = select_generation_key(device.generation)
         m, k, n = _core_microtile(generation, int(precision['lhs'].width))
         microtiling = MatmulMicrotileConfig(microtile_m=m, microtile_k=k, microtile_n=n)
-        out_w = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[1]
+        in_shape, spatial, input_fold = self._kernel_input(node, generation, fold=fold)
+        out_w = spatial.output_extent(in_shape[1], in_shape[2])[1]
         spatial_blocks = min(_SPATIAL_BLOCKS[generation], key=lambda blocks: align_up(out_w, blocks * m))
 
         view = node.traits.get('output_view')
         flatten = view is not None and view.data['kind'] == VIEW_FLATTEN_2D
-        parallelism = self._resolve_parallelism(node, parallel_cfg, input_contracts, flatten=flatten)
+        parallelism = self._resolve_parallelism(
+            node, parallel_cfg, input_contracts, flatten=flatten, kernel_input=(in_shape, spatial)
+        )
         block, column_align = _frame_columns(generation)
         outer = parallelism.contract == 'outer'
         row_slices = parallelism.cas_num if outer else 1
@@ -191,23 +222,35 @@ class Conv2dOpImplVariant(OpImplVariant):
                 raise NotImplementedError(
                     f'{node.name}: {self.variant_id} fuses a 2x2 max pool of stride 2 without pads, not {window}.'
                 )
-            conv_rows = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+            conv_rows = spatial.output_extent(in_shape[1], in_shape[2])[0]
             if outer and (conv_rows // parallelism.cas_num) % 2:
                 raise ConfigRefused(
                     f"{node.name}: each of its {parallelism.cas_num} row slices (contract 'outer') must hold whole "
                     f'pool windows, but {conv_rows} output rows split into odd slices.'
                 )
 
-        io_views = {
-            lhs.name: frame_view(
+        if input_fold is None:
+            in_view = frame_view(
                 lhs,
                 spatial,
                 column_block=block,
                 column_align=column_align,
                 channel_slices=parallelism.cas_length,
                 row_slices=row_slices,
-            ),
-        }
+            )
+        else:
+            # Only the folder writes it and only this conv reads it: the columns this conv computes, in whole steps of
+            # the folder.
+            in_view = build_padded_spatial_view(
+                in_shape,
+                None,
+                column_block=math.lcm(spatial_blocks * m, FOLD_STEP_PIXELS),
+                column_align=column_align,
+                inner_block=CHANNEL_BLOCK,
+                inner_slices=parallelism.cas_length,
+                row_slices=row_slices,
+            )
+        io_views = {lhs.name: in_view}
         if flatten:
             if int(rhs.shape[-1]) % CHANNEL_BLOCK:
                 raise NotImplementedError(
@@ -250,7 +293,46 @@ class Conv2dOpImplVariant(OpImplVariant):
             bank_mem_bytes=int(device.bank_mem_bytes),
             flags=Conv2dFlags(use_relu=use_relu, emit_flattened=flatten),
             pool=pool,
+            input_fold=input_fold,
         )
+
+    def _fold_unit(self, node: OpNode, generation: str) -> int:
+        """Bytes per input pixel of a folded conv, or 0 for one that reads its input as it is.
+
+        A conv reading the graph boundary with a few channels folds: its folder (frame_fold.cpp) gives each output
+        pixel its whole window, so the conv runs a 1x1 over a few full blocks instead of a tap per window position
+        that fills a fraction of one. Pixels are 1, 2 or 4 bytes (`_FOLD_MIN_UNIT` at least), and a step loads one
+        window position's strided pixels as one vector.
+        """
+        lhs = input_tensor_for_role(node, 'lhs')
+        spatial = spatial_access_of(node)
+        unit = max(1 << (int(lhs.shape[-1]) - 1).bit_length(), _FOLD_MIN_UNIT[generation])
+        stride_w = int(spatial.strides[1])
+        folds = (
+            self.input_port_kind == PORT_KIND_BUFFER
+            and lhs.producer is None
+            and int(node.metadata['groups']) == 1
+            and unit <= CHANNEL_BLOCK // 2
+            and spatial.kernel != (1, 1)
+            and stride_w & (stride_w - 1) == 0
+            and unit * stride_w <= CHANNEL_BLOCK
+            and resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name).width == 8
+        )
+        return unit if folds else 0
+
+    def _kernel_input(
+        self, node: OpNode, generation: str, *, fold: bool
+    ) -> Tuple[Tuple[int, ...], SpatialAccess2D, Optional[InputFold]]:
+        """The input and window the kernel computes on: the conv's own, or, folding, a folded conv's folded input --
+        per output pixel its window, in whole 8-channel blocks -- and the 1x1 window over it."""
+        lhs = input_tensor_for_role(node, 'lhs')
+        spatial = spatial_access_of(node)
+        unit = self._fold_unit(node, generation) if fold else 0
+        if not unit:
+            return tuple(int(x) for x in lhs.shape), spatial, None
+        out_h, out_w = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))
+        channels = align_up(spatial.kernel[0] * spatial.kernel[1] * unit, CHANNEL_BLOCK)
+        return (1, out_h, out_w, channels), _POINTWISE_WINDOW, InputFold(unit=unit, window=spatial)
 
     def _output_frame(
         self, node, parallelism: ParallelismConfig, *, column_block: int, column_align: int
@@ -274,14 +356,17 @@ class Conv2dOpImplVariant(OpImplVariant):
             )
         return view
 
-    def _resolve_parallelism(self, node, parallel_cfg, input_contracts, *, flatten: bool) -> ParallelismConfig:
-        """Tiles over the channel-block axis, in the Dense contract vocabulary."""
+    def _resolve_parallelism(
+        self, node, parallel_cfg, input_contracts, *, flatten: bool, kernel_input
+    ) -> ParallelismConfig:
+        """Tiles over the channel-block axis, in the Dense contract vocabulary, of the input and window the kernel
+        computes on (`kernel_input`, see _kernel_input)."""
         contract = str(parallel_cfg.get('contract', 'inner'))
         if contract not in STAGING_CONTRACTS:
             raise ValueError(f'{node.name}: unknown parallelism contract {contract!r}.')
         lhs = input_tensor_for_role(node, 'lhs')
-        spatial = spatial_access_of(node)
-        in_blocks = align_up(int(lhs.shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
+        in_shape, spatial = kernel_input
+        in_blocks = align_up(in_shape[-1], CHANNEL_BLOCK) // CHANNEL_BLOCK
         out_blocks = align_up(int(input_tensor_for_role(node, 'rhs').shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
         neighbour_rows = reads_neighbour_rows(spatial)
 
@@ -337,7 +422,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 )
             if flatten:
                 raise ConfigRefused(f"{node.name}: a flattened output cannot be split by rows (contract 'outer').")
-            out_rows = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+            out_rows = spatial.output_extent(in_shape[1], in_shape[2])[0]
             if cas_num < 1 or out_rows % cas_num:
                 raise ConfigRefused(
                     f'{node.name}: cas_num={cas_num} does not split {out_rows} output rows into equal row slices.'
@@ -433,6 +518,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         widths = tuple(int(config.precision[role].width) for role in ('lhs', 'rhs', 'output'))
         return (
             self.input_port_kind == PORT_KIND_BUFFER
+            and config.input_fold is None
             and config.microtiling.microtile_m > 2
             and int(config.groups) == int(lhs.shape[-1]) == int(input_tensor_for_role(node, 'rhs').shape[-1])
             and widths == (8, 8, 8)
@@ -452,60 +538,91 @@ class Conv2dOpImplVariant(OpImplVariant):
         """
         return self.input_port_kind == PORT_KIND_BUFFER and int(config.spatial.strides[1]) > 1
 
+    def converts_input(self, config: Conv2dConfig) -> bool:
+        """Whether this conv reads a frame a converter built, a retiler or a folder, in place of its input."""
+        return self.retiles_input(config) or config.input_fold is not None
+
     @staticmethod
     def retiled_frame(node) -> str:
-        """The execution-only tensor a retiler writes and this conv reads in place of its input."""
+        """The execution-only tensor a converter writes and this conv reads in place of its input."""
         return f'{input_tensor_for_role(node, "lhs").name}__{node.name}_frame'
 
     def input_conversions(self, node, config: Conv2dConfig, sources):
-        if not self.retiles_input(config):
+        if not self.converts_input(config):
             return ()
         lhs = input_tensor_for_role(node, 'lhs')
         source = sources[lhs.name]
         if source.view is not None:
             raise NotImplementedError(
-                f'{node.name}: its strided input is the {source.view.kind} view {source.view.node!r}; a '
-                'retiler reads only the boundary tensor or a whole frame a kernel wrote.'
+                f'{node.name}: its input is the {source.view.kind} view {source.view.node!r}; a converter reads '
+                'only the boundary tensor or a whole frame a kernel wrote.'
             )
         view = config.io_views[lhs.name]
         from_boundary = source.producer is None
         row_slices = int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else 1
-        if row_slices > 1 and not from_boundary:
-            raise ConfigRefused(
-                f'{node.name}: its strided input arrives from {source.producer} split by rows; a retiler reads a '
-                "producer's frame whole."
-            )
         frame = self.retiled_frame(node)
-        retile = FrameRetileConfig.for_frame(
-            config.precision['lhs'],
-            view,
-            int(config.spatial.strides[1]),
-            source=lhs.name,
-            target=frame,
-            from_boundary=from_boundary,
-            row_slices=row_slices,
-            row_step=self._input_row_step(node, config),
-            channel_slices=int(config.parallelism.cas_length),
-            alternating_horizontal=config.alternating_horizontal,
-            bank_mem_bytes=config.bank_mem_bytes,
-        )
-        # A performance constraint, not a functional one: a retiler beside its conv tile hands the frame
+        against_flow = self.reads_against_flow(node, config)
+        fold = config.input_fold
+        if fold is not None:
+            name, variant = f'{node.name}_fold', FrameFoldOpImplVariant()
+            converter = FrameFoldConfig.for_frame(
+                config.precision['lhs'],
+                lhs.shape,
+                fold,
+                view,
+                source=lhs.name,
+                target=frame,
+                row_slices=row_slices,
+                channel_slices=int(config.parallelism.cas_length),
+                alternating_horizontal=config.alternating_horizontal,
+                bank_mem_bytes=config.bank_mem_bytes,
+                against_flow=against_flow,
+            )
+            source_view = converter.source_view
+        else:
+            if row_slices > 1 and not from_boundary:
+                raise ConfigRefused(
+                    f'{node.name}: its strided input arrives from {source.producer} split by rows; a retiler reads a '
+                    "producer's frame whole."
+                )
+            name, variant = f'{node.name}_retile', FrameRetileOpImplVariant()
+            converter = FrameRetileConfig.for_frame(
+                config.precision['lhs'],
+                view,
+                int(config.spatial.strides[1]),
+                source=lhs.name,
+                target=frame,
+                from_boundary=from_boundary,
+                row_slices=row_slices,
+                row_step=self._input_row_step(node, config),
+                channel_slices=int(config.parallelism.cas_length),
+                alternating_horizontal=config.alternating_horizontal,
+                bank_mem_bytes=config.bank_mem_bytes,
+                against_flow=against_flow,
+            )
+            source_view = view
+        # A performance constraint, not a functional one: a converter beside its conv tile hands the frame
         # over in shared memory, which every single-tile figure was measured with. A cascade's tiles read
-        # their inputs in their own row, which the retilers stacked beside it cannot reach, and chains
+        # their inputs in their own row, which the converters stacked beside it cannot reach, and chains
         # of output channels each read every slice, so there the frame moves by DMA.
         one_reader = int(config.parallelism.cas_length) == 1 and (
             config.parallelism.contract == 'outer' or int(config.parallelism.cas_num) == 1
         )
         return (
             LayoutConversion(
-                name=f'{node.name}_retile',
+                name=name,
                 source=lhs.name,
                 target=frame,
-                variant=FrameRetileOpImplVariant(),
-                config=retile,
+                variant=variant,
+                config=converter,
                 shared_memory=one_reader,
+                source_view=source_view,
             ),
         )
+
+    def reads_against_flow(self, _node, _config: Conv2dConfig) -> bool:
+        """Whether its input buffers sit on its output side (`row_flow`), its producer beside it there."""
+        return False
 
     def buffer_locations(self, _node, config: Conv2dConfig, anchor_row):
         """Dense's contract (`cascade_ports`), mirroring `place_graph`: each hand-over in banks 0 and 3."""
@@ -514,8 +631,7 @@ class Conv2dOpImplVariant(OpImplVariant):
     def band_rows(self, node, config: Conv2dConfig) -> int:
         """Output rows one core call covers. A buffer kernel does the whole tile in one call; a
         stream kernel walks the image in bands, keeping only a window of it."""
-        lhs = input_tensor_for_role(node, 'lhs')
-        out_rows = config.spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+        out_rows = config.spatial.output_extent(*self._input_extent(node, config))[0]
         if self.input_port_kind == PORT_KIND_BUFFER:
             return out_rows // int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else out_rows
         band = min(STREAM_BAND_ROWS, out_rows)
@@ -527,10 +643,9 @@ class Conv2dOpImplVariant(OpImplVariant):
         """What one tile computes per call: its input and output channel blocks, its output rows and
         columns, and the columns it computes (whole register tiles)."""
         lhs = input_tensor_for_role(node, 'lhs')
-        _, in_h, in_w, _ = (int(x) for x in lhs.shape)
         in_blocks = int(config.io_views[lhs.name].tile[3]) // CHANNEL_BLOCK
         out_blocks = align_up(int(input_tensor_for_role(node, 'rhs').shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
-        out_h, out_w = config.spatial.output_extent(in_h, in_w)
+        out_h, out_w = config.spatial.output_extent(*self._input_extent(node, config))
         # 'inner' chains own a share of the output channels; 'outer' chains own rows and each
         # computes every channel.
         if config.parallelism.contract == 'inner':
@@ -540,12 +655,18 @@ class Conv2dOpImplVariant(OpImplVariant):
         out_w_computed = align_up(out_w, config.spatial_blocks * config.microtiling.microtile_m)
         return in_blocks, out_blocks, out_h, out_w, out_w_computed
 
+    @staticmethod
+    def _input_extent(node, config: Conv2dConfig) -> Tuple[int, int]:
+        """The height and width of the input the kernel computes on: the tensor's, or its folded frame's."""
+        _, height, width, _ = config.io_views[input_tensor_for_role(node, 'lhs').name].logical
+        return int(height), int(width)
+
     def fills_border(self, node, config: Conv2dConfig) -> bool:
         """Who puts the zeros around the image: the kernel re-fills the border of a buffer another kernel
         wrote; the host delivers it with the padded window at the boundary, the stream wrapper keeps it in
-        a frame it owns, and a retiler builds the whole frame."""
+        a frame it owns, and a converter builds the whole frame."""
         producer = input_tensor_for_role(node, 'lhs').producer
-        return producer is not None and self.input_port_kind == PORT_KIND_BUFFER and not self.retiles_input(config)
+        return producer is not None and self.input_port_kind == PORT_KIND_BUFFER and not self.converts_input(config)
 
     def kernel_params(self, node, config: Conv2dConfig):
         lhs = input_tensor_for_role(node, 'lhs')
@@ -553,7 +674,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         in_view, out_view = config.io_views[lhs.name], config.io_views[out.name]
         _, in_rows, in_cols, _ = (int(x) for x in in_view.tile)
         kh, kw = config.spatial.kernel
-        _, in_h, in_w, cin = (int(x) for x in lhs.shape)
+        _, in_h, in_w, cin = (int(x) for x in in_view.logical)
         outer = config.parallelism.contract == 'outer'
         cout = int(input_tensor_for_role(node, 'rhs').shape[-1])
         in_blocks, out_blocks, out_h, out_w, out_w_computed = self._tile_extent(node, config)
@@ -654,8 +775,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         """Output rows one chain owns, or 0 when the chains split channels instead."""
         if config.parallelism.contract != 'outer':
             return 0
-        lhs = input_tensor_for_role(node, 'lhs')
-        out_rows = config.spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+        out_rows = config.spatial.output_extent(*self._input_extent(node, config))[0]
         return out_rows // int(config.parallelism.cas_num)
 
     def _input_row_step(self, node, config) -> int:
@@ -667,7 +787,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             return describe_logical_staging(config.io_views[tensor_name], 'read')
         # 'inner': the port is a channel slice every chain reads. 'outer': the port belongs to one
         # (row slice, channel slice) tile, so it selects both. A retiled frame is the same frame, its
-        # columns grouped by residue, and the port reads it from the retiler.
+        # columns grouped by residue, and the port reads it from the retiler; a folded one, from the folder.
         cas_length = int(config.parallelism.cas_length)
         outer = config.parallelism.contract == 'outer'
         row_slice, channel_port = (int(port) // cas_length, int(port) % cas_length) if outer else (0, int(port))
@@ -701,8 +821,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         cas_length = int(config.parallelism.cas_length)
         cas_num = int(config.parallelism.cas_num)
         lhs = input_tensor_for_role(node, 'lhs')
-        # A retiled conv reads the frame its retiler writes, not the tensor itself.
-        in_tensor = self.retiled_frame(node) if self.retiles_input(config) else lhs.name
+        # A retiled or folded conv reads the frame its converter writes, not the tensor itself.
+        in_tensor = self.retiled_frame(node) if self.converts_input(config) else lhs.name
         if config.parallelism.contract == 'outer':
             # Every tile reads its own row slice, so no port is shared.
             lhs_endpoints = tuple((f'kk[{tile}].in[0]',) for tile in range(cas_num * cas_length))
@@ -743,6 +863,14 @@ class Conv2dOpImplVariant(OpImplVariant):
             )
         )
         kh, kw, cin_g, cout = compact.shape
+        if p.input_fold is not None:
+            # A folded conv is 1x1 over its windows: window unit (ky, kx) holds its channels at (ky * kw + kx) * unit.
+            unit = p.input_fold.unit
+            folded = np.zeros((1, 1, int(p.io_views[lhs.name].full[-1]), cout), dtype=compact.dtype)
+            rows = (np.arange(kh * kw)[:, None] * unit + np.arange(cin_g)).reshape(-1)
+            folded[0, 0, rows] = compact.reshape(kh * kw * cin_g, cout)
+            compact = folded
+            kh, kw, cin_g, cout = compact.shape
         groups = int(p.groups)
         cout_g = cout // groups
         in_channels = int(p.io_views[lhs.name].full[-1])

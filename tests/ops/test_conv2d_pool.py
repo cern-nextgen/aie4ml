@@ -116,7 +116,7 @@ def _pooled(ctx):
 )
 def test_the_conv_writes_the_pooled_tensor_and_no_pool_remains(tmp_path, directives):
     ctx = lower(_model('pooled', second_conv=True), tmp_path, directives, part=PARTS['aie1'])
-    assert {inst.node.op_type for inst in ctx.ir.execution} == {'conv2d', 'dense'}
+    assert {inst.node.op_type for inst in ctx.ir.execution} == {'frame_fold', 'conv2d', 'dense'}  # 3 channels fold
     conv = _pooled(ctx)
     assert conv.config.pool is not None and conv.config.pool.window.kernel == (2, 2)
     (out,) = conv.node.outputs

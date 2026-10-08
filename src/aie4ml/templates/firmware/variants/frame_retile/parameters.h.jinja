@@ -11,6 +11,7 @@ struct {{L.struct_name}} {
   static constexpr int CAS_NUM = {{P.parallelism.cas_num}}, CAS_LENGTH = {{P.parallelism.cas_length}};
   static constexpr int SRC_W = {{P.src_w}};
   static constexpr int ROWS = {{P.rows}}, COLS = {{P.cols}}, CB = {{P.blocks}};
+  static constexpr bool FOLD = false;
   static constexpr int STRIDE = {{P.stride}};
   static constexpr int ORIGIN_C = {{P.origin_c}};
   static constexpr int FRAME_BYTES = {{P.frame_bytes}};

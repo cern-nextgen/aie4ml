@@ -744,10 +744,11 @@ def _keep(children: List[tuple], width: int) -> List[tuple]:
 def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: int) -> Dict[str, Placed]:
     """
     Place the ops one at a time (`_placement_order`), keeping `width` partial placements (`_keep`). Each grows by
-    up to four places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
+    up to five places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
     and the row bias; and the westmost legal one that leaves each neighbour still to place a free place sharing its
-    buffers (`_share_slots`), on whichever side that is, and the one that leaves that room along a whole chain of such
-    neighbours (`leaves_room`). Legal includes each tile's DMA channels. The cheapest complete placement wins.
+    buffers (`_share_slots`), on whichever side that is, and the ones that leave that room along a chain of such
+    neighbours sharing all of their buffers, or some (`leaves_room`). Legal includes each tile's DMA channels. The
+    cheapest complete placement wins.
     """
     places = {name: _places(spec, W, H) for name, spec in graph.specs.items()}
     slots = _share_slots(graph, H)
@@ -767,22 +768,22 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
                 cost += _edge_cost(edge, placed[edge.src], p, lam)
         return cost
 
-    def leaves_room(p: Placed, state: _State, partners: List[str], chained: bool) -> bool:
+    def leaves_room(p: Placed, state: _State, partners: List[str], onward) -> bool:
         """Whether each of `partners` has an in-bounds place sharing `p`'s buffers whose tiles nothing holds yet;
-        `chained`: and so on along each edge sharing all of its buffers, as a chain of row bands handing its rows on
-        west in shared memory needs room for all of it."""
+        and so on along each edge with places in `onward` (`_share_slots`: sharing all of its buffers, or some), as a
+        chain of row bands handing its rows on west in shared memory needs room for all of it."""
 
         def room(at: Placed, other: str, held: frozenset, chain: frozenset, among) -> bool:
             for offset, row in among[at.name, other].get(at.y, ()):
                 q = Placed(other, at.x + offset, row, graph.specs[other].rect)
                 if not _in_bounds(q, W, H) or q.tiles & held:
                     continue
-                onward = [
+                ahead = [
                     n
                     for n in partners_of[other]
-                    if chained and n not in state.placed and n not in chain and (other, n) in whole
+                    if onward is not None and n not in state.placed and n not in chain and (other, n) in onward
                 ]
-                if all(room(q, n, held | q.tiles, chain | {n}, whole) for n in onward):
+                if all(room(q, n, held | q.tiles, chain | {n}, onward) for n in ahead):
                     return True
             return False
 
@@ -813,9 +814,9 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
                 cheapest = next(p for p in sorted(row, key=lambda p: (cost(p), p.x)) if state.fits(p, graph))
                 grown.update({(p.x, p.y): p for p in (westmost, cheapest)})
                 if partners:
-                    for chained in (False, True):
+                    for onward in (None, whole, slots):
                         roomy = next(
-                            (p for p in row if leaves_room(p, state, partners, chained) and state.fits(p, graph)), None
+                            (p for p in row if leaves_room(p, state, partners, onward) and state.fits(p, graph)), None
                         )
                         if roomy is not None:
                             grown[roomy.x, roomy.y] = roomy

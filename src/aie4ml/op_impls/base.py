@@ -79,7 +79,8 @@ def cascade_ports(config, anchor_row: int):
 @dataclass(frozen=True)
 class LayoutConversion:
     """A kernel graph re-laying `source` into `target`, an execution-only value the op reads instead.
-    `shared_memory` makes the hand-over to the op a hard no-DMA requirement."""
+    `shared_memory` makes the hand-over to the op a hard no-DMA requirement; `source_view` is what the converter
+    reads of `source`."""
 
     name: str
     source: str
@@ -87,6 +88,7 @@ class LayoutConversion:
     variant: 'OpImplVariant'
     config: Any
     shared_memory: bool
+    source_view: Any
 
 
 @dataclass(frozen=True)

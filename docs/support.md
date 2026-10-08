@@ -84,6 +84,13 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
 - **Stride > 1**: runs on buffer ports. A small retiler kernel on the neighbouring tile regroups the input columns,
   which costs one extra tile and one pipeline stage of latency. A row-only stride needs no retiler. A strided conv
   split by rows must read from the graph input.
+- **Few input channels**: an int8 conv reading the graph input with at most 4 channels on buffer ports, one group,
+  folds its input: a small kernel on the neighbouring tile gives each output pixel its whole window, its channels
+  padded to 1, 2 or 4 (2 or 4 on AIE1), and the conv runs a 1×1 over it, filling its 8-channel blocks with the window
+  instead of zeros.
+  The horizontal stride goes with it (a power of two up to 8 over the padded channels: 2 for 3 or 4 channels), so it
+  needs no retiler. It costs one extra tile and one pipeline stage of latency. Where one tile's folded frame outgrows
+  a memory bank, the conv reads its input unfolded: on AIE1, a 16×16 image of 3 channels folds once split into rows.
 - **Graph boundary**: a buffer port carries one 8-channel block, so an input or output with more channels at the
   boundary needs a matching `cas_length` or `cas_num`, or stream ports.
 - **Streams** (`ports: 'stream'`): one tile, int8, stride 1, no pool or flatten. They let a frame of several channel

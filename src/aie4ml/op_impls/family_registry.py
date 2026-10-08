@@ -29,6 +29,12 @@ class FamilyResolver:
         their blocks; () leaves it to resolution. Legality is resolution's call."""
         return ()
 
+    def fallback_kernels(self, _node: Any, _device: Any) -> Tuple[Dict[str, Any], ...]:
+        """Directives resolving the node with a kernel its resolution prefers not to, which takes fewer tiles: a
+        design search falls back on it where the preferred kernel's design does not fit the budget, or, optimizing
+        speed, is slower. Internal: no user sets them."""
+        return ()
+
     def spatial_access(self, _node: Any):
         """The 2-D window read around each output pixel (sizes its producer's frame), or None."""
         return None

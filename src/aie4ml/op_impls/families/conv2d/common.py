@@ -184,37 +184,43 @@ def describe_frame_staging(
     row_base: int = 0,
     column_phases: int = 1,
     fills_border: bool = False,
+    transfer_bytes: int = 0,
 ):
     """Staging of one port's window on a spatial frame.
 
     The frame holds `CHANNEL_BLOCK` channels per chunk with the chunk index outermost, so a port's
     share of the channels is a contiguous region -- which is what makes the channel axis the
-    partition axis for both the cascade split and the 'inner' chain split. A row slice -- the
-    'outer' chain split -- is the other partition: it starts `row_base + row_slice * row_step` into the frame
-    and runs for the tile's rows: a window's slices overlap by the window span, a row band owns its rows.
+    partition axis for both the cascade split and the 'inner' chain split; a frame of fewer channels
+    holds them all as one chunk. A row slice -- the 'outer' chain split -- is the other partition: it
+    starts `row_base + row_slice * row_step` into the frame and runs for the tile's rows: a window's
+    slices overlap by the window span, a row band owns its rows.
 
     `column_phases` > 1 marks a frame whose columns are grouped by their residue modulo it, as a
     strided window reads them. Only a retiler writes one, and the marker keeps any frame in plain
     column order from ever matching it.
 
     A read wants zeros where its window leaves the image, unless the reading kernel `fills_border` itself.
+    `transfer_bytes` is what one inference moves when the port's buffer holds more than its window.
     """
     extras = {'storage_layout': STORAGE_LAYOUT_INNER_BLOCKED}
     if column_phases > 1:
         extras['column_phases'] = int(column_phases)
+    if transfer_bytes:
+        extras['transfer_bytes'] = int(transfer_bytes)
     inner_dim, _outer_dim, traversal_dims = canonical_buffer_axes(view)
     row_dim = view.buffer_order.index(1)
-    blocks = int(view.tile[-1]) // CHANNEL_BLOCK
+    block = min(CHANNEL_BLOCK, int(view.tile[-1]))
+    blocks = int(view.tile[-1]) // block
     origin = ordered_view_shape(view, 'origin')
     tile = ordered_view_shape(view, 'tile')
     row_offset = int(row_base) + int(row_slice) * int(row_step)
-    plans = {inner_dim: AxisPlan(CHANNEL_BLOCK, CHANNEL_BLOCK, blocks, int(port) * blocks * CHANNEL_BLOCK)}
+    plans = {inner_dim: AxisPlan(block, block, blocks, int(port) * blocks * block)}
     # The port holds the tile's rows, row after row, from its slice's first; a strided window may end before the
     # frame's border does.
     plans[row_dim] = AxisPlan(1, 1, int(tile[row_dim]), row_offset)
     # The frame is the image inside its zero border, so a window starts `origin` before the image.
     starts = {dim: 0 for dim in range(view.rank)}
-    starts[inner_dim] = int(port) * blocks * CHANNEL_BLOCK
+    starts[inner_dim] = int(port) * blocks * block
     starts[row_dim] = row_offset
     return build_staging_descriptor(
         view,

@@ -41,7 +41,7 @@ def convert_inputs(inst: ExecutionInstance, sources, device) -> list[ExecutionIn
                     'inputs': {conversion.source: routes.get(conversion.source, 'auto')},
                     'outputs': {conversion.target: 'direct'},
                 },
-                port_views={conversion.source: view, conversion.target: view},
+                port_views={conversion.source: conversion.source_view, conversion.target: view},
                 config=config,
                 graph_header=variant.graph_header,
                 graph_name=variant.graph_name,

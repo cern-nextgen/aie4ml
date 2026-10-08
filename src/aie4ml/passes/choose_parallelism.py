@@ -70,6 +70,16 @@ class _Design:
     ready: Tuple[Tuple[str, int], ...]  # (live tensor, estimated cycle it is written by)
 
 
+def _kernel(option) -> Dict[str, Any]:
+    """The fallback kernel a search option resolves its layer with, or {} for the kernel resolution prefers."""
+    return {key: value for key, value in (option or {}).items() if key not in ('parallelism', 'microtiling')}
+
+
+def _fallbacks(design: _Design) -> int:
+    """How many of the design's layers resolve with a fallback kernel."""
+    return sum(bool(_kernel(option)) for _, _, option in design.chosen)
+
+
 def _step(cycles: int) -> int:
     """`cycles` on a geometric grid INTERVAL_TOLERANCE apart."""
     return int(math.log1p(cycles) / math.log1p(INTERVAL_TOLERANCE))
@@ -272,10 +282,11 @@ class _Search:
             )
             if microtiling is not None:
                 self.microtiling[node.name] = microtiling
-            if parallelisms or microtiling:
+            fallbacks = family.fallback_kernels(node, ctx.device)
+            if parallelisms or microtiling or fallbacks:
                 self.choosing.add(node.name)
                 extra = {'microtiling': microtiling} if microtiling else {}
-                self.options[node.name] = [{**p, **extra} for p in parallelisms or [{}]]
+                self.options[node.name] = [{**p, **extra, **k} for p in parallelisms or [{}] for k in ({}, *fallbacks)]
             else:
                 self.options[node.name] = [None]
         self.graph_inputs = tuple(ctx.ir.logical.input_tensor_names)
@@ -435,8 +446,9 @@ class _Search:
         source, sink = insts
         streams, sharing = [], []
         try:
-            # an ordered merge only where the leg is its tensor's only reader (`classify.gathers`)
-            readers = self.readers.get(leg.producer.tensor, 0)
+            # an ordered merge only where the leg is its tensor's only reader (`classify.gathers`); a value only the
+            # execution graph has is a converter's, which the op that asked for it alone reads
+            readers = self.readers.get(leg.producer.tensor, 1)
             merge = (
                 bool(self.ctx.device.packet_ordered_merge)
                 and sink is not None
@@ -591,7 +603,12 @@ class _Search:
         kept: List[Tuple[Tuple[int, ...], _Design]] = []
         for design in ordered:
             area = design.tiles + design.reserved
-            point = (area,) if fewest else (area, _step(design.latency), design.memtile)
+            # a fallback kernel's fewer tiles never beat the preferred kernel's design: ranking trades them
+            point = (
+                (_fallbacks(design), area)
+                if fewest
+                else (_fallbacks(design), area, _step(design.latency), design.memtile)
+            )
             if not any(all(a <= b for a, b in zip(other, point)) for other, _ in kept):
                 kept.append((point, design))
         self.truncated |= not fewest and len(designs) > len(kept)
@@ -599,7 +616,8 @@ class _Search:
 
     def rank(self, design: _Design) -> tuple:
         if self.mode == 'resource':
-            return (design.tiles, design.memtile, design.latency, design.interval)
+            # the fewest tiles for the kernels resolution prefers; a fallback kernel only where none of those fits
+            return (_fallbacks(design), design.tiles, design.memtile, design.latency, design.interval)
         # intervals and latencies, within INTERVAL_TOLERANCE of each other the estimate cannot tell apart: of those,
         # the fewest memory-tile legs, then the fewest tiles
         first, second = (
@@ -653,13 +671,15 @@ class _Search:
 
     def choices(self, design: _Design) -> Dict[str, Dict[str, Any]]:
         """Per directive the search chooses, what the design resolved each chosen layer under: its parallelism as
-        resolved, its microtiling as chosen."""
-        made: Dict[str, Dict[str, Any]] = {'parallelism': {}, 'microtiling': {}}
+        resolved, its microtiling and fallback kernel (`fallback_kernels`) as chosen."""
+        made: Dict[str, Dict[str, Any]] = {'parallelism': {}, 'microtiling': {}, 'kernel': {}}
         for name, inst, option in design.chosen:
             if name in self.choosing:
                 made['parallelism'][name] = asdict(inst.config.parallelism)
             if option and 'microtiling' in option:
                 made['microtiling'][name] = option['microtiling']
+            if _kernel(option):
+                made['kernel'][name] = _kernel(option)
         return made
 
     def _build(self, design: _Design):

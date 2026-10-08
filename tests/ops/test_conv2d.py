@@ -213,7 +213,8 @@ def _nchw_output_model():
 
 
 def _row_split_model():
-    return _frame_model(name='conv_row_split')
+    """Eight channels: a conv reading fewer folds its input (_folded_model), and its row slices are the folder's."""
+    return _frame_model(channels_in=8, name='conv_row_split')
 
 
 def _stream_model():
@@ -245,9 +246,9 @@ def _padded_pair_model(size=H, pad=1, k=3, stride=1):
     )
 
 
-def _feed() -> np.ndarray:
+def _feed(channels=CIN) -> np.ndarray:
     rng = np.random.default_rng(11)
-    return rng.integers(-40, 40, size=(1, H, W, CIN), dtype=np.int8)
+    return rng.integers(-40, 40, size=(1, H, W, channels), dtype=np.int8)
 
 
 # --------------------------------------------------------------------------- #
@@ -267,10 +268,13 @@ def test_conv_chain_lowers_to_blocked_frames(conv_model, tmp_path):
     assert c3.node.traits['output_view'].data == {'kind': 'flatten_2d'} and c3.config.flags.emit_flattened
     assert (c2.config.spatial.kernel, c2.config.spatial.pads, c2.config.groups) == ((3, 3), (1, 1, 1, 1), C2)
 
-    # The graph input's frame: 3 channels padded to one 8-block, a 1-pixel zero border, and the
-    # image at column 2 so every stored register tile stays aligned.
+    # The graph input folds: c1 reads, from the folder beside it, a 1x1 frame of each output pixel's window -- nine
+    # pixels of 3 channels padded to 4, five 8-channel blocks -- whose columns are whole steps of the folder.
+    fold = execution.get('c1_aie_fold')
+    assert c1.config.input_fold.unit == 4 and c1.config.spatial.kernel == (1, 1)
     x_view = c1.config.io_views[c1.node.inputs[0].name]
-    assert x_view.full == (1, H + 2, 12, 8) and x_view.origin == (0, 1, 2, 0)
+    assert x_view.full == (1, H, 16, 40) and x_view.origin == (0, 0, 0, 0)
+    assert fold.config.source_view.full == (1, H + 2, 16, 4) and fold.config.source_view.origin == (0, 1, 1, 0)
     # A tensor's padded frame follows from the tensor alone, so producer and consumer agree on it.
     for producer, consumer in ((c1, c2), (c2, c3)):
         tensor = producer.node.outputs[0].name
@@ -279,7 +283,8 @@ def test_conv_chain_lowers_to_blocked_frames(conv_model, tmp_path):
 
     # Every internal edge is a direct whole-frame copy; the flattened output feeds Dense's LHS.
     assert {(e['source'], e['target']) for e in plan['direct_edges']} == {
-        ('ifm[0]', 'c1_aie.in1[0]'),
+        ('ifm[0]', 'c1_aie_fold.in1[0]'),
+        ('c1_aie_fold.out1[0]', 'c1_aie.in1[0]'),
         ('c1_aie.out1[0]', 'c2_aie.in1[0]'),
         ('c2_aie.out1[0]', 'c3_aie.in1[0]'),
         ('c3_aie.out1[0]', 'fc_aie.in1[0]'),
@@ -287,11 +292,13 @@ def test_conv_chain_lowers_to_blocked_frames(conv_model, tmp_path):
     }
     assert plan['buffers'] == []
 
+    # The PLIO carries the padded image in 4-byte pixels, rows of 64 B, then what the folder's loads read past it.
     graph_input = next(p['staging'] for p in plan['io_ports'] if p['direction'] == 'input')
     assert graph_input['storage_layout'] == 'linear'
-    assert graph_input['tiling_dimension'] == [8, 12, H + 2, 1]  # the PLIO carries the whole frame
+    assert graph_input['tiling_dimension'] == [4, 16, H + 2, 1]
     assert graph_input['io_boundary_dimension'] == [CIN, W, H, 1]
-    assert graph_input['logical_origin'] == [0, -2, -1, 0]  # the window opens on the border
+    assert graph_input['logical_origin'] == [0, -1, -1, 0]  # the window opens on the border
+    assert graph_input['transfer_bytes'] == 784  # 640 B of rows, 8 B the last row's steps read past it, 128 B slack
 
 
 @pytest.mark.parametrize('k', [3, 7])
@@ -552,7 +559,7 @@ def test_frame_rows_hold_whole_register_tiles(tmp_path):
     """A producer stores whole register tiles, so every frame row starts on one: 64 bytes on AIE-MLv2, where
     32-byte rows put every other row's stores out of alignment."""
     ctx = lower(_padded_pair_model(), tmp_path, part=MLV2_PART)
-    for inst in ctx.ir.execution:
+    for inst in (inst for inst in ctx.ir.execution if inst.node.op_type == 'conv2d'):
         m = inst.config.microtiling.microtile_m
         assert all(view.full[2] % m == 0 for view in inst.config.io_views.values() if len(view.full) == 4)
 
@@ -661,7 +668,7 @@ def test_a_chain_of_row_bands_is_placed_with_room_to_share_every_hand_over(tmp_p
     without it, the middle conv's band sent its rows and both halos by DMA from one tile, which has two channels."""
     ctx = lower(_halo_chain_model(), tmp_path, HALO_CHAIN)
     legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['source'].startswith(('b_aie', 'd_aie'))]
-    assert len(legs) == 14 and {e['realization'] for e in legs} == {'shared_memory'}
+    assert len(legs) == 17 and {e['realization'] for e in legs} == {'shared_memory'}  # the folder's three as well
 
 
 @pytest.mark.parametrize('bands', [4, 8])
@@ -1014,26 +1021,134 @@ def test_vertical_only_stride_takes_the_plain_boundary(tmp_path):
     )
 
 
-def _single_channel_strided_conv():
-    """One input channel, 18x18, 7x7 stride 2, five filters: the conv reads 17 of the 18 rows, 306
-    bytes, not whole units."""
-    return _strided_model(stride=2, k=7, channels_in=1, channels_out=5, size=18, name='conv_single_channel_s2')
-
-
 def test_strided_boundary_conv_is_retiled(tmp_path):
     """The boundary carries the rows the conv reads, in plain order, and a retiler builds the frame.
-    Those rows are 306 bytes and one inference moves 320: the two are kept apart."""
+    Five channels do not fold; the 17 rows the conv reads are 1530 bytes and one inference moves 1536: the two are
+    kept apart."""
     from aie4ml.simulation import build_io_layout
 
-    ctx = lower(_single_channel_strided_conv(), tmp_path, part=AIE1_PART)
+    model = _strided_model(stride=2, k=7, channels_in=5, channels_out=5, size=18, name='conv_five_channel_s2')
+    ctx = lower(model, tmp_path, part=AIE1_PART)
     retile, conv = ctx.ir.execution.get('b_aie_retile'), ctx.ir.execution.get('b_aie')
     assert retile.op_type == 'frame_retile' and conv.variant.retiles_input(conv.config)
     assert list(retile.ports.inputs) == ['x_q'] and 'x_q' not in conv.ports.inputs
 
     port = build_io_layout(ctx).inputs['x_q'][0]
-    assert port.numpy_tile_shape == (1, 17, 18, 1)  # stride 2 never reaches row 18; nothing around them
-    assert port.transfer_bytes == 320
+    assert port.numpy_tile_shape == (1, 17, 18, 5)  # stride 2 never reaches row 18; nothing around them
+    assert port.transfer_bytes == 1536
     assert port.staging['storage_layout'] == 'linear'
+
+
+def _single_channel_strided_conv():
+    """One input channel, 18x18, 7x7 stride 2, five filters: the conv reads 17 of the 18 rows."""
+    return _strided_model(stride=2, k=7, channels_in=1, channels_out=5, size=18, name='conv_single_channel_s2')
+
+
+def test_few_channel_boundary_conv_folds(tmp_path):
+    """A conv reading the boundary with few channels folds: a folder beside it gives each output pixel its whole
+    window -- 49 one-byte pixels, seven 8-channel blocks -- and the conv runs a 1x1 over them; the stride is gone with
+    the columns it skips, so nothing retiles. The boundary carries the 17 rows the window reads, then what the
+    folder's last step reads past them and the slack of its loads; its rows start on 32 bytes. AIE1 folds pixels of two
+    bytes at least: thirteen blocks, which fit a bank there in two row bands."""
+    from aie4ml.simulation import build_io_layout
+
+    bands = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
+    aie1 = lower(_single_channel_strided_conv(), tmp_path / 'aie1', bands, part=AIE1_PART).ir.execution.get('b_aie')
+    assert aie1.config.input_fold.unit == 2 and aie1.config.io_views[aie1.node.inputs[0].name].tile == (1, 3, 16, 104)
+
+    ctx = lower(_single_channel_strided_conv(), tmp_path)
+    assert [inst.name for inst in ctx.ir.execution] == ['b_aie_fold', 'b_aie']
+    fold, conv = ctx.ir.execution.get('b_aie_fold'), ctx.ir.execution.get('b_aie')
+    assert fold.op_type == 'frame_fold' and list(fold.ports.inputs) == ['x_q'] and 'x_q' not in conv.ports.inputs
+    assert conv.config.input_fold.unit == 1 and conv.config.spatial.kernel == (1, 1)
+    assert conv.config.io_views[conv.node.inputs[0].name].full == (1, 6, 16, 56)  # columns in whole folder steps
+    assert conv.inputs[0].shared_memory
+    assert fold.config.pairs_bytes == 0  # at stride 2 a step loads each unit pair directly
+
+    port = build_io_layout(ctx).inputs['x_q'][0]
+    assert port.numpy_tile_shape == (1, 17, 32, 1)
+    assert port.transfer_bytes == 688  # 544 B of rows, the last step's 6 B past them, 128 B of slack
+
+    # Window position (ky, kx) is input channel ky * 7 + kx of the 1x1.
+    compact = np.rint(np.asarray(conv.node.inputs[1].data) * 2**FRAC).reshape(49, 5)
+    packed = conv.artifacts['packed_weights'].reshape(56, 8)  # (cin block, lane) x cout, one output block
+    assert np.array_equal(packed[:49, :5], compact) and not packed[49:].any() and not packed[:, 5:].any()
+
+
+def test_a_folded_frame_fits_a_bank_or_the_conv_reads_its_input(tmp_path):
+    """On AIE1 a whole 16x16 frame of 3x3 windows of 3 channels (40 bytes a pixel) outgrows a memory bank: one tile
+    reads the input as it is, and two row bands each fold their half."""
+    model = _strided_model(stride=1, k=3, channels_in=3, channels_out=8, size=16, name='conv_tutorial_first', pad=1)
+    whole = lower(model, tmp_path / 'whole', part=AIE1_PART).ir.execution.get('b_aie')
+    assert whole.config.input_fold is None and whole.config.spatial.kernel == (3, 3)
+    split = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
+    bands = lower(model, tmp_path / 'bands', split, part=AIE1_PART).ir.execution.get('b_aie')
+    assert bands.config.input_fold.unit == 4 and bands.config.io_views[bands.node.inputs[0].name].tile == (1, 8, 16, 40)
+
+
+def test_folded_row_bands_and_channel_slices_each_get_a_folder(tmp_path):
+    """Split by rows and by its folded blocks, the conv reads one window per tile: each folder reads its band's rows of
+    the boundary, the halo included, and builds its slice of the blocks."""
+    model = _strided_model(stride=1, k=3, channels_in=2, channels_out=8, size=12, name='conv_folded_split', pad=1)
+    ctx = lower(model, tmp_path, {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2, 'cas_length': 3}}})
+    fold, conv = ctx.ir.execution.get('b_aie_fold'), ctx.ir.execution.get('b_aie')
+    frame = conv.node.inputs[0].name
+    assert conv.config.input_fold.unit == 2 and conv.config.io_views[frame].tile == (1, 6, 16, 8)  # 18 B: 3 blocks
+    params = fold.variant.kernel_params(fold.node, fold.config)
+    assert (params['blocks'], params['first_blocks']) == (1, [0, 1, 2, 0, 1, 2])
+    reads = [fold.variant.describe_input_staging(fold.node, fold.config, 'x_q', port) for port in (0, 3)]
+    assert [d['logical_origin'][2] for d in reads] == [-1, 5]  # band 1's rows start one above its own
+    assert all(staging_tile_shape(d)[2] == 8 for d in reads)
+    written = [fold.variant.describe_output_staging(fold.node, fold.config, frame, port) for port in range(6)]
+    read = [conv.variant.describe_input_staging(conv.node, conv.config, frame, port) for port in range(6)]
+    assert [w['offset'] for w in written] == [r['offset'] for r in read]
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [AIE1_PART, PART, MLV2_PART], ids=['aie1', 'aie-ml', 'aie-mlv2'])
+def test_folded_convs_match_onnx(tmp_path, part):
+    """One channel at stride 2 in two row bands -- one-byte pixels, two-byte ones on AIE1 --, one at stride 1 in row
+    bands split by their folded blocks -- one-byte pixels in pairs --, and two channels split by their blocks: what
+    the folder puts where, and the weights that follow it, must agree for every unit, stride and split."""
+    feeds = np.random.default_rng(23).integers(-40, 40, size=(4, 1, 18, 18, 1), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _single_channel_strided_conv(),
+        {'x_q': feeds},
+        {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}},
+        tmp_path / 'strided',
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=4,
+        per_iteration=True,
+    )
+    model = _strided_model(stride=1, k=5, channels_in=1, channels_out=8, size=12, name='conv_folded_pairs', pad=2)
+    feeds = np.random.default_rng(31).integers(-40, 40, size=(4, 1, 12, 12, 1), dtype=np.int8)
+    assert_x86_matches_onnx(
+        model,
+        {'x_q': feeds},
+        # AIE1 folds two-byte pixels, seven blocks: it splits only the rows
+        {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2, 'cas_length': 1 if part == AIE1_PART else 2}}},
+        tmp_path / 'pairs',
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=4,
+        per_iteration=True,
+    )
+    model = _strided_model(stride=1, k=3, channels_in=2, channels_out=8, size=12, name='conv_folded_split', pad=1)
+    feeds = np.random.default_rng(29).integers(-40, 40, size=(4, 1, 12, 12, 2), dtype=np.int8)
+    assert_x86_matches_onnx(
+        model,
+        {'x_q': feeds},
+        {'b': {'parallelism': {'cas_length': 3}}},
+        tmp_path / 'split',
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=4,
+        per_iteration=True,
+    )
 
 
 def _row_split_strided_conv(channels_in=8):
@@ -1283,7 +1398,7 @@ def test_outer_split_matches_onnx(tmp_path, part):
     """Same-padded conv split by rows into two slices: the halo rows and the delivered top/bottom border
     are what this checks, so any mistake in the slice windows shows up as wrong pixels."""
     assert_x86_matches_onnx(
-        _row_split_model(), {'x_q': _feed()}, ROW_SPLIT, tmp_path, frac=FRAC, max_code_diff=1, part=part
+        _row_split_model(), {'x_q': _feed(8)}, ROW_SPLIT, tmp_path, frac=FRAC, max_code_diff=1, part=part
     )
 
 

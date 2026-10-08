@@ -178,6 +178,7 @@ class Resolve(AIEPass):
                 for key in ('parallelism', 'microtiling')
                 if node.name in (chosen := ctx.ir.optimizer.get(key, {}))
             }
+            choice.update(ctx.ir.optimizer.get('kernel', {}).get(node.name, {}))
             inst = resolve_instance(node, ctx.device, inputs, choice)
             execution.add(inst)
             execution.tensor_contracts.update(output_contracts(inst))

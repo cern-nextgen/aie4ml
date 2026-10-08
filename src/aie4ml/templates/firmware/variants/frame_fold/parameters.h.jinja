@@ -1,0 +1,27 @@
+{% from 'variants/placement.jinja' import buffer_locations %}
+{% set P = L.op_impl.parameters %}
+// A folder: the input window in rows of UNIT-byte pixels, and the frame it folds for the conv that reads it, per
+// output pixel its window in the channels of a 1x1 conv. One kernel per window builds that window's tile of the
+// frame (a row band, a channel slice, or both), configured by `window<w>::type` (see frame_retile).
+struct {{L.struct_name}} {
+  using data_t = {{P.precision.c_type}};
+  static constexpr int CAS_NUM = {{P.parallelism.cas_num}}, CAS_LENGTH = {{P.parallelism.cas_length}};
+  static constexpr bool FOLD = true;
+  static constexpr int UNIT = {{P.unit}};
+  static constexpr int KH = {{P.window.kernel[0]}}, KW = {{P.window.kernel[1]}};
+  static constexpr int STRIDE_H = {{P.window.strides[0]}}, STRIDE_W = {{P.window.strides[1]}};
+  static constexpr int SRC_COLS = {{P.src_cols}}, SRC_BYTES = {{P.src_bytes}};
+  static constexpr int ROWS = {{P.rows}}, COLS = {{P.cols}}, CB = {{P.blocks}};
+  static constexpr int FRAME_BYTES = {{P.frame_bytes}};
+  static constexpr int col_placement = {{L.placement.col}};
+  static constexpr int row_placement = {{L.placement.row}};
+{{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
+{{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
+  template<int WINDOW> struct window;
+};
+{% for first_block in P.first_blocks %}
+struct {{L.struct_name}}_window{{loop.index0}} : {{L.struct_name}} {
+  static constexpr int FIRST_BLOCK = {{first_block}};
+};
+template<> struct {{L.struct_name}}::window<{{loop.index0}}> { using type = {{L.struct_name}}_window{{loop.index0}}; };
+{% endfor %}

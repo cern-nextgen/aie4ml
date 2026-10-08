@@ -5,6 +5,7 @@
 #include <adf.h>
 #include <utility>
 #include "buffer_location.h"
+#include "frame_fold.h"
 #include "frame_retile.h"
 #include "parameters.h"
 
@@ -12,7 +13,7 @@ using namespace adf;
 
 // A retiler kernel per window -- CAS_NUM of them, no cascade -- window `w` on row `w`, on the Dense bank contract: its input and frame
 // where IN1/OUT1_BUFFER_LOCATIONS put them -- one copy per bank -- and its stack in bank 1. Each
-// window's kernel is configured by `ConfigT::window<w>::type`.
+// window's kernel is configured by `ConfigT::window<w>::type`; FOLD picks the kernel that folds the frame.
 template<typename ConfigT>
 class frame_retile_graph : public graph {
 public:
@@ -40,8 +41,13 @@ private:
   void build_window()
   {
     using WindowT = typename ConfigT::template window<W>::type;
-    kk[W] = kernel::create_object<frame_retile<WindowT>>();
-    source(kk[W]) = "frame_retile.cpp";
+    if constexpr (ConfigT::FOLD) {
+      kk[W] = kernel::create_object<frame_fold<WindowT>>();
+      source(kk[W]) = "frame_fold.cpp";
+    } else {
+      kk[W] = kernel::create_object<frame_retile<WindowT>>();
+      source(kk[W]) = "frame_retile.cpp";
+    }
     runtime<ratio>(kk[W]) = 1.0;
     dimensions(kk[W].in[0]) = { WindowT::SRC_BYTES };
     dimensions(kk[W].out[0]) = { ConfigT::FRAME_BYTES };

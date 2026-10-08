@@ -85,7 +85,9 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
             )
         return config
 
-    def _resolve_parallelism(self, node, parallel_cfg, input_contracts, *, flatten: bool) -> ParallelismConfig:
+    def _resolve_parallelism(
+        self, node, parallel_cfg, input_contracts, *, flatten: bool, kernel_input
+    ) -> ParallelismConfig:
         """One tile per band: the producer's bands when its window reads them, else the requested ones."""
         if int(parallel_cfg.get('cas_length', 1)) != 1:
             raise ConfigRefused(
@@ -114,7 +116,9 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
                 )
             parallelism = ParallelismConfig(cas_num=bands, cas_length=1, contract='outer')
         else:
-            parallelism = super()._resolve_parallelism(node, parallel_cfg, input_contracts, flatten=flatten)
+            parallelism = super()._resolve_parallelism(
+                node, parallel_cfg, input_contracts, flatten=flatten, kernel_input=kernel_input
+            )
         if int(parallelism.cas_num) < 2:
             raise ConfigRefused(f'{node.name}: one row band has no neighbour to exchange a halo with.')
         return parallelism
@@ -194,17 +198,23 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
                     f'{config.bank_mem_bytes} B; split it into more row bands.'
                 )
 
+    def reads_against_flow(self, node, config: Conv2dConfig) -> bool:
+        """Bands hand their rows on against the flow: a band reading its halo reads it there. So does a band whose
+        converter builds its input: the reader of the rows it sends sits on its input side, so the converter sits
+        on the other."""
+        return _reads_halo(node) or self.converts_input(config)
+
     def buffer_locations(self, node, config: Conv2dConfig, anchor_row):
         """Band b on row b. The rows a band writes for its reader -- its own and its edge rows -- sit where the
         band and its reader, one column west, both reach them (`row_flow`); the reader's neighbours reach them
         north and south, and read them in their own column: on an AIE1 odd row that is not where the band writes
         them, and a planned DMA carries them over."""
         bands = int(config.parallelism.cas_num)
-        reads, sends = _reads_halo(node), any(_sent_rows(node))
+        against, sends = self.reads_against_flow(node, config), any(_sent_rows(node))
         flows = [row_flow(config.alternating_horizontal, int(anchor_row) + band, 1) for band in range(bands)]
         locations = []
         for band, flow in enumerate(flows):
-            locations.append(BufferLocation('in1', band, flow.output_col if reads else flow.input_col, band, (0, 3)))
+            locations.append(BufferLocation('in1', band, flow.output_col if against else flow.input_col, band, (0, 3)))
             locations.append(BufferLocation('out1', band, flow.input_col if sends else flow.output_col, band, (0, 3)))
         # Halo rows are a row or two: they go beside the stack, bias and weights, and leave banks 0 and 3 to the
         # windows.
@@ -250,8 +260,8 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         for port in self._halo(node, config, 'output')[1]:
             up = port.reader < port.band  # its first rows are the bottom halo of the band above
             outputs.append((f'kk[{port.band}].out[{1 if up else 1 + (port.band > 0 and sends_first)}]',))
-        # A strided band reads the frame its retiler writes, not the tensor itself.
-        in_tensor = self.retiled_frame(node) if self.retiles_input(config) else input_tensor_for_role(node, 'lhs').name
+        # A strided or folded band reads the frame its converter writes, not the tensor itself.
+        in_tensor = self.retiled_frame(node) if self.converts_input(config) else input_tensor_for_role(node, 'lhs').name
         return PortMap(
             inputs={in_tensor: PortBinding('in1', len(inputs), PORT_KIND_BUFFER, tuple(inputs))},
             outputs={node.outputs[0].name: PortBinding('out1', len(outputs), PORT_KIND_BUFFER, tuple(outputs))},

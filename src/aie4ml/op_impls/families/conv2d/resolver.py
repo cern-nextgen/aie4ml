@@ -34,6 +34,12 @@ class Conv2dFamilyResolver(FamilyResolver):
             for cas_length in _divisors(in_blocks)
         )
 
+    def fallback_kernels(self, node, _device):
+        """A conv reading the graph input with few channels folds it, at a tile per split: unfolded is its fallback."""
+        lhs = input_tensor_for_role(node, 'lhs')
+        few = lhs.producer is None and int(lhs.shape[-1]) <= CHANNEL_BLOCK // 2
+        return ({'input_fold': False},) if few and spatial_access_of(node).kernel != (1, 1) else ()
+
     def spatial_access(self, node) -> SpatialAccess2D:
         return spatial_access_of(node)
 
