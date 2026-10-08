@@ -121,8 +121,8 @@ static inline void conv2d_tile_rows(typename ConfigT::data_t* frame,
       } else if constexpr (ConfigT::POOL) {
         // Rows oy and oy + 1 are one pool window's: M pooled pixels per register-tile pair.
         auto pool = [&](MMUL& c_lo, MMUL& c_hi, MMUL& d_lo, MMUL& d_hi) __attribute__((always_inline)) {
-          return aie::max(aie::max(conv2d_pool_init<ConfigT>(), conv2d_pool_row<ConfigT>(c_lo, c_hi)),
-                          conv2d_pool_row<ConfigT>(d_lo, d_hi));
+          return aie::max(aie::max(conv2d_pool_init<ConfigT>(), conv2d_pool_row<ConfigT, true>(c_lo, c_hi)),
+                          conv2d_pool_row<ConfigT, true>(d_lo, d_hi));
         };
         auto store = [&](int px, aie::vector<pool_t, SA> pooled) __attribute__((always_inline)) {
           if constexpr (ConfigT::FLATTEN) {

@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <limits>
 #include <numeric>
+#include <type_traits>
+#include <utility>
 #include "parameters.h"
 
 using namespace adf;
@@ -73,20 +75,24 @@ using conv2d_pool_t = std::conditional_t<__AIE_ARCH__ == 10 && sizeof(typename C
                                          typename ConfigT::result_t>;
 
 // Pools a register-tile pair of one output row along the row: 2M pixels to M. M is even, so no pixel pair
-// straddles the tiles, and vectors stay within 1024 bits.
-template<typename ConfigT, typename MMUL>
+// straddles the tiles, and vectors stay within 1024 bits. Each tile is rounded straight to the pool type, unless
+// VIA_RESULT: through the result type, widened after, which on AIE1 goes through the stack and only the rows core
+// schedules better.
+template<typename ConfigT, bool VIA_RESULT = false, typename MMUL>
 __attribute__((always_inline)) static inline aie::vector<conv2d_pool_t<ConfigT>, ConfigT::M * 8>
 conv2d_pool_row(MMUL& lo, MMUL& hi)
 {
   using result_t = typename ConfigT::result_t;
   using pool_t = conv2d_pool_t<ConfigT>;
-  constexpr int SA = ConfigT::M * 8, PIXEL_WORDS = 8 * sizeof(pool_t) / 4;
+  constexpr int PIXEL_WORDS = 8 * sizeof(pool_t) / 4;
   static_assert(ConfigT::M % 2 == 0, "a register tile holds whole pixel pairs");
-  auto widen = [](aie::vector<result_t, SA> v) {
-    if constexpr (std::is_same_v<pool_t, result_t>) return v; else return v.template unpack<pool_t>();
+  auto round = [](MMUL& acc) __attribute__((always_inline)) {
+    if constexpr (VIA_RESULT && !std::is_same_v<pool_t, result_t>)
+      return acc.template to_vector<result_t>(ConfigT::SHIFT).template unpack<pool_t>();
+    else
+      return acc.template to_vector<pool_t>(ConfigT::SHIFT);
   };
-  const auto row = aie::concat(widen(lo.template to_vector<result_t>(ConfigT::SHIFT)),
-                               widen(hi.template to_vector<result_t>(ConfigT::SHIFT)));
+  const auto row = aie::concat(round(lo), round(hi));
   // Word permutes are native; AIE1 runs byte permutes through the multiplier.
   const auto words = row.template cast_to<int32>();
   return aie::max(aie::filter_even(words, PIXEL_WORDS).template cast_to<pool_t>(),
@@ -239,6 +245,41 @@ static inline aie::vector<T, N> conv2d_load_window(const T __aie_dm_resource_b* 
   return aie::load_unaligned_v<N>(p, ALIGN);
 }
 
+#if defined(__AIENGINE__) && __AIE_ARCH__ == 10
+// AIE1 at stride 1: the KW taps of one (ky, cb) read windows one pixel (8 bytes) apart, in one span of 16-byte
+// granules. A window is a pair of granules, the multiply starting one pixel in (zstart) where it is not on one: no
+// window load per tap, and no shuffle beside the multiplies on the vector unit. A one-column window has no such
+// taps: its aligned window loads are already the cheaper ones.
+template<typename ConfigT>
+struct conv2d_span_taps {
+  using G = conv2d_geometry<ConfigT>;
+  static constexpr int C0 = ConfigT::IN_ORIGIN_C - ConfigT::PAD_L;  // the first tap's column
+  static constexpr int LO = C0 * 8 / 16 * 16;                        // its granule
+  static constexpr int GRANULES = ((C0 + ConfigT::KW - 1) * 8 - LO + 2 * G::SA + 15) / 16;
+  static constexpr int GROUPS = ConfigT::KH * ConfigT::CB;
+  struct table { int data[GROUPS]; int wts[GROUPS]; };
+  static constexpr table build() {
+    table r{};
+    for (int ky = 0; ky < ConfigT::KH; ++ky)
+      for (int cb = 0; cb < ConfigT::CB; ++cb) {
+        r.data[ky * ConfigT::CB + cb] = cb * G::CHB + ky * G::RB + LO;
+        r.wts[ky * ConfigT::CB + cb] = (ky * ConfigT::KW * ConfigT::CB + cb) * ConfigT::NBP * G::SB;
+      }
+    return r;
+  }
+  static constexpr table TBL = build();
+  // The last window's span stays in the frame.
+  static constexpr int LAST = (conv2d_rows<ConfigT> - 1) * ConfigT::STRIDE_H * G::RB +
+                              (ConfigT::OUT_W_COMPUTED - ConfigT::MB * ConfigT::M) * 8 +
+                              TBL.data[GROUPS - 1] + GRANULES * 16;
+  static constexpr bool USED = std::is_same_v<typename ConfigT::data_t, int8> &&
+                               std::is_same_v<typename ConfigT::weight_t, int8> && ConfigT::KW > 1 &&
+                               ConfigT::STRIDE_W == 1 && ConfigT::MB == 2 && ConfigT::M == 2 && G::RB % 16 == 0 &&
+                               LAST <= ConfigT::IN_ELEMENTS;
+};
+
+#endif
+
 // The DMA delivers only the image; the border of the frame is whatever the buffer held before.
 // Only the border the taps read is zeroed: rows [0, RR1), columns [RC0, RC1).
 template<typename ConfigT>
@@ -342,6 +383,39 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
           }
 
           const weight_t __aie_dm_resource_a* __restrict pB = (const weight_t __aie_dm_resource_a*)(wts + j * SB);
+#if defined(__AIENGINE__) && __AIE_ARCH__ == 10
+          if constexpr (conv2d_span_taps<ConfigT>::USED) {
+            // The taps by span (conv2d_span_taps), with the API's 2x8x8 multiply (aie1/mmul_8_8.hpp), its activations
+            // starting ZS bytes into their register. Written here: as a function, or with its granules loaded by a
+            // loop into an array, it kept the compiler from pipelining the loops around it.
+            using S = conv2d_span_taps<ConfigT>;
+            constexpr int STEP = ConfigT::CB * NBP * SB;
+            v16acc48 c00 = C00.to_accum().to_native(), c01 = C01.to_accum().to_native();
+            v16acc48 c10 = C10.to_accum().to_native(), c11 = C11.to_accum().to_native();
+            for (int g = 0; g < S::GROUPS; ++g)
+              chess_prepare_for_pipelining
+            {
+              // Each granule is loaded once: the taps' repeated reads of it merge.
+              const v16int8 __aie_dm_resource_b* span = (const v16int8 __aie_dm_resource_b*)(pA + S::TBL.data[g]);
+              const weight_t __aie_dm_resource_a* b = pB + S::TBL.wts[g];
+              auto tap = [&](auto kx) __attribute__((always_inline)) {
+                constexpr int KX = decltype(kx)::value, O = (S::C0 + KX) * 8 - S::LO, Q = O / 16, ZS = O % 16;
+                const v32int8 z0 = concat(span[Q], span[Q + 1]), z1 = concat(span[Q + 1], span[Q + 2]);
+                const v64int8 b0 = aie::load_v<SB>(b + KX * STEP).to_native();
+                const v64int8 b1 = aie::load_v<SB>(b + KX * STEP + SB).to_native();
+                c00 = mac16(c00, b0, 0, 0x11101110, 16, 0x3120, z0, ZS, 0x44440000, 2, 0x3210);
+                c01 = mac16(c01, b1, 0, 0x11101110, 16, 0x3120, z0, ZS, 0x44440000, 2, 0x3210);
+                c10 = mac16(c10, b0, 0, 0x11101110, 16, 0x3120, z1, ZS, 0x44440000, 2, 0x3210);
+                c11 = mac16(c11, b1, 0, 0x11101110, 16, 0x3120, z1, ZS, 0x44440000, 2, 0x3210);
+              };
+              [&]<int... KX>(std::integer_sequence<int, KX...>) __attribute__((always_inline)) {
+                (tap(std::integral_constant<int, KX>{}), ...);
+              }(std::make_integer_sequence<int, ConfigT::KW>{});
+            }
+            using A = aie::accum<acc48, 16>;
+            C00 = MMUL(A(c00)); C01 = MMUL(A(c01)); C10 = MMUL(A(c10)); C11 = MMUL(A(c11));
+          } else
+#endif
           for (int t = 0; t < G::T; ++t)
             chess_prepare_for_pipelining
           {
