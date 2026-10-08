@@ -20,6 +20,7 @@ from .common import (
 from .config import Conv2dConfig
 from .conv2d import Conv2dOpImplVariant
 
+
 def _reads_halo(node: OpNode) -> bool:
     """Whether its window reads rows of the neighbouring bands, which another kernel's bands write."""
     return input_tensor_for_role(node, 'lhs').producer is not None and reads_neighbour_rows(spatial_access_of(node))

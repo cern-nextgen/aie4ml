@@ -1593,9 +1593,7 @@ def test_row_bands_on_aie1_copy_only_the_halo_an_odd_row_reads(tmp_path):
         row = ctx.ir.physical.placements[name]['row']
         rows, halo = inst.variant._halo(inst.node, inst.config, 'lhs')
         realized = {e['target']: e.get('realization') for e in ctx.ir.physical.plan['direct_edges']}
-        expected = ['shared_memory'] * 3 + [
-            'dma' if (row + port.reader) % 2 else 'shared_memory' for port in halo
-        ]
+        expected = ['shared_memory'] * 3 + ['dma' if (row + port.reader) % 2 else 'shared_memory' for port in halo]
         assert [realized[f'{name}.in1[{port}]'] for port in range(3 + len(halo))] == expected
 
 
