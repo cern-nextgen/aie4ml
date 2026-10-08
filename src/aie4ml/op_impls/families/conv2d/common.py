@@ -99,27 +99,32 @@ class HaloPort(NamedTuple):
     reader: int
 
 
-def halo_ports(bands: int, band_rows: int, top: int, bottom: int) -> Tuple[HaloPort, ...]:
-    """The ports a row-banded frame carries after its `bands` own bands, whose windows read `top` rows of the band
-    above and `bottom` rows of the band below: for each pair of neighbouring bands b and b + 1, band b's last `top`
-    rows, then band b + 1's first `bottom` rows. Every one has a single reader, so it is shared memory wherever both
-    ends reach it."""
+def halo_ports(bands: int, band_rows: int, top: int, bottom: int, step: int = 0) -> Tuple[HaloPort, ...]:
+    """The ports a row-banded frame carries after its `bands` own bands, whose windows read rows of the band above
+    and of the band below: `top` and `bottom` rows where the window keeps the height; where it shrinks it by `step`
+    rows a band, band b reads `top + b * step` rows above and `bottom - (b + 1) * step` below. For each pair of
+    neighbouring bands b and b + 1, band b's last rows, then band b + 1's first rows. Every one has a single reader,
+    so it is shared memory wherever both ends reach it."""
     ports = []
     for band in range(int(bands) - 1):
-        if top:
-            ports.append(HaloPort(band, int(band_rows) - int(top), int(top), band + 1))
-        if bottom:
-            ports.append(HaloPort(band + 1, 0, int(bottom), band))
+        up, down = int(top) + (band + 1) * int(step), int(bottom) - (band + 1) * int(step)
+        if up:
+            ports.append(HaloPort(band, int(band_rows) - up, up, band + 1))
+        if down:
+            ports.append(HaloPort(band + 1, 0, down, band))
     return tuple(ports)
 
 
-def describe_band_staging(frame: TensorView, access: str, band_rows: int, port: int, halo: Tuple[HaloPort, ...]):
+def describe_band_staging(
+    frame: TensorView, access: str, band_rows: int, port: int, halo: Tuple[HaloPort, ...], step: int = 0
+):
     """Staging of port `port` of a frame split into row bands (`frame` cut into overlapping windows, as
     `frame_view` cuts it): a band's window -- its own rows, which its producer band writes, and around them the
-    halo its reader fills -- or a halo port's rows (see `halo_ports`)."""
+    halo its reader fills -- or a halo port's rows (see `halo_ports`). A window that shrinks the image by `step`
+    rows a band starts that much fewer rows after the one before."""
     bands = int(frame.logical[1]) // int(band_rows)
     if port < bands:
-        return describe_frame_staging(frame, access, 0, row_slice=port, row_step=band_rows)
+        return describe_frame_staging(frame, access, 0, row_slice=port, row_step=int(band_rows) - int(step))
     band, first, rows, _ = halo[port - bands]
     tile = (int(frame.tile[0]), int(rows), *(int(x) for x in frame.tile[2:]))
     row = int(frame.origin[1]) + int(band) * int(band_rows) + int(first)

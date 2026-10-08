@@ -73,8 +73,9 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
 - **Parallelism**: `cas_length` splits the input channels over a cascade and `cas_num` splits the output channels
   (`'inner'`) or the output rows (`'outer'`); every split must be whole 8-channel blocks or equal row bands. A row
   band whose window reads its neighbours' rows takes them from the graph input or, behind a conv split into the same
-  bands, from the neighbouring bands themselves, one tile per band: that needs stride 1 and a window that keeps the
-  height (same padding). With a fused pool, each row band must hold whole pool windows.
+  bands, from the neighbouring bands themselves, one tile per band: that needs stride 1, a window that keeps or
+  shrinks the height (same or valid padding), equal bands of its output too, and a halo no deeper than the band
+  beside it. With a fused pool, each row band must hold whole pool windows.
 - **Depthwise** (one channel per group): on AIE-ML and AIE-MLv2, an int8 layer with a horizontal stride of 1 and no
   fused pool or flatten runs a channelwise kernel, on one tile or split by rows. Otherwise, and on AIE1, it runs the
   general kernel on block-diagonal weights.

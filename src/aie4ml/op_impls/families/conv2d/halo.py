@@ -9,7 +9,7 @@ from ....ir.graph import VIEW_FLATTEN_2D, OpNode, input_tensor_for_role
 from ...base import BufferLocation, row_flow
 from ...common_types import PORT_KIND_BUFFER, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, TensorView, shared_consumer_spatial_access
+from ...utils import ParallelismConfig, SpatialAccess2D, TensorView, shared_consumer_spatial_access
 from .common import (
     describe_band_staging,
     frame_view,
@@ -25,18 +25,46 @@ def _reads_halo(node: OpNode) -> bool:
     return input_tensor_for_role(node, 'lhs').producer is not None and reads_neighbour_rows(spatial_access_of(node))
 
 
-def _sent_rows(node: OpNode) -> Tuple[int, int]:
-    """The rows its consumers' windows read above and below each band: the row border of its output frame."""
+def _window_rows(access: SpatialAccess2D) -> Tuple[int, int, int]:
+    """The rows a window of row stride 1 reads above an output row's own and below it, and the rows it takes off the
+    image's height."""
+    top, _, bottom, _ = (int(p) for p in access.pads)
+    span = int(access.window[0])
+    return top, span - 1 - top, span - 1 - top - bottom
+
+
+def _sent_rows(node: OpNode) -> Tuple[int, int, int]:
+    """The rows its consumers' windows read above and below each band, and the rows they take off its height."""
     view = node.traits.get('output_view')
     out = node.outputs[0]
     if (view is not None and view.data['kind'] == VIEW_FLATTEN_2D) or not out.consumers:
-        return 0, 0
+        return 0, 0, 0
     if any(consumer.op_type != 'conv2d' for consumer in out.consumers):
-        return 0, 0  # only a conv band reads its halo from its neighbours
+        return 0, 0, 0  # only a conv band reads its halo from its neighbours
     access = shared_consumer_spatial_access(out)
-    if access is None or access.strides[0] != 1 or access.pads[0] + access.pads[2] != access.window[0] - 1:
-        return 0, 0  # a window that strides or changes the height does not read its halo from row bands
-    return int(access.pads[0]), int(access.pads[2])
+    if access is None or access.strides[0] != 1 or _window_rows(access)[2] < 0:
+        return 0, 0, 0  # a window that strides or grows the image does not read its halo from row bands
+    return _window_rows(access)
+
+
+def _band_halo(node: OpNode, bands: int, height: int, window: Tuple[int, int, int]) -> Tuple[int, int, int]:
+    """The rows above and below a band of an image `height` rows high that `window` reads (see `_window_rows`), and
+    the step a band adds to the first and takes off the second: a window that shrinks the image by some rows takes
+    as many off every band, so each band's window starts that much further into its own rows."""
+    top, bottom, shrink = window
+    step, extra = divmod(shrink, bands)
+    rows = height // bands
+    if extra:
+        raise ConfigRefused(
+            f'{node.name}: a window that takes {shrink} rows off the image does not leave {bands} equal row bands.'
+        )
+    deepest = max(top + (bands - 1) * step, bottom - step)
+    if deepest > rows:
+        raise ConfigRefused(
+            f'{node.name}: its window reads {deepest} rows past a band, more than the bands of {rows} rows beside it '
+            'hold; a band reads only those.'
+        )
+    return top, bottom, step
 
 
 @register_variant
@@ -67,22 +95,15 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         config = super().resolve(node, device, directives, input_contracts)
         if not _reads_halo(node):
             return config
-        lhs = input_tensor_for_role(node, 'lhs')
         spatial = config.spatial
-        top, _, bottom, _ = spatial.pads
-        rows = int(lhs.shape[1]) // int(config.parallelism.cas_num)
         if spatial.strides != (1, 1):
             raise ConfigRefused(f'{node.name}: row bands exchange their halo at stride 1, got {spatial.strides}.')
-        if top + bottom != spatial.kernel[0] - 1:
+        if _window_rows(spatial)[2] < 0:
             raise ConfigRefused(
-                f'{node.name}: its window {spatial.kernel} with pads {spatial.pads} changes the image height, so its '
-                "output bands are not its producer's bands; row bands exchange their halo where the height is kept."
+                f'{node.name}: its window {spatial.kernel} with pads {spatial.pads} grows the image; row bands '
+                'exchange their halo where a window keeps or shrinks it.'
             )
-        if max(top, bottom) > rows:
-            raise ConfigRefused(
-                f'{node.name}: a halo of {max(top, bottom)} rows is more than a band of {rows} holds; a band reads '
-                'only the bands beside it.'
-            )
+        self._halo_rows(node, config, 'lhs')  # refuses a halo the bands beside it do not hold
         return config
 
     def _resolve_parallelism(
@@ -100,14 +121,16 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
                     f'{node.name}: its row bands read their halo from their neighbours, so its producer must be '
                     "split into the same row bands (contract 'outer')."
                 )
-            top, _, bottom, _ = spatial_access_of(node).pads
-            per_pair = bool(top) + bool(bottom)
+            # Each pair of bands passes rows up where the window reads above a row or shrinks the image (each band
+            # then reads further into the one above), and down where it reads below.
+            top, bottom, shrink = _window_rows(spatial_access_of(node))
+            per_pair = (top > 0 or shrink > 0) + (bottom > 0)
             ports = len(producer.port_staging)
             bands, extra = divmod(ports + per_pair, 1 + per_pair)
             if extra:
                 raise ConfigRefused(
-                    f'{node.name}: its producer writes {ports} ports, not row bands with the {top} + {bottom} '
-                    'halo rows between them that its window reads.'
+                    f'{node.name}: its producer writes {ports} ports, not row bands with the halo rows between them '
+                    'that its window reads.'
                 )
             asked = parallel_cfg.get('cas_num')
             if asked is not None and int(asked) != bands:
@@ -126,8 +149,7 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
     def _output_frame(
         self, node, parallelism: ParallelismConfig, *, column_block: int, column_align: int
     ) -> TensorView:
-        top, bottom = _sent_rows(node)
-        if not (top or bottom):
+        if not any(_sent_rows(node)):
             return super()._output_frame(node, parallelism, column_block=column_block, column_align=column_align)
         # Every band writes its own rows into its reader's window, the frame's rows the reader's window covers; the
         # edge rows its neighbours read get ports of their own (halo_ports).
@@ -138,39 +160,42 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
             column_align=column_align,
             row_slices=int(parallelism.cas_num),
         )
-        rows = int(view.logical[1]) // int(parallelism.cas_num)
-        if max(top, bottom) > rows:
-            raise ConfigRefused(
-                f'{node.name}: its consumer reads {max(top, bottom)} rows past each of its bands of {rows} rows; a '
-                'band hands rows only to the bands beside it.'
-            )
+        _band_halo(node, int(parallelism.cas_num), int(view.logical[1]), _sent_rows(node))
         return view
 
-    def _halo(self, node, config: Conv2dConfig, role: str):
-        """The halo ports of its input (the rows its window reads) or its output (the rows it sends)."""
+    def _halo_rows(self, node, config: Conv2dConfig, role: str) -> Tuple[int, int, int]:
+        """The rows above and below a band its input's window reads (`lhs`) or its output's reader's does, and the
+        step a band adds to the first and takes off the second."""
         if role == 'lhs':
-            top, _, bottom, _ = config.spatial.pads if _reads_halo(node) else (0, 0, 0, 0)
             view = config.io_views[input_tensor_for_role(node, 'lhs').name]
+            window = _window_rows(config.spatial) if _reads_halo(node) else (0, 0, 0)
         else:
-            top, bottom = _sent_rows(node)
             view = config.io_views[node.outputs[0].name]
-        rows = int(view.logical[1]) // int(config.parallelism.cas_num)
-        return rows, halo_ports(int(config.parallelism.cas_num), rows, top, bottom)
+            window = _sent_rows(node)
+        return _band_halo(node, int(config.parallelism.cas_num), int(view.logical[1]), window)
+
+    def _halo(self, node, config: Conv2dConfig, role: str):
+        """The band rows and halo ports of its input (the rows its window reads) or its output (the rows it sends)."""
+        tensor = input_tensor_for_role(node, 'lhs') if role == 'lhs' else node.outputs[0]
+        rows = int(config.io_views[tensor.name].logical[1]) // int(config.parallelism.cas_num)
+        return rows, halo_ports(int(config.parallelism.cas_num), rows, *self._halo_rows(node, config, role))
 
     def uses_depthwise_core(self, _node, _config) -> bool:
         return False  # a band's window is a frame for the mmul core
 
     def kernel_params(self, node, config: Conv2dConfig):
         params = super().kernel_params(node, config)
-        top, _, bottom, _ = config.spatial.pads if _reads_halo(node) else (0, 0, 0, 0)
-        sent_top, sent_bottom = _sent_rows(node)
+        top, bottom, step = self._halo_rows(node, config, 'lhs')
+        sent_top, sent_bottom, sent_step = self._halo_rows(node, config, 'output')
         params.update(
             halo_top=top,
             halo_bottom=bottom,
+            halo_step=step,
             # The rows it sends: its first ones are the bottom halo of the band above, its last ones the top halo
             # of the band below.
             send_first=sent_bottom,
             send_last=sent_top,
+            send_step=sent_step,
             own_rows=self._halo(node, config, 'lhs')[0],
         )
         return params
@@ -185,7 +210,7 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         params = self.build_template_params(node, config, {'row': 0, 'col': 0})
         window = self._frame_bytes(config, 'lhs', params['in_elements'])
         out = 0 if any(_sent_rows(node)) else self._frame_bytes(config, 'output', params['out_elements'])
-        halo = window // int(params['in_rows']) * (int(params['halo_top']) + int(params['halo_bottom']))
+        halo = window // int(params['in_rows']) * (int(params['in_rows']) - int(params['own_rows']))
         bias = int(params['bias_count']) * int(config.precision['bias'].width) // 8
         for banks, what, size in (
             ('0 and 3', 'window and output', window + out),
@@ -238,28 +263,32 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         if not _reads_halo(node):
             return super().describe_input_staging(node, config, tensor_name, port, _producer)
         rows, halo = self._halo(node, config, 'lhs')
-        return describe_band_staging(config.io_views[tensor_name], 'read', rows, int(port), halo)
+        step = self._halo_rows(node, config, 'lhs')[2]
+        return describe_band_staging(config.io_views[tensor_name], 'read', rows, int(port), halo, step)
 
     def describe_output_staging(self, node, config, tensor_name, port):
         if not any(_sent_rows(node)):
             return super().describe_output_staging(node, config, tensor_name, port)
         rows, halo = self._halo(node, config, 'output')
-        return describe_band_staging(config.io_views[tensor_name], 'write', rows, int(port), halo)
+        step = self._halo_rows(node, config, 'output')[2]
+        return describe_band_staging(config.io_views[tensor_name], 'write', rows, int(port), halo, step)
 
     def build_ports(self, node: OpNode, config: Conv2dConfig):
         """Kernel ports, as conv2d_halo.h orders them: its own rows, then the top halo and the bottom halo it reads;
         its own rows, then the first rows and the last rows it sends."""
         bands = int(config.parallelism.cas_num)
-        reads_top = _reads_halo(node) and config.spatial.pads[0] > 0
-        sends_first = _sent_rows(node)[1] > 0
+        top, _, step = self._halo_rows(node, config, 'lhs')
+        _, sent_bottom, sent_step = self._halo_rows(node, config, 'output')
         inputs = [(f'kk[{band}].in[0]',) for band in range(bands)]
         for port in self._halo(node, config, 'lhs')[1]:
             above = port.band < port.reader  # the band above's last rows are the reader's top halo
-            inputs.append((f'kk[{port.reader}].in[{1 if above else 1 + (port.reader > 0 and reads_top)}]',))
+            reads_top = port.reader > 0 and top + port.reader * step > 0
+            inputs.append((f'kk[{port.reader}].in[{1 if above else 1 + reads_top}]',))
         outputs = [(f'kk[{band}].out[0]',) for band in range(bands)]
         for port in self._halo(node, config, 'output')[1]:
             up = port.reader < port.band  # its first rows are the bottom halo of the band above
-            outputs.append((f'kk[{port.band}].out[{1 if up else 1 + (port.band > 0 and sends_first)}]',))
+            sends_first = port.band > 0 and sent_bottom - port.band * sent_step > 0
+            outputs.append((f'kk[{port.band}].out[{1 if up else 1 + sends_first}]',))
         # A strided or folded band reads the frame its converter writes, not the tensor itself.
         in_tensor = self.retiled_frame(node) if self.converts_input(config) else input_tensor_for_role(node, 'lhs').name
         return PortMap(

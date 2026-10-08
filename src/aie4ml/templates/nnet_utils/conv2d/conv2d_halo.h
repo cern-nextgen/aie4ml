@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Conv2D row bands, one tile each, handing their neighbours the rows the neighbours' windows read. Band b's window
-// reads HALO_TOP rows of band b - 1 and HALO_BOTTOM rows of band b + 1 (the zero border where the image ends), and
-// it writes, beside its own rows, its first SEND_FIRST rows for band b - 1 and its last SEND_LAST rows for band
-// b + 1 of the next layer. Each of those is a buffer of its own with one reader, shared wherever both ends reach it.
-// A band's own rows arrive in the middle of its window, where its producer band writes them; the band fills the halo
-// rows around them in place, and the unchanged compute core reads the window.
+// reads rows of band b - 1 above its own and rows of band b + 1 below them (the zero border where the image ends),
+// and it writes, beside its own rows, its first rows for band b - 1 and its last rows for band b + 1 of the next
+// layer (`conv2d_halo_role`). Each of those is a buffer of its own with one reader, shared wherever both ends reach
+// it. A band's own rows arrive in the middle of its window, where its producer band writes them; the band fills the
+// halo rows around them in place, and the unchanged compute core reads the window.
 
 #pragma once
 #include <adf.h>
@@ -15,13 +15,21 @@
 
 using namespace adf;
 
-// The ports a band has: which neighbours it reads and which it writes for.
+// The rows a band reads and writes, and the ports it has for them. Its window holds ABOVE rows above its own and
+// BELOW below them; it sends its first SENT_FIRST rows to the band above and its last SENT_LAST to the band below,
+// and writes its own from row ORIGIN of its reader's window. A window that keeps the height reads as many rows past
+// every band; one that shrinks the image by a STEP of rows a band starts that much later in each band's rows.
 template<typename ConfigT, int B>
 struct conv2d_halo_role {
-  static constexpr bool TOP = B > 0 && ConfigT::HALO_TOP > 0;
-  static constexpr bool BOTTOM = B + 1 < ConfigT::CAS_NUM && ConfigT::HALO_BOTTOM > 0;
-  static constexpr bool FIRST = B > 0 && ConfigT::SEND_FIRST > 0;
-  static constexpr bool LAST = B + 1 < ConfigT::CAS_NUM && ConfigT::SEND_LAST > 0;
+  static constexpr int ABOVE = ConfigT::HALO_TOP + B * ConfigT::HALO_STEP;
+  static constexpr int BELOW = ConfigT::HALO_BOTTOM - (B + 1) * ConfigT::HALO_STEP;
+  static constexpr int SENT_FIRST = ConfigT::SEND_FIRST - B * ConfigT::SEND_STEP;
+  static constexpr int SENT_LAST = ConfigT::SEND_LAST + (B + 1) * ConfigT::SEND_STEP;
+  static constexpr int ORIGIN = ConfigT::SEND_LAST + B * ConfigT::SEND_STEP;
+  static constexpr bool TOP = B > 0 && ABOVE > 0;
+  static constexpr bool BOTTOM = B + 1 < ConfigT::CAS_NUM && BELOW > 0;
+  static constexpr bool FIRST = B > 0 && SENT_FIRST > 0;
+  static constexpr bool LAST = B + 1 < ConfigT::CAS_NUM && SENT_LAST > 0;
   static constexpr int HALOS = TOP + BOTTOM, EDGES = FIRST + LAST;
 };
 

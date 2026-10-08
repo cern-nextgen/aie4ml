@@ -696,20 +696,60 @@ def test_row_bands_placed_apart_plan_their_halo_as_dma(tmp_path):
     assert len(legs) == 4 and {e['realization'] for e in legs} == {'dma'}
 
 
+def test_row_bands_of_a_valid_window_read_further_into_each_band(tmp_path):
+    """A window that takes rows off the image takes as many off every band, so each band's window starts that many
+    rows further into its own rows than the one above. A valid 3x3 over two bands of 4 rows: 3 output rows each;
+    band 0 reads band 1's first row, band 1 band 0's last. A valid 7x7 over three bands of 4: 2 output rows each,
+    windows from rows 0, 2 and 4, reading 2 and then 4 rows of the band above and 4 and then 2 of the band below.
+    Every hand-over is still one shared buffer."""
+    ctx = lower(_padded_pair_model(pad=0), tmp_path / 'valid', HALO_SPLIT)
+    b, d = ctx.ir.execution.get('b_aie'), ctx.ir.execution.get('d_aie')
+    tensor = b.node.outputs[0].name
+    assert b.config.io_views[tensor] == d.config.io_views[tensor] and d.config.io_views[tensor].tile[1] == 3 + 2
+    sent = b.variant.kernel_params(b.node, b.config)
+    assert (sent['send_first'], sent['send_last'], sent['send_step']) == (2, 0, 1)
+    params = d.variant.kernel_params(d.node, d.config)
+    assert (params['halo_top'], params['halo_bottom'], params['halo_step']) == (0, 2, 1)
+    assert (params['own_rows'], params['in_rows']) == (4, 5)
+    assert d.ports.inputs[tensor].endpoints == (('kk[0].in[0]',), ('kk[1].in[0]',), ('kk[1].in[1]',), ('kk[0].in[1]',))
+    legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['target'].startswith('d_aie.')]
+    assert len(legs) == 4 and {e['realization'] for e in legs} == {'shared_memory'}
+
+    three = {name: {'parallelism': {'contract': 'outer', 'cas_num': 3}} for name in ('b', 'd')}
+    ctx = lower(_padded_pair_model(size=12, k=7, pad=0), tmp_path / 'deep', three)
+    d = ctx.ir.execution.get('d_aie')
+    tensor = d.node.inputs[0].name
+    rows, halo = d.variant._halo(d.node, d.config, 'lhs')
+    assert rows == 4 and [(port.band, port.rows, port.reader) for port in halo] == [
+        (0, 2, 1),
+        (1, 4, 0),
+        (1, 4, 2),
+        (2, 2, 1),
+    ]
+    reads = [d.variant.describe_input_staging(d.node, d.config, tensor, port) for port in range(3)]
+    assert [staging['logical_origin'][2] for staging in reads] == [0, 2, 4]
+    legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['target'].startswith('d_aie.')]
+    assert len(legs) == 7 and {e['realization'] for e in legs} == {'shared_memory'}
+
+
 def test_row_bands_refuse_a_halo_they_cannot_exchange(tmp_path):
+    # A window that grows the image or strides: its producer's bands are not its own, so they send it nothing.
     with pytest.raises(ConfigRefused, match='cannot feed a consumer whose window reads'):
-        lower(_padded_pair_model(pad=0), tmp_path / 'valid', HALO_SPLIT)
-    # A window that changes the height or strides: its producer's bands are not its own, so they send it nothing.
-    with pytest.raises(ConfigRefused, match='cannot feed a consumer whose window reads'):
-        lower(_padded_pair_model(k=5, pad=1), tmp_path / 'height', HALO_SPLIT)
+        lower(_padded_pair_model(pad=2), tmp_path / 'grows', HALO_SPLIT)
     with pytest.raises(ConfigRefused, match='cannot feed a consumer whose window reads'):
         lower(_padded_pair_model(stride=2), tmp_path / 'strided', HALO_SPLIT)
+    with pytest.raises(ConfigRefused, match='6 output rows do not split into 4 equal bands'):
+        four = {name: {'parallelism': {'contract': 'outer', 'cas_num': 4}} for name in ('b', 'd')}
+        lower(_padded_pair_model(pad=0), tmp_path / 'uneven', four)
+    with pytest.raises(ConfigRefused, match='reads 4 rows past a band, more than the bands of 3 rows'):
+        three = {name: {'parallelism': {'contract': 'outer', 'cas_num': 3}} for name in ('b', 'd')}
+        lower(_padded_pair_model(size=9, k=7, pad=0), tmp_path / 'far', three)
     with pytest.raises(ConfigRefused, match='does not split 8 output rows'):
         odd = {name: {'parallelism': {'contract': 'outer', 'cas_num': 3}} for name in ('b', 'd')}
         lower(_padded_pair_model(), tmp_path / 'odd', odd)
     with pytest.raises(ConfigRefused, match='window and output need 16512 B of bank 0 and 3'):
         lower(_padded_pair_model(size=24), tmp_path / 'bank', HALO_SPLIT)
-    with pytest.raises(ConfigRefused, match='reads 2 rows past each of its bands of 1 rows'):
+    with pytest.raises(ConfigRefused, match='reads 2 rows past a band, more than the bands of 1 rows'):
         ones = {name: {'parallelism': {'contract': 'outer', 'cas_num': 8}} for name in ('b', 'd')}
         lower(_padded_pair_model(k=5, pad=2), tmp_path / 'deep', ones)
     with pytest.raises(ConfigRefused, match='producer must be split into the same row bands'):
@@ -1567,6 +1607,45 @@ def test_row_bands_exchanging_their_halo_match_onnx(tmp_path, part):
         max_code_diff=0,
         part=part,
         iterations=6,
+        per_iteration=True,
+    )
+
+
+def _valid_chain_model(size=12):
+    """A same-padded 3x3 conv, then two valid 3x3 convs, 12 rows down to 10 and 8: in two row bands, the middle conv
+    reads and sends halos that move a row further into each band."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'b', CIN, 8, 3, pad=1, relu=True, seed=61)
+    _conv(nodes, inits, 'a', 'c', 'd', 8, 8, 3, pad=0, relu=True, seed=62)
+    _conv(nodes, inits, 'c', 'e_out', 'e', 8, 8, 3, pad=0, relu=True, seed=63)
+    nodes.append(helper.make_node('Transpose', ['e_out'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    return make_model(
+        'conv_valid_chain',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, size, size, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, size - 4, size - 4, 8])],
+        initializers=inits,
+    )
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [AIE1_PART, PART, MLV2_PART], ids=['aie1', 'aie-ml', 'aie-mlv2'])
+def test_row_bands_of_valid_windows_match_onnx(tmp_path, part):
+    """Two row bands down a chain of valid windows: every band reads and sends its halo a row further into its
+    rows than the band above."""
+    feeds = np.random.default_rng(17).integers(-40, 40, size=(4, 1, 12, 12, CIN), dtype=np.int8)
+    split = {name: {'parallelism': {'contract': 'outer', 'cas_num': 2}} for name in ('b', 'd', 'e')}
+    assert_x86_matches_onnx(
+        _valid_chain_model(),
+        {'x_q': feeds},
+        split,
+        tmp_path,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=4,
         per_iteration=True,
     )
 

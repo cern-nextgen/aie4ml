@@ -13,22 +13,22 @@ using namespace adf;
 // Conv2D row bands handing their neighbours the rows their windows read: band b on row b, one tile each. A port
 // array holds the bands' own rows, then per pair of neighbours (b, b + 1) band b's last rows (band b + 1's top halo)
 // and band b + 1's first rows (band b's bottom halo) -- in1 the rows this op's window reads, out1 the rows its
-// consumer's does (halo_ports in common.py). Every port has one kernel on each end, pinned where the op contract
-// lists it, so each is one buffer.
+// consumer's does (halo_ports in common.py). Every pair has the same ports, the first pair's (`conv2d_halo_role`).
+// Every port has one kernel on each end, pinned where the op contract lists it, so each is one buffer.
 template<typename ConfigT>
 class conv2d_halo_graph : public graph {
 public:
   static constexpr int BANDS = ConfigT::CAS_NUM;
   static_assert(BANDS >= 2 && ConfigT::CAS_LENGTH == 1, "halo bands: two or more single-tile row bands");
-  static constexpr int HT = ConfigT::HALO_TOP, HB = ConfigT::HALO_BOTTOM;
-  static constexpr int SF = ConfigT::SEND_FIRST, SL = ConfigT::SEND_LAST;
-  static constexpr int IN_PAIR = (HT > 0) + (HB > 0), OUT_PAIR = (SL > 0) + (SF > 0);
+  using upper = conv2d_halo_role<ConfigT, 0>;
+  using lower = conv2d_halo_role<ConfigT, 1>;
+  static constexpr int IN_PAIR = lower::TOP + upper::BOTTOM, OUT_PAIR = upper::LAST + lower::FIRST;
   static constexpr int IN_PORTS = BANDS + (BANDS - 1) * IN_PAIR, OUT_PORTS = BANDS + (BANDS - 1) * OUT_PAIR;
 
   // The ports of band b's top and bottom halo, and of the first and last rows it sends.
   static constexpr int top_port(int b) { return BANDS + (b - 1) * IN_PAIR; }
-  static constexpr int bottom_port(int b) { return BANDS + b * IN_PAIR + (HT > 0); }
-  static constexpr int first_port(int b) { return BANDS + (b - 1) * OUT_PAIR + (SL > 0); }
+  static constexpr int bottom_port(int b) { return BANDS + b * IN_PAIR + lower::TOP; }
+  static constexpr int first_port(int b) { return BANDS + (b - 1) * OUT_PAIR + upper::LAST; }
   static constexpr int last_port(int b) { return BANDS + b * OUT_PAIR; }
 
   // Elements of the rows of one channel-blocked frame row, times rows.
@@ -64,11 +64,11 @@ private:
     dimensions(kk[B].in[0]) = { ConfigT::IN_ELEMENTS };
     if constexpr (role::TOP) {
       connect<>(in1[top_port(B)], kk[B].in[1]);
-      dimensions(kk[B].in[1]) = { HT * IN_ROW };
+      dimensions(kk[B].in[1]) = { role::ABOVE * IN_ROW };
     }
     if constexpr (role::BOTTOM) {
       connect<>(in1[bottom_port(B)], kk[B].in[1 + role::TOP]);
-      dimensions(kk[B].in[1 + role::TOP]) = { HB * IN_ROW };
+      dimensions(kk[B].in[1 + role::TOP]) = { role::BELOW * IN_ROW };
     }
     single_buffer(kk[B].in[WTS]);
     connect<parameter>(wts[B], async(kk[B].in[WTS]));
@@ -78,11 +78,11 @@ private:
     dimensions(kk[B].out[0]) = { ConfigT::OUT_ELEMENTS };
     if constexpr (role::FIRST) {
       connect<>(kk[B].out[1], out1[first_port(B)]);
-      dimensions(kk[B].out[1]) = { SF * OUT_ROW };
+      dimensions(kk[B].out[1]) = { role::SENT_FIRST * OUT_ROW };
     }
     if constexpr (role::LAST) {
       connect<>(kk[B].out[1 + role::FIRST], out1[last_port(B)]);
-      dimensions(kk[B].out[1 + role::FIRST]) = { SL * OUT_ROW };
+      dimensions(kk[B].out[1 + role::FIRST]) = { role::SENT_LAST * OUT_ROW };
     }
   }
 
