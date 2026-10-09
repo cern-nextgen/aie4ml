@@ -10,7 +10,8 @@
 `aie4ml` is an end-to-end compiler that generates **optimized** AIE firmware automatically, which can be then built and simulated directly using **AMD Vitis**. It targets the **AMD AI Engine (AIE)** from model-level frontends and lowers supported operators into AIE graphs and kernels as a standalone AIE project.
 
 - Current hardware targets: AIE1, AIE-ML and AIE-MLv2 devices.
-- Current frontend paths: ONNX for explicit operator graphs, and an optional [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) frontend path.
+- Current frontend paths: ONNX for explicit operator graphs, and the more user-friendly [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) frontend path.
+- Automatic firmware generation optimized for `resource`, `throughput`, or `latency` targets under a given AIE tile budget.
 
 ## Supported Operators
 
@@ -67,7 +68,7 @@ General `hls4ml` concepts: [https://fastmachinelearning.org/hls4ml](https://fast
 | Frontend | Models |
 | --- | --- |
 | ONNX (preferred) | Quantized operator graphs with QuantizeLinear/DequantizeLinear boundaries (QDQ). |
-| hls4ml | Keras 3 and QKeras v3: Dense, Conv2D, DepthwiseConv2D, QConv2DBatchnorm, MaxPooling2D, Flatten, ReLU activations and LayerNormalization. Split a SeparableConv2D into its depthwise and pointwise layers. |
+| hls4ml (user-friendly) | Keras 3 and QKeras v3: Dense, Conv2D, DepthwiseConv2D, QConv2DBatchnorm, MaxPooling2D, Flatten, ReLU activations and LayerNormalization. Split a SeparableConv2D into its depthwise and pointwise layers. |
 
 ## Maintainer
 
