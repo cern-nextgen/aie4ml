@@ -34,11 +34,11 @@ def test_a_configuration_changed_after_building_is_built_again(tmp_path, monkeyp
     model = from_onnx(_dense_model(in_features=64, out_features=64), config, output_dir=tmp_path, project_name='proj')
     model.build()
 
-    model.context.aie_config['Optimize'] = 'performance'
+    model.context.aie_config['Optimize'] = 'throughput'
     with pytest.raises(RuntimeError, match='as configured now'):
         model.write_inputs(np.zeros((8, 64), np.int8), quantize_in=False)
     model.build()
-    assert json.loads((tmp_path / 'aie_pipeline.json').read_text())['optimizer']['mode'] == 'performance'
+    assert json.loads((tmp_path / 'aie_pipeline.json').read_text())['optimizer']['mode'] == 'throughput'
 
     model.context.reset_ir()
     assert model.context.emitted is None

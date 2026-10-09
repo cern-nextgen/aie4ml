@@ -52,6 +52,7 @@ aie_model = hls4ml.converters.convert_from_keras_model(
     batch_size=BATCH,
     iterations=ITERS,
     part=PLATFORM,
+    optimize='resource',  # resource | throughput | latency
     target='hardware',  # hardware | aie
     pl_memory='uram',  # uram | bram
     enable_pl_timing=True,  # True | False

@@ -14,8 +14,9 @@ where it must (`AIEConfig`):
 
 - `Optimize: 'resource'` (default) uses the fewest tiles that fit, then the fewest memory-tile hand-overs, then the
   lowest latency.
-- `Optimize: 'performance'` takes the lowest interval, then the lowest latency (each within 10%, which the estimate
-  cannot tell apart), then the fewest memory-tile hand-overs and tiles, within `MaxTiles` (default: the whole array).
+- `Optimize: 'throughput'` takes the lowest interval (the highest throughput), then the lowest latency (each within
+  10%, which the estimate cannot tell apart), then the fewest memory-tile hand-overs and tiles, within `MaxTiles`
+  (default: the whole array). `'performance'`, its former name, still selects it.
 - `Optimize: 'latency'` takes the lowest latency (first inference), then the lowest interval, likewise.
 
 All rank designs by a rough, relative estimate of cycles, not a timing model: each kernel's multiply-accumulates or loads,
@@ -45,7 +46,7 @@ The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml
   16-bit values at scalar speed.
 - **Parallelism**: `cas_length` splits the reduction over a cascade chain; `cas_num` runs parallel chains over the
   output features (`contract: 'inner'`) or the rows (`'outer'`). What a directive leaves open, the compiler chooses for
-  the whole model (`AIEConfig.Optimize`, see the README).
+  the whole model (`AIEConfig.Optimize`: `'resource'`, `'throughput'` or `'latency'`, see Parallelism above).
 - **Microtile**: each generation has a default mmul shape per format. `microtiling: {microtile_m, microtile_k,
   microtile_n}` picks another shape the generation supports; the error lists the allowed ones.
 - **One sample**: a Dense whose rows fit one microtile row block (batch 1) runs a kernel that computes one row

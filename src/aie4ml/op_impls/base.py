@@ -209,8 +209,8 @@ class OpImplVariant:
         raise NotImplementedError
 
     def work(self, node: OpNode, config: Any) -> int:
-        """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which a
-        performance search compares designs. A proxy for time, not a measure of it."""
+        """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which the
+        parallelism search compares designs. A proxy for time, not a measure of it."""
         raise NotImplementedError(f'{node.name}: {self.variant_id} gives no work estimate to compare designs by.')
 
     def build_ports(self, _node: OpNode, _config: Any) -> PortMap:

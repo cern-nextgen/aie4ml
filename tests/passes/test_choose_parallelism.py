@@ -95,9 +95,9 @@ def test_resource_splits_only_what_does_not_fit_and_keeps_every_edge_direct(tmp_
 
 
 @pytest.mark.parametrize('part', PARTS.values(), ids=PARTS.keys())
-def test_performance_splits_the_busiest_layers_within_max_tiles(tmp_path, part):
+def test_throughput_splits_the_busiest_layers_within_max_tiles(tmp_path, part):
     base = lower(_wide_model(), tmp_path / 'base', part=part, aie_config={'Optimize': 'resource'})
-    ctx = lower(_wide_model(), tmp_path, part=part, aie_config={'Optimize': 'performance', 'MaxTiles': 8})
+    ctx = lower(_wide_model(), tmp_path, part=part, aie_config={'Optimize': 'throughput', 'MaxTiles': 8})
     chosen = ctx.ir.optimizer
     busiest = max(inst.variant.work(inst.node, inst.config) for inst in base.ir.execution)
     assert max(inst.variant.work(inst.node, inst.config) for inst in ctx.ir.execution) < busiest
@@ -108,7 +108,7 @@ def test_performance_splits_the_busiest_layers_within_max_tiles(tmp_path, part):
 @pytest.mark.parametrize('part', PARTS.values(), ids=PARTS.keys())
 def test_a_frame_read_twice_is_placed_and_verified(tmp_path, part):
     """A branch keeps two readers of one frame in the search state at once; the design still places and verifies."""
-    ctx = lower(_branch_model(), tmp_path, part=part, aie_config={'Optimize': 'performance', 'MaxTiles': 6})
+    ctx = lower(_branch_model(), tmp_path, part=part, aie_config={'Optimize': 'throughput', 'MaxTiles': 6})
     assert ctx.ir.optimizer['tiles'] == _placed_tiles(ctx) <= 6
     assert set(ctx.ir.optimizer['parallelism']) == {'c0_aie', 'c1_aie', 'c2_aie'}
 
@@ -143,7 +143,7 @@ def test_a_rerun_searches_afresh_and_leaves_the_directives_as_given(tmp_path):
     )
     ctx = model.run_pipeline().context
     assert ctx.ir.optimizer['tiles'] == 3
-    ctx.aie_config.update({'Optimize': 'performance', 'MaxTiles': 8})
+    ctx.aie_config.update({'Optimize': 'throughput', 'MaxTiles': 8})
     model.run_pipeline()
     assert 3 < ctx.ir.optimizer['tiles'] == _placed_tiles(ctx) <= 8
     assert all(node.directives == {} for node in ctx.ir.logical if not node.is_folded_view)
@@ -169,7 +169,7 @@ def test_a_design_placement_refuses_gives_way_to_the_next(tmp_path, monkeypatch)
         return place(self, model_or_ctx)
 
     monkeypatch.setattr(placement.PlaceKernels, 'transform', refuse_first)
-    ctx = lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'performance', 'MaxTiles': 8})
+    ctx = lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'throughput', 'MaxTiles': 8})
     assert ctx.ir.optimizer['designs_tried'] == 2
 
 
@@ -192,7 +192,7 @@ def test_an_error_that_is_not_a_refusal_stops_the_search(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Conv2dOpImplVariant, 'work', broken)
     with pytest.raises(KeyError, match='a bug'):
-        lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'performance'})
+        lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'throughput'})
 
 
 def test_dense_offers_splits_its_tiling_pads(tmp_path):
@@ -213,11 +213,11 @@ def test_dense_offers_splits_its_tiling_pads(tmp_path):
 
 def test_latency_mode_ranks_latency_before_interval():
     """Of a design that finishes the first inference sooner and one that takes the next one sooner, 'latency' ranks
-    the first best and 'performance' the second."""
+    the first best and 'throughput' the second."""
     soon = choose_parallelism._Design(0, 8, 0, 2000, 5000, (), (), ())
     steady = choose_parallelism._Design(0, 8, 0, 1000, 9000, (), (), ())
     search = object.__new__(choose_parallelism._Search)
-    for mode, best in (('latency', soon), ('performance', steady)):
+    for mode, best in (('latency', soon), ('throughput', steady)):
         search.mode = mode
         assert min((soon, steady), key=search.rank) is best
 
@@ -225,6 +225,11 @@ def test_latency_mode_ranks_latency_before_interval():
 def test_an_unknown_mode_is_refused(tmp_path):
     with pytest.raises(ValueError, match="Optimize='fast'"):
         lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'fast'})
+
+
+def test_performance_is_the_former_name_of_throughput(tmp_path):
+    ctx = lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'performance', 'MaxTiles': 8})
+    assert ctx.ir.optimizer['mode'] == 'throughput'
 
 
 def _encoder_model(tokens=16, features=64, ffn=128):
@@ -339,11 +344,11 @@ def test_a_direct_route_one_end_asks_for_is_honoured(tmp_path):
 
 def test_a_transformer_block_is_searched_in_both_modes(tmp_path):
     """Q, K and V alive at once once overflowed the search, and a LayerNorm left to split itself cut its rows below
-    a microtile band; both modes now find a design, and 'performance' splits the row-wise layers by rows."""
+    a microtile band; both modes now find a design, and 'throughput' splits the row-wise layers by rows."""
     ctx = lower(_encoder_model(), tmp_path / 'resource', aie_config={'Optimize': 'resource'})
     assert ctx.ir.optimizer['tiles'] == _placed_tiles(ctx)
     budget = 2 * ctx.ir.optimizer['tiles']
-    ctx = lower(_encoder_model(), tmp_path / 'performance', aie_config={'Optimize': 'performance', 'MaxTiles': budget})
+    ctx = lower(_encoder_model(), tmp_path / 'throughput', aie_config={'Optimize': 'throughput', 'MaxTiles': budget})
     assert ctx.ir.optimizer['tiles'] == _placed_tiles(ctx) <= budget
     assert _splits(ctx)['softmax_aie'].cas_num > 1
 
@@ -362,5 +367,5 @@ def test_an_optimized_design_runs_on_the_aie(tmp_path, part):
         part=part,
         iterations=2,
         per_iteration=True,
-        aie_config={'Optimize': 'performance', 'MaxTiles': 8},
+        aie_config={'Optimize': 'throughput', 'MaxTiles': 8},
     )

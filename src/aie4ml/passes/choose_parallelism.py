@@ -4,12 +4,12 @@
 Resolution and the transport classifier stay the only judges of legality; user directives are constraints and are
 never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Designs are ranked by
 an estimate of their interval (the slowest kernel or leg) and latency (the critical path), in cycles (`estimate`):
-'performance' takes the lowest interval, then latency -- each to within INTERVAL_TOLERANCE, which the estimate cannot
+'throughput' takes the lowest interval, then latency -- each to within INTERVAL_TOLERANCE, which the estimate cannot
 tell apart -- then the fewest memory-tile legs and tiles; 'latency' the lowest latency, then interval, likewise;
 'resource' the fewest tiles, then memory-tile legs, then the lowest latency.
 
 It takes the layers in an order that keeps few tensors alive, since a state holds a layout per live tensor.
-'performance' first finds the lowest interval a design within the budget reaches, keeping only each state's
+'throughput' first finds the lowest interval a design within the budget reaches, keeping only each state's
 fewest-tile design, then searches the designs within it. The search is bounded, not exhaustive: per state it keeps
 the designs no other beats on tiles, latency and memory-tile legs, at most MAX_PARTIALS designs per layer, and builds
 at most MAX_PLACEMENT_TRIALS, so it reports a search limit unless it discarded nothing. A design counts the tiles its
@@ -45,7 +45,8 @@ from .transport.routing import BELOW, port_tiles, route_overflow
 
 log = logging.getLogger(__name__)
 
-MODES = ('performance', 'latency', 'resource')
+MODES = ('throughput', 'latency', 'resource')
+ALIASES = {'performance': 'throughput'}  # the mode's former name
 MAX_PARTIALS = 50_000  # partial designs kept past a layer; beyond it the search narrows
 MAX_PLACEMENT_TRIALS = 16
 INTERVAL_TOLERANCE = 0.1  # cycle estimates this close the search cannot tell apart
@@ -164,6 +165,7 @@ class ChooseParallelism(AIEPass):
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         mode = ctx.aie_config.get('Optimize', 'resource')
+        mode = ALIASES.get(mode, mode)
         if mode not in MODES:
             raise ValueError(f'AIEConfig Optimize={mode!r}; expected one of {list(MODES)}.')
         device = ctx.device
@@ -301,7 +303,7 @@ class _Search:
             for tensor in set(tensors):
                 self.readers[tensor] += 1
         self.refusals = shared.refusals
-        self.intervals: set = set()  # every layer's estimated interval met, the bounds a performance search tries
+        self.intervals: set = set()  # every layer's estimated interval met, the bounds a throughput search tries
         self.truncated = False  # whether the program has discarded a design since last reset
         self.narrowed: set = set()  # the layers past which the search kept only MAX_PARTIALS designs
         self._resolved = shared.resolved
@@ -629,7 +631,7 @@ class _Search:
         """The best-ranked design the rest of the pipeline builds, the context it was built in, and how many
         designs were tried."""
         bounds: List[Optional[int]] = [None]
-        if self.mode == 'performance':
+        if self.mode == 'throughput':
             # each grid step's widest interval met, from the lowest step any design completes within on
             bounds = []
             if self.designs(fewest=True):  # also resolves every option it meets
