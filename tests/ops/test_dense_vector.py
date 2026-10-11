@@ -1,4 +1,5 @@
-"""Dense on a single sample: one row microtile per step (dense_vector.cpp)."""
+"""The Dense buffer kernels by row microtiles per step: one for a single sample (dense_vector.cpp), four for an int8
+batch on AIE-MLv2 whose rows allow it (dense_rows4.cpp), two otherwise (dense_bias_relu.cpp)."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ from helpers import (
     PART,
     TensorProto,
     assert_aie_matches_onnx,
+    assert_x86_matches_onnx,
     direct_edges,
     helper,
     lower,
@@ -102,5 +104,37 @@ def test_one_sample_matches_onnx(tmp_path, part):
         max_code_diff=0,
         part=part,
         iterations=4,
+        per_iteration=True,
+    )
+
+
+def test_mlv2_batch_takes_four_row_blocks(tmp_path):
+    """Rows in whole groups of four 8-row microtiles take dense_rows4.cpp on AIE-MLv2, split by columns or by rows;
+    other rows, and AIE-ML, keep the 2x2 kernel rather than pad."""
+    ctx = lower(_mlp(rows=32), tmp_path / 'rows4', SPLIT, part=MLV2_PART)
+    assert {inst.config.row_blocks for inst in ctx.ir.execution} == {4}
+
+    row_split = {'d0': {'parallelism': {'cas_num': 2, 'contract': 'outer'}}}
+    ctx = lower(_mlp(rows=64), tmp_path / 'outer', row_split, part=MLV2_PART)
+    assert ctx.ir.execution.get('d0_aie').config.row_blocks == 4
+
+    for rows, part in ((16, MLV2_PART), (32, PART)):
+        ctx = lower(_mlp(rows=rows), tmp_path / f'rows{rows}_{part}', SPLIT, part=part)
+        assert {inst.config.row_blocks for inst in ctx.ir.execution} == {2}
+
+
+@pytest.mark.requires_vitis
+def test_mlv2_four_row_blocks_match_onnx(tmp_path):
+    """dense_rows4.cpp as a single kernel and as first, middle and last of a cascade, with and without bias and ReLU."""
+    feeds = np.random.default_rng(9).integers(-60, 60, size=(2, 32, K), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _mlp(rows=32),
+        {'x_q': feeds},
+        SPLIT,
+        tmp_path,
+        frac=3,
+        max_code_diff=0,
+        part=MLV2_PART,
+        iterations=2,
         per_iteration=True,
     )

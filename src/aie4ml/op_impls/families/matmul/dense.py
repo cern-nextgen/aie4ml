@@ -139,7 +139,8 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             parallel_cfg=parallel_cfg,
             row_blocks=self.row_blocks,
             # dense_vector.cpp, a buffer kernel, takes a chain whose rows the two-block kernel cannot hold
-            one_block_chains=self.input_port_kind == PORT_KIND_BUFFER and self.output_port_kind == PORT_KIND_BUFFER,
+            one_block_chains=self._buffer_ports(),
+            widest_row_blocks=self._widest_row_blocks(device, microtiling, precision, accumulator_tag),
         )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
         check_register_transpose(node, io_views, device)
@@ -186,6 +187,22 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             lhs_inner_shards=lhs_inner_shards,
             row_blocks=tiling.row_blocks,
         )
+
+    def _buffer_ports(self) -> bool:
+        return self.input_port_kind == PORT_KIND_BUFFER and self.output_port_kind == PORT_KIND_BUFFER
+
+    def _widest_row_blocks(self, device, microtiling, precision, accumulator_tag) -> int:
+        """The most row microtiles the kernel takes a step: four (dense_rows4.cpp, a buffer kernel) where its 4x2 block
+        of int8 8x8x8 microtiles, eight int32 accumulators, fills the AIE-MLv2 register file; else the variant's own."""
+        fits = (
+            self.row_blocks == 2
+            and self._buffer_ports()
+            and device.generation == 'AIE-MLV2'
+            and accumulator_tag == 'acc32'
+            and int(precision['lhs'].width) == int(precision['rhs'].width) == 8
+            and (microtiling.microtile_m, microtiling.microtile_k, microtiling.microtile_n) == (8, 8, 8)
+        )
+        return 4 if fits else self.row_blocks
 
     def input_inner_shards(self, node, config, tensor_name):
         return config.lhs_inner_shards if tensor_name == input_tensor_for_role(node, 'lhs').name else None

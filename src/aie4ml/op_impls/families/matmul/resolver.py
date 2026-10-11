@@ -280,9 +280,11 @@ def _resolve_parallelism(
     parallel_cfg: Dict[str, Any],
     row_blocks: int = 2,
     one_block_chains: bool = False,
+    widest_row_blocks: Optional[int] = None,
 ) -> MatmulTiling:
     """The tiling `parallel_cfg` asks for, its rows aligned to `row_blocks` row microtiles; or, with
-    `one_block_chains`, to one where only a kernel computing one row block a step can split them so."""
+    `one_block_chains`, to one where only a kernel computing one row block a step can split them so. A kernel that can
+    also take `widest_row_blocks` a step takes them where the rows align to them with no more padding."""
     lhs_tensor = input_tensor_for_role(node, 'lhs')
     lhs_shape = view_shape(node, lhs_tensor, 'inputs')
     in_shape = lhs_shape[-1]
@@ -325,6 +327,10 @@ def _resolve_parallelism(
     if tiling is None and one_block_chains and contract == 'outer' and row_blocks > 1:
         # rows the two-block kernel cannot split this many ways, as one row block a step
         tiling = candidate(1)
+    if tiling is not None and widest_row_blocks and tiling.row_blocks == row_blocks < widest_row_blocks:
+        wider = candidate(widest_row_blocks)
+        if wider is not None and (wider.tile_outer, wider.tile_outer_raw) == (tiling.tile_outer, tiling.tile_outer_raw):
+            tiling = wider
     if tiling is None:
         raise ConfigRefused(
             f'{node.name}: cas_num={cas_num} x cas_length={cas_length} does not tile it under the {contract!r} '
