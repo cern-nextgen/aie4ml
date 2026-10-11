@@ -73,13 +73,14 @@ class _SoftmaxVariantBase(OpImplVariant):
     supported_directives: ClassVar[frozenset] = frozenset({'approximation', 'layout', 'parallelism'})
 
     def work(self, node: OpNode, config) -> int:
-        """Multiply-accumulates' time one tile takes per call, mostly per row: int8 HCCS on an AIE-ML tile took about
-        22 cc a row and 0.18 cc an element with the CLB reciprocal (16x64: 545 cc, 64x128: 2929), about 235 and 0.3
-        with the exact one (16x64: 4064), counted at its 256 int8 multiply-accumulates a cycle. The exp Softmax is
-        slower still; it is costed as exact HCCS."""
+        """Multiply-accumulates' time one tile takes per call, at 256 int8 multiply-accumulates a cycle. The exp
+        Softmax is costed as the linear exact HCCS."""
         *rows, cols = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
-        per_row, per_element = (22, 0.18) if config.use_clb else (235, 0.3)
-        return round(math.prod(rows) * (per_row + per_element * cols) * 256)
+        if config.approximation == 'hccs' and config.layout == 'tiled':
+            per_call, per_row, per_element = (90, 4, 0.14) if config.use_clb else (90, 57, 0.16)
+        else:
+            per_call, (per_row, per_element) = 0, ((22, 0.18) if config.use_clb else (235, 0.3))
+        return round((per_call + math.prod(rows) * (per_row + per_element * cols)) * 256)
 
     def matches(self, node: OpNode, device, _directives) -> bool:
         if not layout_variant_matches(node, self.layout_name):
@@ -133,7 +134,14 @@ class _SoftmaxVariantBase(OpImplVariant):
 
         in_bpp = storage_bytes_for_spec(precision['lhs'])
         out_bpp = storage_bytes_for_spec(precision['output'])
-        scratch_rows = microtile.outer if microtile else 1  # the int16 scores kept between passes
+
+        def scratch_bytes(to: int) -> int:
+            """Kept between passes: one row's int16 scores (linear); each row's max and int16 scale across its
+            microtile lanes, or on AIE1 one row band's int16 scores (tiled)."""
+            if microtile is None:
+                return full_inner * 2
+            return max(outer_prefix * to * microtile.inner * 3, microtile.outer * full_inner * 2)
+
         cas_num, tile_outer = find_tile_split(
             partition_size=last_outer,
             max_rows=max(1, int(device.rows) - int(device.row_start)),
@@ -141,7 +149,7 @@ class _SoftmaxVariantBase(OpImplVariant):
             tile_bytes_fn=lambda to: max(
                 outer_prefix * to * full_inner * in_bpp,
                 outer_prefix * to * full_inner * out_bpp,
-                scratch_rows * full_inner * 2,
+                scratch_bytes(to),
             ),
             parallel_cfg=parallel_cfg,
             input_contracts=input_contracts,
@@ -278,19 +286,10 @@ class _SoftmaxTiledMixin:
             )
         if cols % mt.inner:
             raise ValueError(f'{node.name}: cols={cols} must be a whole number of {mt.inner}-wide microtiles.')
-        block_bytes = mt.outer * mt.inner * storage_bytes_for_spec(config.precision['lhs'])
-        if block_bytes < 16:
+        if mt.inner != 8 or mt.outer not in (2, 4, 8):
             raise ValueError(
-                f'{node.name}: a {mt.outer}x{mt.inner} microtile of {config.precision["lhs"].c_type} is '
-                f'{block_bytes} bytes, under the 16-byte minimum vector width. This layout needs a wider '
-                f'microtile or a wider dtype.'
-            )
-        if mt.inner < 8 or mt.outer < 2 or mt.outer > 8 or mt.outer * mt.inner > 64:
-            raise ValueError(
-                f'{node.name}: the tiled Softmax cannot reduce a {mt.outer}x{mt.inner} microtile. '
-                f'It needs 2 <= outer <= 8, inner >= 8, and outer*inner <= 64, matching the aie::mmul '
-                f'microtiles a producer can emit. The producer chose this tiling; retile it, or run '
-                f"this Softmax as layout='linear'."
+                f'{node.name}: the tiled Softmax reads 2x8, 4x8 or 8x8 int8 microtiles, the ones an int8 matmul emits; '
+                f"got {mt.outer}x{mt.inner}. Retile the producer, or run this Softmax as layout='linear'."
             )
 
 
@@ -328,8 +327,11 @@ class _SoftmaxHccsBase(_SoftmaxVariantBase):
                 f'{node.name}: {self.variant_id} does not support multi-head param_sets={config.param_sets}; '
                 'lower attention to one Softmax op per head.'
             )
-        if not (1 <= int(config.inv_shift) <= 30):
-            raise ValueError(f'{node.name}: HCCS Softmax inv_shift must be in [1, 30], got {config.inv_shift}.')
+        # The scale (255 << inv_shift) / Z for uint8 out must fit int16 at Z = 256; the CLB scale 255 << (inv_shift - k)
+        # must also be whole at k = floor(log2 Z) = 14.
+        lo = 14 if config.use_clb and config.precision['output'].format == 'uint8' else 1
+        if not (lo <= int(config.inv_shift) <= 15):
+            raise ValueError(f'{node.name}: HCCS Softmax inv_shift must be in [{lo}, 15], got {config.inv_shift}.')
         in_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         validate_hccs_params(config.hccs, cols=int(in_view.full_inner), param_sets=int(config.param_sets))
 

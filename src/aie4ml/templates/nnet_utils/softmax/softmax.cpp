@@ -206,14 +206,6 @@ static inline aie::vector<T, R * W> spread_rows(const T* s)
 }
 
 
-template <typename ConfigT>
-softmax_i8_tiled<ConfigT>::softmax_i8_tiled(int16_t B_i, int8_t S_i, uint8_t DMAX_i)
-    : softmax_base<ConfigT>(),
-      B_param(B_i),
-      S_param(S_i),
-      DMAX_param(DMAX_i)
-{}
-
 template <typename ConfigT, int N, int MTI, int MTO, typename T>
 static inline aie::vector<T, N> load_microtile(const T* p)
 {
@@ -222,30 +214,92 @@ static inline aie::vector<T, N> load_microtile(const T* p)
     return v;
 }
 
-
-// The lanes the tiled HCCS works in: int8 where the vector unit has int8 max and multiplies, int16 on AIE1, whose
-// int8 arithmetic widens through 16-bit lanes (and spills) on every step; one unpack per block widens it once.
-using hccs_lane_t = std::conditional_t<__AIE_ARCH__ == 10, int16, int8>;
-
-template <unsigned N>
-static inline aie::vector<hccs_lane_t, N> hccs_lanes(const aie::vector<int8, N>& v)
+// P consecutive microtiles of BLK lanes as one vector, each transposed on its own when the input is.
+template <typename ConfigT, int P, int BLK, int MTI, int MTO, typename T>
+static inline aie::vector<T, P * BLK> load_microtiles(const T* p)
 {
-    if constexpr (std::is_same_v<hccs_lane_t, int8>) return v;
-    else return aie::unpack(v);
+    if constexpr (!ConfigT::TRANSPOSE_INPUT || P == 1)
+        return load_microtile<ConfigT, P * BLK, MTI, MTO>(p);
+    else if constexpr (P == 2)
+        return aie::concat(load_microtile<ConfigT, BLK, MTI, MTO>(p), load_microtile<ConfigT, BLK, MTI, MTO>(p + BLK));
+    else
+        return aie::concat(load_microtile<ConfigT, BLK, MTI, MTO>(p), load_microtile<ConfigT, BLK, MTI, MTO>(p + BLK),
+                           load_microtile<ConfigT, BLK, MTI, MTO>(p + 2 * BLK),
+                           load_microtile<ConfigT, BLK, MTI, MTO>(p + 3 * BLK));
+}
+
+// P copies of v side by side, and the lane-wise max / sum of v's P equal parts.
+template <int P, typename T, unsigned N>
+static inline aie::vector<T, P * N> repeat(const aie::vector<T, N>& v)
+{
+    if constexpr (P == 1) return v;
+    else if constexpr (P == 2) return aie::concat(v, v);
+    else return aie::concat(v, v, v, v);
+}
+
+template <int P, typename T, unsigned N>
+static inline aie::vector<T, N / P> fold_max(const aie::vector<T, N>& v)
+{
+    if constexpr (P == 1) return v;
+    else return fold_max<P / 2>(aie::max(v.template extract<N / 2>(0), v.template extract<N / 2>(1)));
+}
+
+template <int P, typename A, unsigned N>
+static inline aie::accum<A, N / P> fold_add(const aie::accum<A, N>& v)
+{
+    if constexpr (P == 1) return v;
+    else return fold_add<P / 2>(aie::add(v.template extract<N / 2>(0), v.template extract<N / 2>(1)));
 }
 
 
+template <typename ConfigT>
+softmax_i8_tiled<ConfigT>::softmax_i8_tiled(int16_t B_i, int8_t S_i, uint8_t DMAX_i)
+    : softmax_base<ConfigT>(),
+      B_param(B_i),
+      S_param(S_i),
+      DMAX_param(DMAX_i)
+{}
+
+// The CLB scale of a row is CLB_UNIT * code, from q = Z >> 8 in [1, 127] (256 <= Z <= 32767 by the HCCS constraints)
+// with k = floor(log2 Z) = 39 - clb(q): 255 << (INV_SHIFT - k) for uint8 out, 32767 >> k = 127 >> (k - 8) for int16.
+template <typename ConfigT>
+inline uint32_t softmax_i8_tiled<ConfigT>::clb_code(int32_t q)
+{
+    const int lz = clb(q);
+    return std::is_same_v<out_t, int16_t> ? (127u >> (31 - lz)) : (1u << (lz + ConfigT::INV_SHIFT - 39));
+}
+
+template <typename ConfigT>
+inline int16_t softmax_i8_tiled<ConfigT>::exact_scale(int32_t z)
+{
+    return (int16_t)(base::NUMER / z);   // <= 32767: Z >= 256 by the HCCS constraints
+}
+
+// The lanes k*MT_INNER + k of an MT_INNER square: its diagonal.
+template <typename ConfigT>
+constexpr uint64_t softmax_i8_tiled<ConfigT>::diagonal_lanes()
+{
+    uint64_t lanes = 0;
+    for (int k = 0; k < MT_INNER; ++k) lanes |= 1ull << (k * MT_INNER + k);
+    return lanes;
+}
+
+
+#if __AIE_ARCH__ == 10
+// AIE1: one row band at a time, in int16 lanes (its int8 arithmetic widens through 16-bit lanes, and spills, on every
+// step; one unpack per block widens it once), with the band's scores kept for the normalising pass.
 template <typename ConfigT>
 void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& out)
 {
     using acc_t = typename ConfigT::acc_scalar_t;
     const in_t*  __restrict in_ptr  = in.data();
           out_t* __restrict out_ptr = out.data();
+    int16_t* __restrict scores = (int16_t*)scratch_;
 
     const int32_t B    = B_param;
     const int8_t  S    = S_param;
     const int32_t DMAX = DMAX_param;
-    const aie::vector<hccs_lane_t, BLK> s_v = aie::broadcast<hccs_lane_t, BLK>(S);
+    const aie::vector<int16, BLK> s_v = aie::broadcast<int16, BLK>(S);
     const aie::vector<int16, BLK> nb_v = aie::broadcast<int16, BLK>((int16)NB);
 
     for (int bm = 0; bm < ROWS / MT_OUTER; ++bm) {
@@ -253,9 +307,9 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
               out_t* __restrict dst  = out_ptr + bm * NB * BLK;
 
         // ---- pass 1: per-row max, segmented over the MT_INNER lane groups ----
-        aie::vector<hccs_lane_t, BLK> vmax = aie::broadcast<hccs_lane_t, BLK>(-128);
+        aie::vector<int16, BLK> vmax = aie::broadcast<int16, BLK>(-128);
         for (int bn = 0; bn < NB; ++bn)
-            vmax = aie::max(vmax, hccs_lanes(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK)));
+            vmax = aie::max(vmax, aie::unpack(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK)));
         for (int step = MT_INNER / 2; step >= 1; step >>= 1)
             vmax = aie::max(vmax, aie::shuffle_down(vmax, step));
 
@@ -267,20 +321,16 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
             lo16[m] = (int16_t)(row_max - DMAX < -128 ? -128 : row_max - DMAX);
             c16[m] = (int16_t)(B - S * row_max);
         }
-        aie::vector<hccs_lane_t, BLK> lo_v;
-        if constexpr (std::is_same_v<hccs_lane_t, int16>)
-            lo_v = spread_rows<int16, MT_OUTER, MT_INNER>(lo16);
-        else
-            lo_v = aie::accum<acc_t, BLK>(spread_rows<int16, MT_OUTER, MT_INNER>(lo16)).template to_vector<int8>(0);
+        const aie::vector<int16, BLK> lo_v = spread_rows<int16, MT_OUTER, MT_INNER>(lo16);
         const aie::vector<int16, BLK> c_v = spread_rows<int16, MT_OUTER, MT_INNER>(c16);
         const aie::accum<acc_t, BLK> c_acc(c_v);
 
         // ---- pass 2: scores to the scratch band, and their per-row sum Z = NB*c + S*sum(y) per lane ----
         aie::accum<acc_t, BLK> zsum = aie::mul(c_v, nb_v);
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<hccs_lane_t, BLK> y =
-                aie::max(hccs_lanes(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK)), lo_v);
-            *aie::begin_vector<BLK>(scores_ + bn * BLK) = aie::mac(c_acc, y, s_v).template to_vector<int16>(0);
+            const aie::vector<int16, BLK> y =
+                aie::max(aie::unpack(load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK)), lo_v);
+            *aie::begin_vector<BLK>(scores + bn * BLK) = aie::mac(c_acc, y, s_v).template to_vector<int16>(0);
             zsum = aie::mac(zsum, y, s_v);
         }
         aie::vector<int32, BLK> zv = zsum.template to_vector<int32>(0);
@@ -307,11 +357,122 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
 
         // ---- pass 3: normalise the stored scores ----
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int16, BLK> score16 = *aie::cbegin_vector<BLK>(scores_ + bn * BLK);
+            const aie::vector<int16, BLK> score16 = *aie::cbegin_vector<BLK>(scores + bn * BLK);
             *aie::begin_vector<BLK>(dst + bn * BLK) = aie::mul(score16, inv_v).template to_vector<out_t>(OUT_SHIFT);
         }
     }
 }
+
+#else
+// AIE-ML, AIE-MLv2: three passes, each a loop over the row bands that the compiler pipelines across bands, handing
+// each row's max and scale to the next pass through the scratch. P microtiles side by side fill one 64-byte vector;
+// stacked they are a (P*MT_OUTER) x MT_INNER matrix whose rows are rows of the band, so the row reductions and
+// broadcasts run on the matrix unit as products C = A * R with a constant MT_INNER square R, on the data as it lies.
+template <typename ConfigT>
+void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& out)
+{
+    using acc_t  = typename ConfigT::acc_scalar_t;
+    using blkmm  = aie::mmul<MT_OUTER, MT_INNER, MT_INNER, int8, int8>;
+    using vecmm  = aie::mmul<P * MT_OUTER, MT_INNER, MT_INNER, int8, int8>;
+    using codemm = aie::mmul<MT_OUTER, MT_INNER, MT_INNER, uint8, uint8>;
+    constexpr int VB    = P * BLK;
+    constexpr int RB    = MT_INNER * MT_INNER;
+    constexpr int BANDS = ROWS / MT_OUTER;
+    constexpr int NV    = NB / P;
+    // uint8 out: scale = 255 * code; int16 out: scale = code (CLB); the exact scale is stored whole.
+    constexpr uint8_t CLB_UNIT = std::is_same_v<out_t, int16_t> ? 1 : 255;
+    const in_t*  __restrict in_ptr  = in.data();
+          out_t* __restrict out_ptr = out.data();
+    int8_t*   __restrict row_max   = scratch_;                                     // BLK int8 per band
+    uint32_t* __restrict row_scale = (uint32_t*)(scratch_ + ROWS * MT_INNER);      // BLK int16 (or uint8 code) per band
+
+    const int32_t B    = B_param;
+    const int8_t  S    = S_param;
+    const uint8_t DMAX = DMAX_param;
+    const aie::mask<RB> row0 = aie::mask<RB>::from_uint64((1ull << MT_INNER) - 1);
+    // R = e_0 1^T copies column 0 across the row; R = -S 1 1^T sums the row times -S; R = -S I scales each element.
+    const aie::vector<int8, RB>  first_col  = aie::select(aie::zeros<int8, RB>(), aie::broadcast<int8, RB>(1), row0);
+    const aie::vector<uint8, RB> clb_col    = aie::select(aie::zeros<uint8, RB>(), aie::broadcast<uint8, RB>(CLB_UNIT), row0);
+    const aie::vector<int8, RB>  neg_s_ones = aie::broadcast<int8, RB>(-S);
+    const aie::vector<int8, RB>  neg_s_diag = aie::select(aie::zeros<int8, RB>(), aie::broadcast<int8, RB>(-S),
+                                                          aie::mask<RB>::from_uint64(diagonal_lanes()));
+    const aie::accum<acc_t, VB> b_acc(aie::broadcast<int32, VB>(B));
+    const aie::accum<acc_t, VB> z0_acc(aie::broadcast<int32, VB>(P == 1 ? COLS * B : 0));
+
+    // ---- pass 1: each row's max, reduced into lane m*MT_INNER and copied across the row ----
+    for (int bm = 0; bm < BANDS; ++bm)
+        chess_prepare_for_pipelining chess_loop_range(1, )
+    {
+        const in_t* __restrict band = in_ptr + bm * NB * BLK;
+        aie::vector<int8, VB> vmax = load_microtiles<ConfigT, P, BLK, MT_INNER, MT_OUTER>(band);
+        for (int bv = 1; bv < NV; ++bv)
+            vmax = aie::max(vmax, load_microtiles<ConfigT, P, BLK, MT_INNER, MT_OUTER>(band + bv * VB));
+        aie::vector<int8, BLK> bmax = fold_max<P>(vmax);
+        for (int step = MT_INNER / 2; step >= 1; step >>= 1)
+            bmax = aie::max(bmax, aie::shuffle_down(bmax, step));
+        blkmm spread;
+        spread.mul(bmax, first_col);
+        *aie::begin_vector<BLK>(row_max + bm * BLK) = spread.template to_vector<int8>(0);
+    }
+
+    // ---- pass 2: d = min(max - x, DMAX) (exact in uint8), Z = COLS*B - S*sum(d) in every lane of its row, and the
+    //      row's scale on the scalar unit ----
+    for (int bm = 0; bm < BANDS; ++bm)
+        chess_prepare_for_pipelining chess_loop_range(1, )
+    {
+        const in_t* __restrict band = in_ptr + bm * NB * BLK;
+        const aie::vector<uint8, VB> max_u = repeat<P>(aie::load_v<BLK>(row_max + bm * BLK)).template cast_to<uint8>();
+        vecmm z(z0_acc);
+        for (int bv = 0; bv < NV; ++bv) {
+            const aie::vector<uint8, VB> x =
+                load_microtiles<ConfigT, P, BLK, MT_INNER, MT_OUTER>(band + bv * VB).template cast_to<uint8>();
+            z.mac(aie::min(aie::sub(max_u, x), DMAX).template cast_to<int8>(), neg_s_ones);
+        }
+        aie::accum<acc_t, BLK> zb = fold_add<P>(z.to_accum());
+        if constexpr (P > 1) zb = aie::add(zb, aie::broadcast<int32, BLK>(COLS * B));
+        if constexpr (ConfigT::USE_CLB) {
+            // The row's code at byte m*MT_INNER, as a word: byte stores issue far apart, and pass 3 reads only that byte.
+            const aie::vector<uint8, BLK> q = zb.template to_vector<uint8>(8);
+            for (int m = 0; m < MT_OUTER; ++m)
+                row_scale[(bm * BLK + m * MT_INNER) / 4] = clb_code(q.get(m * MT_INNER));
+        } else {
+            // The exact scale across the row's lanes, two lanes a word.
+            const aie::vector<int16, BLK> zv = zb.template to_vector<int16>(0);   // Z <= COLS*B <= 32767
+            for (int m = 0; m < MT_OUTER; ++m) {
+                const uint32_t inv = (uint16_t)exact_scale(zv.get(m * MT_INNER));
+                for (int w = 0; w < MT_INNER / 2; ++w)
+                    row_scale[(bm * BLK + m * MT_INNER) / 2 + w] = inv | (inv << 16);
+            }
+        }
+    }
+
+    // ---- pass 3: recompute the score B - S*d and normalise ----
+    for (int bm = 0; bm < BANDS; ++bm)
+        chess_prepare_for_pipelining chess_loop_range(1, )
+    {
+        const in_t*  __restrict band = in_ptr  + bm * NB * BLK;
+              out_t* __restrict dst  = out_ptr + bm * NB * BLK;
+        const aie::vector<uint8, VB> max_u = repeat<P>(aie::load_v<BLK>(row_max + bm * BLK)).template cast_to<uint8>();
+        aie::vector<int16, BLK> scale;
+        if constexpr (ConfigT::USE_CLB) {
+            codemm spread;
+            spread.mul(aie::load_v<BLK>((const uint8_t*)row_scale + bm * BLK), clb_col);
+            scale = spread.template to_vector<int16>(0);
+        } else {
+            scale = aie::load_v<BLK>((const int16_t*)row_scale + bm * BLK);
+        }
+        const aie::vector<int16, VB> scale_v = repeat<P>(scale);
+        for (int bv = 0; bv < NV; ++bv) {
+            const aie::vector<uint8, VB> x =
+                load_microtiles<ConfigT, P, BLK, MT_INNER, MT_OUTER>(band + bv * VB).template cast_to<uint8>();
+            vecmm score(b_acc);
+            score.mac(aie::min(aie::sub(max_u, x), DMAX).template cast_to<int8>(), neg_s_diag);
+            *aie::begin_vector<VB>(dst + bv * VB) =
+                aie::mul(score.template to_vector<int16>(0), scale_v).template to_vector<out_t>(OUT_SHIFT);
+        }
+    }
+}
+#endif
 
 
 // --------------------------------------------------------------------------- //

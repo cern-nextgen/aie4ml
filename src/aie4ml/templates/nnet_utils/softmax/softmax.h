@@ -94,6 +94,15 @@ public:
     static constexpr int OUT_SHIFT = std::is_same_v<out_t, int16_t> ? 0 : ConfigT::INV_SHIFT;
     // The float reciprocal wants at least a 4-lane vector; pad the stat lanes to that.
     static constexpr int STAT_LANES = (MT_OUTER < 4) ? 4 : MT_OUTER;
+    // Microtiles per 64-byte vector: as many as fit and divide the band.
+    static constexpr int P = (BLK <= 16 && NB % 4 == 0) ? 4 : (BLK <= 32 && NB % 2 == 0) ? 2 : 1;
+    static_assert(MT_INNER == 8 && (MT_OUTER == 2 || MT_OUTER == 4 || MT_OUTER == 8),
+                  "the int8 microtiles are 2x8, 4x8 or 8x8");
+    // Between passes: each row's max and scale across its lanes (AIE-ML, AIE-MLv2), or one band's int16 scores (AIE1).
+    static constexpr int STATS_BYTES  = ROWS * MT_INNER * (1 + 2);
+    static constexpr int SCRATCH_BYTES = STATS_BYTES > NB * BLK * 2 ? STATS_BYTES : NB * BLK * 2;
+    static_assert(!ConfigT::USE_CLB || std::is_same_v<out_t, int16_t> || (ConfigT::INV_SHIFT >= 14 && ConfigT::INV_SHIFT <= 15),
+                  "the uint8 CLB scale 255 << (INV_SHIFT - k) must be a whole int16 for every k in [8, 14]");
 
     softmax_i8_tiled(int16_t B_i, int8_t S_i, uint8_t DMAX_i);
 
@@ -107,7 +116,11 @@ private:
     int16_t B_param;
     int8_t S_param;
     uint8_t DMAX_param;
-    alignas(aie::vector_decl_align) int16_t scores_[NB * BLK];  // one row band's scores, between passes 2 and 3
+    alignas(aie::vector_decl_align) int8_t scratch_[SCRATCH_BYTES];
+
+    static uint32_t clb_code(int32_t q);
+    static int16_t exact_scale(int32_t z);
+    static constexpr uint64_t diagonal_lanes();
 };
 
 
