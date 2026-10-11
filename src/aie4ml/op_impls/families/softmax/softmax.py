@@ -73,13 +73,15 @@ class _SoftmaxVariantBase(OpImplVariant):
     supported_directives: ClassVar[frozenset] = frozenset({'approximation', 'layout', 'parallelism'})
 
     def work(self, node: OpNode, config) -> int:
-        """Multiply-accumulates' time one tile takes per call, at 256 int8 multiply-accumulates a cycle. The exp
+        """Multiply-accumulates' time one tile takes per call, at 256 int8 multiply-accumulates a cycle. The linear exp
         Softmax is costed as the linear exact HCCS."""
         *rows, cols = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
-        if config.approximation == 'hccs' and config.layout == 'tiled':
-            per_call, per_row, per_element = (90, 4, 0.14) if config.use_clb else (90, 57, 0.16)
-        else:
+        if config.layout != 'tiled':
             per_call, (per_row, per_element) = 0, ((22, 0.18) if config.use_clb else (235, 0.3))
+        elif config.approximation == 'exp':
+            per_call, per_row, per_element = 80, 25, 1.9
+        else:
+            per_call, per_row, per_element = (90, 4, 0.14) if config.use_clb else (90, 57, 0.16)
         return round((per_call + math.prod(rows) * (per_row + per_element * cols)) * 256)
 
     def matches(self, node: OpNode, device, _directives) -> bool:
@@ -318,6 +320,7 @@ class _SoftmaxHccsBase(_SoftmaxVariantBase):
             'use_clb': bool(hccs.get('use_clb', False)),
             'hccs': hccs,
             'exp_kq': 0,
+            'exp_k': 0.0,
         }
 
     def validate_config(self, node: OpNode, config: SoftmaxConfig, device) -> None:
@@ -365,11 +368,8 @@ def _exp_kq(input_scale: float) -> int:
 
 
 class _SoftmaxExpBase(_SoftmaxVariantBase):
-    """Accurate integer Softmax: a real 2nd-order integer exp which a plain Softmax lowers here by default.
-
-    TODO(perf): these exp kernels are much slower than the HCCS surrogate and are not yet
-    optimised -- accurate and working, but slow; the poly + per-lane 2^(-z_int) shift need work.
-    """
+    """Accurate Softmax, which a plain Softmax lowers to by default: the tiled kernel on AIE-ML and AIE-MLv2 computes
+    exp in bf16, the linear kernel and AIE1 an integer exp."""
 
     approximation = 'exp'
 
@@ -387,6 +387,7 @@ class _SoftmaxExpBase(_SoftmaxVariantBase):
             'use_clb': False,
             'hccs': {},
             'exp_kq': _exp_kq(input_scale),
+            'exp_k': math.log2(math.e) * input_scale,
         }
 
     def validate_config(self, node: OpNode, config: SoftmaxConfig, device) -> None:

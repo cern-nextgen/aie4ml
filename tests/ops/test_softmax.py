@@ -1,13 +1,14 @@
-"""HCCS Softmax kernels against an integer oracle.
+"""Softmax kernels against their oracles.
 
-ONNX has no HCCS op and HCCS is a clipped-linear surrogate, so the reference is the exact integer arithmetic the
-kernel implements: row max, clipped-linear score, CLB or floor-divide scale. One x86 build covers both layouts, every
-tiled microtile, both scales, the int16 output and row splitting across cas_num; one small aiesim build checks what
-x86 cannot see, the hardware compiler's schedule.
+HCCS is a clipped-linear surrogate ONNX has no op for, so its reference is the exact integer arithmetic the kernel
+implements: row max, clipped-linear score, CLB or floor-divide scale. The accurate Softmax is checked against float
+softmax within one code. One x86 build covers both layouts, every tiled microtile, both HCCS scales, the int16 output
+and row splitting across cas_num; one small aiesim build checks what x86 cannot see, the hardware compiler's schedule.
 """
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,13 @@ def _hccs_oracle(x_i8: np.ndarray, *, use_clb: bool, out16: bool) -> np.ndarray:
     return np.clip((score * rho) >> INV_SHIFT, 0, 255)
 
 
+def _exp_oracle(x_i8: np.ndarray) -> np.ndarray:
+    """Float softmax of the input codes at the input's scale (Q4), as uint8 Q8 codes."""
+    z = np.asarray(x_i8, dtype=np.float64) * 2.0**-4
+    e = np.exp(z - z.max(axis=-1, keepdims=True))
+    return np.clip(np.rint(e / e.sum(axis=-1, keepdims=True) * 256), 0, 255)
+
+
 def _feed(iterations: int, rows: int, cols: int) -> np.ndarray:
     """Random rows, and in each iteration an all -128 row and one whose gaps reach 255."""
     rng = np.random.default_rng(7)
@@ -52,17 +60,34 @@ def _hccs(cas_num: int, layout: str, microtile: tuple[int, int] | None = None, u
     return d
 
 
+def _hccs_variant(cas_num, layout, microtile=None, use_clb=False, out16=False) -> tuple:
+    """(directives, oracle, int16 output, max code difference) of an HCCS Softmax."""
+    return _hccs(cas_num, layout, microtile, use_clb), partial(_hccs_oracle, use_clb=use_clb, out16=out16), out16, 0
+
+
+def _exp_variant(cas_num, microtile) -> tuple:
+    """(directives, oracle, int16 output, max code difference) of a tiled accurate Softmax."""
+    directives = {
+        'approximation': 'exp',
+        'layout': 'tiled',
+        'parallelism': {'cas_num': cas_num},
+        'microtiling': {'microtile_m': microtile[0], 'microtile_n': microtile[1]},
+    }
+    return directives, _exp_oracle, False, 1
+
+
 def _softmax(nodes: list, out: str, prefix: str) -> None:
     nodes.append(helper.make_node('Softmax', ['x'], [f'{prefix}_sm'], name=prefix, axis=-1))
     qdq(nodes, f'{prefix}_sm', out, f'{prefix}o')
 
 
 def _softmax_model(name: str, variants: dict, rows: int, cols: int):
-    """One Softmax per variant, all on the same input; variants map name -> (directives, use_clb, int16 output)."""
+    """One Softmax per variant, all on the same input; variants map name -> (directives, oracle, int16 output, max
+    code difference)."""
     nodes: list = []
     dq(nodes, 'x_i8', 'x', 'x')
     inits = [*qparams('x')]
-    for v, (_, _, out16) in variants.items():
+    for v, (_, _, out16, _) in variants.items():
         _softmax(nodes, f'y_{v}', v)
         if out16:
             inits += [
@@ -87,7 +112,7 @@ def _compile_and_check(variants: dict, feed: np.ndarray, tmp_path, project: str,
         {
             'Part': PART,
             'AIEConfig': {'Iterations': iterations},
-            'LayerDirectives': {v: d for v, (d, _, _) in variants.items()},
+            'LayerDirectives': {v: d for v, (d, _, _, _) in variants.items()},
         },
         output_dir=Path(tmp_path) / project,
         project_name=project,
@@ -97,36 +122,41 @@ def _compile_and_check(variants: dict, feed: np.ndarray, tmp_path, project: str,
     else:
         aie_model.compile()
     got = aie_model.predict(feed, simulator=simulator, quantize_in=False, dequantize_out=False, aie_profile=False)
-    for v, (_, use_clb, out16) in variants.items():
+    for v, (_, oracle, _, max_diff) in variants.items():
         have = np.asarray(got[f'y_{v}']).astype(np.int64).reshape(feed.shape)
-        want = _hccs_oracle(feed, use_clb=use_clb, out16=out16)
-        assert np.array_equal(have, want), f'{v}: max code diff {int(np.abs(have - want).max())}'
+        diff = int(np.abs(have - oracle(feed)).max())
+        assert diff <= max_diff, f'{v}: max code diff {diff}'
 
 
 VARIANTS = {
-    'lin_e2': (_hccs(2, 'linear'), False, False),
-    'lin_c4': (_hccs(4, 'linear', use_clb=True), True, False),
-    'til28_e2': (_hccs(2, 'tiled', (2, 8)), False, False),
-    'til48_e1': (_hccs(1, 'tiled', (4, 8)), False, False),
-    'til48_c4': (_hccs(4, 'tiled', (4, 8), use_clb=True), True, False),
-    'til88_c1': (_hccs(1, 'tiled', (8, 8), use_clb=True), True, False),
-    'til48_c2_i16': (_hccs(2, 'tiled', (4, 8), use_clb=True), True, True),
+    'lin_e2': _hccs_variant(2, 'linear'),
+    'lin_c4': _hccs_variant(4, 'linear', use_clb=True),
+    'til28_e2': _hccs_variant(2, 'tiled', (2, 8)),
+    'til48_e1': _hccs_variant(1, 'tiled', (4, 8)),
+    'til48_c4': _hccs_variant(4, 'tiled', (4, 8), use_clb=True),
+    'til88_c1': _hccs_variant(1, 'tiled', (8, 8), use_clb=True),
+    'til48_c2_i16': _hccs_variant(2, 'tiled', (4, 8), use_clb=True, out16=True),
+    'exp28_c1': _exp_variant(1, (2, 8)),
+    'exp48_c2': _exp_variant(2, (4, 8)),
+    'exp88_c1': _exp_variant(1, (8, 8)),
 }
 
 
 @pytest.mark.requires_vitis
 def test_softmax_variants_match_oracle(tmp_path):
-    """Linear and tiled (2x8/4x8/8x8), exact and CLB, uint8 and int16, split over 1, 2 and 4 tiles, in one build."""
+    """HCCS linear and tiled (2x8/4x8/8x8), exact and CLB, uint8 and int16, split over 1, 2 and 4 tiles, and the
+    tiled accurate Softmax, in one build."""
     _compile_and_check(VARIANTS, _feed(1, ROWS, COLS), tmp_path, 'softmax_variants', simulator='x86')
 
 
 @pytest.mark.requires_vitis
 def test_softmax_tiled_matches_oracle_on_aiesim(tmp_path):
-    """Two small tiled Softmaxes through aiesim, two iterations: two row bands in straight-line code, and four in
-    the pipelined band loops."""
+    """Small tiled Softmaxes through aiesim, two iterations: HCCS in two row bands of straight-line code and in four
+    of pipelined band loops, and the accurate Softmax."""
     variants = {
-        'til48_c1': (_hccs(1, 'tiled', (4, 8), use_clb=True), True, False),
-        'til28_e1': (_hccs(1, 'tiled', (2, 8)), False, False),
+        'til48_c1': _hccs_variant(1, 'tiled', (4, 8), use_clb=True),
+        'til28_e1': _hccs_variant(1, 'tiled', (2, 8)),
+        'exp48_c1': _exp_variant(1, (4, 8)),
     }
     _compile_and_check(variants, _feed(2, 8, 16), tmp_path, 'softmax_aiesim', simulator='aie')
 

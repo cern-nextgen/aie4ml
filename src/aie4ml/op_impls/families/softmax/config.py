@@ -26,3 +26,5 @@ class SoftmaxConfig:
     approximation: str = 'hccs'
     #: For the exp variant: log2(e) * input_scale in Q(EXP_ZF). 0 for HCCS.
     exp_kq: int = 0
+    #: For the exp variant: log2(e) * input_scale. 0 for HCCS.
+    exp_k: float = 0.0

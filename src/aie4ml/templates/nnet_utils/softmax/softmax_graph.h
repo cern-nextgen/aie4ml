@@ -70,7 +70,7 @@ public:
                 kk[i] = kernel::create_object<softmax_i8<ConfigT>>(
                     ConfigT::B[i], ConfigT::S[i], ConfigT::Dmax[i]);
             }
-            source(kk[i])         = "softmax.cpp";
+            source(kk[i])         = ConfigT::APPROX_EXP ? "softmax_exp.cpp" : "softmax_hccs.cpp";
             runtime<ratio>(kk[i]) = 1.0;
 
             connect<>(in1[i], kk[i].in[0]);

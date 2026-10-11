@@ -111,7 +111,9 @@ positive epsilon. `cas_num` splits the rows.
 ## Softmax
 
 int8 in, uint8 (Q8) or int16 (Q15) out, over the last axis, whose length must be a multiple of 8 (32 with
-`layout: 'linear'`). The default computes the exponential exactly in integer arithmetic (beta). `approximation`
+`layout: 'linear'`). The default computes the exponential accurately (beta): the tiled layout on AIE-ML and
+AIE-MLv2 works in bf16 inside, within one code of float softmax for uint8 output and about 0.2% for int16; the
+linear layout and AIE1 use integer arithmetic. `approximation`
 selects a faster surrogate, which is accurate only for a model trained with it thus needs QAT (HCCS approx).
 `cas_num` splits the rows.
 

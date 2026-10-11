@@ -11,6 +11,12 @@
 
 using namespace adf;
 
+// Microtiles of blk int8 lanes a 64-byte vector holds side by side: as many as fit and divide a band of nb.
+constexpr int microtiles_per_vector(int blk, int nb)
+{
+    return (blk <= 16 && nb % 4 == 0) ? 4 : (blk <= 32 && nb % 2 == 0) ? 2 : 1;
+}
+
 template <typename ConfigT>
 class softmax_base {
 public:
@@ -94,8 +100,7 @@ public:
     static constexpr int OUT_SHIFT = std::is_same_v<out_t, int16_t> ? 0 : ConfigT::INV_SHIFT;
     // The float reciprocal wants at least a 4-lane vector; pad the stat lanes to that.
     static constexpr int STAT_LANES = (MT_OUTER < 4) ? 4 : MT_OUTER;
-    // Microtiles per 64-byte vector: as many as fit and divide the band.
-    static constexpr int P = (BLK <= 16 && NB % 4 == 0) ? 4 : (BLK <= 32 && NB % 2 == 0) ? 2 : 1;
+    static constexpr int P = microtiles_per_vector(BLK, NB);
     static_assert(MT_INNER == 8 && (MT_OUTER == 2 || MT_OUTER == 4 || MT_OUTER == 8),
                   "the int8 microtiles are 2x8, 4x8 or 8x8");
     // Between passes: each row's max and scale across its lanes (AIE-ML, AIE-MLv2), or one band's int16 scores (AIE1).
@@ -139,13 +144,31 @@ public:
     static constexpr int NB         = COLS / MT_INNER;
     static constexpr int OUT_SHIFT  = std::is_same_v<out_t, int16_t> ? 0 : ConfigT::INV_SHIFT;
     static constexpr int STAT_LANES = (MT_OUTER < 4) ? 4 : MT_OUTER;
+    static constexpr int P          = microtiles_per_vector(BLK, NB);
+    // log2(e) * input scale, and in fixed point: K_Q = EXP_K * 2^K_FRAC in [2^13, 2^14), so d * K_Q < 2^22 for every
+    // gap d <= 255.
+    static constexpr double EXP_K = ConfigT::EXP_K;
+    static constexpr int K_FRAC = [] {
+        int frac = 0;
+        for (double k = EXP_K; k > 0 && k * 2 < 16384; k *= 2) ++frac;
+        return frac;
+    }();
+    static constexpr int16_t K_Q = (int16_t)(EXP_K * (double)(1ll << K_FRAC) + 0.5);
+    static_assert(K_FRAC >= 7 && K_FRAC <= 126, "EXP_K out of the kernel's range");
+    // Fraction bits of the output probability.
+    static constexpr int OUT_FRAC = std::is_same_v<out_t, int16_t> ? 15 : 8;
 
     void run(input_buffer<in_t>& in, output_buffer<out_t>& out);
 
     static void registerKernelClass() {
         REGISTER_FUNCTION(softmax_exp_i8_tiled::run);
     }
+
+private:
+    // Between passes: each row's max (int8) and 1 / sum (bf16) across its lanes.
+    alignas(aie::vector_decl_align) int8_t scratch_[ROWS * MT_INNER * 3];
 };
+
 
 template <typename ConfigT>
 class softmax_exp_i8 : public softmax_base<ConfigT> {

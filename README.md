@@ -27,7 +27,7 @@ The full constraints are in [docs/support.md](docs/support.md).
 | ReLU | ✅ | ✅ | ✅ | — | Fused into the Dense or Conv2D. |
 | Add | ✅ | ✅ | ✅ | Both inputs and the output of one type | Same shapes; no broadcasting. |
 | LayerNorm | ✅ | ✅ | ✅ | int8 | Last axis. |
-| Softmax | ✅ | ✅ | ✅ | int8 in, uint8 or int16 out | Last axis. Exact integer exponential (beta), or a faster surrogate for models trained with it. |
+| Softmax | ✅ | ✅ | ✅ | int8 in, uint8 or int16 out | Last axis. Accurate exponential (beta), or a faster surrogate for models trained with it. |
 | Flatten / Reshape | ✅ | ✅ | ✅ | — | One sample to `[1, K]`, from a Conv2D into a Dense; no data is copied. |
 | Transpose | ✖️ | ✅ | ✅ | — | Of the last two axes. |
 | Slice, Split, Concat | ✅ | ✅ | ✅ | — | Along the boundaries of the producing layer's tiles; no data is copied. |

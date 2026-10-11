@@ -21,6 +21,7 @@ struct {{L.struct_name}} {
   // in Q(EXP_ZF); the poly coeffs are fixed (2^(-f) ~= A2 f^2 + B1 f + C0 in Q14).
   static constexpr bool    APPROX_EXP = {{ 'true' if P.approximation == 'exp' else 'false' }};
   static constexpr int16_t EXP_KQ = {{ P.exp_kq }};
+  static constexpr double  EXP_K = {{ '%.17g' % P.exp_k }};
   static constexpr int16_t EXP_A2 = 2811;
   static constexpr int16_t EXP_B1 = -11004;
   static constexpr int16_t EXP_C0 = 16384;
