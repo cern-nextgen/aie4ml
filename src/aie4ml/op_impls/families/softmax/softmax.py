@@ -40,7 +40,7 @@ def _input_scale(node: OpNode) -> float:
 
 def _requested_approximation(node: OpNode) -> str:
     """The approximation this node asks for. Default 'exp': a plain ONNX Softmax with no directive
-    lowers to the accurate integer exp, which needs no calibration."""
+    lowers to the accurate exp, which needs no calibration."""
     directives = node.directives or {}
     approx = directives.get('approximation')
     return 'exp' if approx is None else str(approx).lower()

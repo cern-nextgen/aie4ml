@@ -117,9 +117,11 @@ linear layout and AIE1 use integer arithmetic. `approximation`
 selects a faster surrogate, which is accurate only for a model trained with it thus needs QAT (HCCS approx).
 `cas_num` splits the rows.
 
-HCCS takes the trained `B`, `S` and `Dmax` (one set per Softmax), with `0 <= S, Dmax <= 127` and
-`ceil(256/n) + S*Dmax <= B <= floor(32767/n)` for an axis of length `n`. `use_clb: true` normalises by a power of two
-instead of an exact division, several times faster; use it when the model was trained that way.
+HCCS takes the trained `B`, `S` and `Dmax` (one set per Softmax) and scores each element `B - S*min(max - x, Dmax)` on
+the raw int8 codes, so a constant scale before the Softmax (such as `1/sqrt(d)`) must be trained into them. For an axis
+of length `n`: `0 <= S, Dmax <= 127`, `S*Dmax <= B` (a zero floor is allowed), `B + (n-1)*(B - S*Dmax) >= 256` and
+`n*B <= 32767`. `use_clb: true` normalises by a power of two instead of an exact division, several times faster; use
+it when the model was trained that way. `inv_shift` (default 15) must be 14 or 15 with `use_clb` and uint8 output.
 
 ## Folded operators
 

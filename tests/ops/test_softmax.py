@@ -14,10 +14,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 from aie4ml.frontends.onnx import from_onnx
+from aie4ml.op_impls.families.softmax.common import validate_hccs_params
 from helpers import PART, TensorProto, dq, helper, lower, make_model, qdq, qparams
 
 ROWS, COLS = 32, 64
-B, S, DMAX, INV_SHIFT = 255, 2, 64, 15
+# A zero floor (B = S*DMAX): a row max among floor scores sums to Z = 256, the smallest the kernels take.
+B, S, DMAX, INV_SHIFT = 256, 4, 64, 15
 
 
 def _hccs_oracle(x_i8: np.ndarray, *, use_clb: bool, out16: bool) -> np.ndarray:
@@ -40,11 +42,13 @@ def _exp_oracle(x_i8: np.ndarray) -> np.ndarray:
 
 
 def _feed(iterations: int, rows: int, cols: int) -> np.ndarray:
-    """Random rows, and in each iteration an all -128 row and one whose gaps reach 255."""
+    """Random rows, and in each iteration an all -128 row, one whose gaps reach 255 and one with a single max."""
     rng = np.random.default_rng(7)
     x = np.clip(np.rint(rng.normal(0, 24, (iterations, rows, cols))), -96, 96)
     x[:, 0] = -128
     x[:, 1] = np.where(np.arange(cols) % 2, 127, -128)
+    x[:, 2] = -128
+    x[:, 2, 5] = 127
     return x.astype(np.int8)
 
 
@@ -217,3 +221,16 @@ def test_softmax_prefers_tiled_and_honors_explicit_linear_layout(boundary_softma
 def test_softmax_tiled_refuses_non_int8_microtile(boundary_softmax, tmp_path):
     with pytest.raises(ValueError, match=r'reads 2x8, 4x8 or 8x8 int8 microtiles'):
         lower(boundary_softmax, tmp_path, {'til': _hccs(1, 'tiled', (4, 16))})
+
+
+def test_hccs_calibration_bounds_the_score_sum():
+    def check(b, s, dmax, cols=64):
+        validate_hccs_params({'B': b, 'S': s, 'Dmax': dmax}, cols=cols, param_sets=1)
+
+    check(256, 4, 64)
+    with pytest.raises(ValueError, match=r'B \+ \(cols - 1\) \* \(B - S\*Dmax\) >= 256'):
+        check(252, 4, 63)
+    with pytest.raises(ValueError, match=r'B - S\*Dmax >= 0'):
+        check(256, 4, 65)
+    with pytest.raises(ValueError, match=r'cols \* B <= 32767'):
+        check(512, 4, 64)

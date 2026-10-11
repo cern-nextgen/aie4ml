@@ -57,7 +57,13 @@ def _compact_hccs_param(values: np.ndarray, *, name: str, param_sets: int) -> np
 
 
 def validate_hccs_params(hccs: Dict[str, Any], *, cols: int, param_sets: int) -> None:
-    """Validate HCCS calibration constants against kernel ABI constraints."""
+    """Validate HCCS calibration constants against kernel ABI constraints.
+
+    A row of `cols` gaps d = min(max - x, Dmax) scores B - S*d, from B at the row max down to B - S*Dmax, and Z is the
+    row's score sum. The kernels need every score >= 0 (B >= S*Dmax; a zero floor is allowed) and
+    256 <= Z <= 32767: Z >= 256 keeps the reciprocal 255 << inv_shift / Z within int16, and int16 holds Z. The
+    smallest Z is one row max among floor scores, B + (cols - 1)*(B - S*Dmax); the largest is cols*B.
+    """
     if int(param_sets) != 1:
         raise ValueError(f'HCCS Softmax compile-time scalar parameter packing requires param_sets=1, got {param_sets}.')
     b = _compact_hccs_param(
@@ -79,11 +85,12 @@ def validate_hccs_params(hccs: Dict[str, Any], *, cols: int, param_sets: int) ->
     if np.any(min_score < 0):
         bad = int(np.argmin(min_score))
         raise ValueError(f'HCCS Softmax requires B - S*Dmax >= 0 for every row; row {bad} gives {int(min_score[bad])}.')
-    if np.any(min_score * int(cols) < 256):
-        bad = int(np.argmin(min_score))
+    min_sum = b + (int(cols) - 1) * min_score
+    if np.any(min_sum < 256):
+        bad = int(np.argmin(min_sum))
         raise ValueError(
-            f'HCCS Softmax requires cols * (B - S*Dmax) >= 256 for reciprocal range; '
-            f'row {bad} gives {int(min_score[bad]) * int(cols)}.'
+            f'HCCS Softmax requires B + (cols - 1) * (B - S*Dmax) >= 256 for reciprocal range; '
+            f'row {bad} gives {int(min_sum[bad])}.'
         )
     if np.any(b * int(cols) > 32767):
         raise ValueError('HCCS Softmax requires cols * B <= 32767 so score sum fits int16 range.')
