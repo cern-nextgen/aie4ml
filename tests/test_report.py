@@ -274,3 +274,39 @@ def test_a_kernel_without_a_profile_is_named_not_dropped(tmp_path):
 
     missing = report(tmp_path)['missing']
     assert any(item.startswith('per-kernel cycles of fc_aie:') for item in missing)
+
+
+def test_a_kernel_inlined_into_its_tile_loop_is_estimated_from_its_instructions(tmp_path):
+    """With `run` inlined into the tile's never-returning main, no function carries the kernel: its tile's
+    instructions past start-up, per iteration of the graph (the profiled kernels' call count), estimate it."""
+    from aie4ml.report import _kernel_cycles
+
+    (tmp_path / 'aie_pipeline.json').write_text(
+        json.dumps(
+            {
+                'physical': {'placements': {'c1_aie': {'col': 7, 'row': 0}, 'add_aie': {'col': 8, 'row': 0}}},
+                'execution': [
+                    {'node': name, 'config': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}
+                    for name in ('c1_aie', 'add_aie')
+                ],
+            }
+        )
+    )
+    profiles = tmp_path / 'aiesimulator_output'
+    profiles.mkdir()
+    (profiles / 'profile_funct_7_2.txt').write_text(
+        'Function profiling report information for ::tl.aie_logical.aie_xtlm.math_engine'
+        '.array.tile_7_3.cm.proc.iss\n'
+        '  5  6145  76.88%  1229  1229  1229  6145  76.88%  1229  1229  1229  704  1245  0'
+        ' run _ZN13conv2d_singleI5L1Cfg\n'
+    )
+    (profiles / 'profile_funct_8_2.txt').write_text(
+        'Function profiling report information for ::tl.aie_logical.aie_xtlm.math_engine'
+        '.array.tile_8_3.cm.proc.iss\n'
+        '    Total instruction count     :                  936\n'
+        '  1  38  79.17%  38  38  38  48  100.00%  48  48  48  0  177  0 _main_no_exit_init _main_no_exit_init\n'
+        '  0  0  0.00%  -  -  -  0  0.00%  -  -  -  192  927  0 main _main\n'
+    )
+    kernels = {k['op']: k for k in _kernel_cycles(tmp_path, {'aie_tile_row_start': 3})}
+    assert (kernels['c1_aie']['cycles_per_call'], kernels['c1_aie'].get('estimated')) == (1229, None)
+    assert (kernels['add_aie']['cycles_per_call'], kernels['add_aie']['estimated']) == (round((936 - 48) / 5), True)

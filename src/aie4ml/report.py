@@ -26,8 +26,11 @@ import os
 import re
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from .device_catalog import lookup_device
 
 # Itanium mangling prefixes each identifier with its length (_ZN12dense_singleI... ->
 # 12 chars of 'dense_single'), which is how the class name is recovered from the symbol.
@@ -35,6 +38,7 @@ _KERNEL_RE = re.compile(r' _ZN(\d+)([A-Za-z_][A-Za-z0-9_]*)')  # a kernel class'
 _TILE_RE = re.compile(r'array\.tile_(\d+)_(\d+)')  # a profile's tile, by absolute array row
 _PLIO_RE = re.compile(r'\|\s*(?:plio)?\s*\|?\s*(PLIO_\w+)\s*\|\s*(IN|OUT)\s*\|\s*([\d.]+)')
 _CORE_RE = re.compile(r'^Core (\S+)', re.M)
+_INSTR_RE = re.compile(r'Total instruction count\s*:\s*(\d+)')  # a core's executed instruction bundles
 
 
 def _analyze_aie_out_interval(output_dir: Path, pipeline: Optional[Dict[str, Any]] = None) -> Dict:
@@ -372,33 +376,53 @@ def _kernel_cycles(project: Path, vitis: Dict[str, Any]) -> List[Dict[str, Any]]
     row_start = vitis.get('aie_tile_row_start')
     if row_start is None:
         return []
-    rows = []
+    rows, inlined = [], []
     for path in sorted(project.glob('aiesimulator_output/profile_funct_*.txt')):
         text = path.read_text(errors='ignore')
         named = _TILE_RE.search(text)
+        if named is None:
+            continue
+        tile = f'{named.group(1)}_{int(named.group(2)) - int(row_start)}'
         # Columns come in two groups of six: the function alone, then the function with its
         # callees. A kernel that moves its data through helper functions does that work too, so
         # the second group is the kernel's cost -- reading the first would charge its callees to
         # nobody and leave the difference looking like time blocked on a port. The kernel is its
         # class's costliest member function: `run`, or what the compiler left of it once inlined.
-        members = []
+        members, startup = [], None
         for line in text.split('Cycle count details', 1)[0].splitlines():
             fields, match = line.split(), _KERNEL_RE.search(line)
             if match and len(fields) > 7 and fields[0].isdigit() and fields[6].isdigit():
                 members.append((int(fields[6]), int(fields[0]), fields[7].rstrip('%'), match))
-        if not members or named is None:
-            continue
-        total, calls, busy, match = max(members, key=lambda member: member[0])
-        kernel = match.group(2)[: int(match.group(1))]
-        tile = f'{named.group(1)}_{int(named.group(2)) - int(row_start)}'
+            elif len(fields) > 6 and fields[-1] == '_main_no_exit_init' and fields[6].isdigit():
+                startup = int(fields[6])
+        if members:
+            total, calls, busy, match = max(members, key=lambda member: member[0])
+            rows.append(
+                {
+                    'tile': tile,
+                    **{k: v for k, v in owned.get(tile, {}).items()},
+                    'kernel': match.group(2)[: int(match.group(1))],
+                    'calls': calls,
+                    'cycles_per_call': round(total / calls) if calls else 0,
+                    'busy_pct': float(busy) if busy else None,
+                }
+            )
+        elif 'op' in owned.get(tile, {}) and startup is not None and (count := _INSTR_RE.search(text)):
+            inlined.append((tile, int(count.group(1)) - startup))
+    # A kernel the compiler inlined into its tile's loop has no function of its own to profile. Its tile's instructions
+    # past start-up, per graph iteration, estimate it: one bundle a cycle, so the kernel and its lock handling, without
+    # stall cycles. Every tile runs the graph's iterations, the call count of the kernels profiled directly.
+    calls = Counter(r['calls'] for r in rows if r['calls']).most_common(1)
+    for tile, instructions in inlined if calls else ():
         rows.append(
             {
                 'tile': tile,
-                **{k: v for k, v in owned.get(tile, {}).items()},
-                'kernel': kernel,
-                'calls': calls,
-                'cycles_per_call': round(total / calls) if calls else 0,
-                'busy_pct': float(busy) if busy else None,
+                **owned[tile],
+                'kernel': 'inlined',
+                'calls': calls[0][0],
+                'cycles_per_call': round(instructions / calls[0][0]),
+                'busy_pct': None,
+                'estimated': True,
             }
         )
     return rows
@@ -441,7 +465,12 @@ def _bottleneck(kernels: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         prev = staged.get(op)
         if prev is None or k['cycles_per_call'] > prev['cycles']:
-            staged[op] = {'cycles': k['cycles_per_call'], 'kernel': k['kernel'], 'tiles': 0}
+            staged[op] = {
+                'cycles': k['cycles_per_call'],
+                'kernel': k['kernel'],
+                'tiles': 0,
+                'estimated': bool(k.get('estimated')),
+            }
     if not staged:
         return {}
     for k in kernels:
@@ -631,8 +660,10 @@ def collect_report(model_or_path) -> 'Report':
             for key in ('min', 'max', 'avg'):
                 if f'{key}_ns' in stats:
                     stats[f'{key}_cc'] = round(stats[f'{key}_ns'] * clock)
+    part = doc.get('device')
     report: Dict[str, Any] = {
         'project': str(project),
+        'device': {'part': part, 'generation': lookup_device(part).get('Generation')} if part else None,
         'aie_clock_GHz': clock,
         'design': _design(project, vitis),
         'latency': latency,
@@ -662,6 +693,10 @@ def collect_report(model_or_path) -> 'Report':
             and t in produced
         ]
         critical = _critical_path(edges, stage_cycles)
+        if critical:
+            per_stage = report['bottleneck']['per_stage']
+            estimated = [op for op in critical['chain'] if op in per_stage and per_stage[op]['estimated']]
+            critical['estimated_stages'] = len(estimated)
         report['critical_path'] = critical
         first = (latency or {}).get('latency_cc')
         if critical and first:
@@ -697,6 +732,10 @@ def format_report(report: Dict[str, Any]) -> str:
     """Render the report as plain text."""
     out: List[str] = []
     add = out.append
+
+    def approx(cycles: int, estimated: bool, width: int) -> str:
+        return f'{("~" if estimated else "") + format(cycles, ",d"):>{width}s}'
+
     clock = report.get('aie_clock_GHz')
     ns = lambda cycles: cycles / clock if clock else float('nan')  # noqa: E731 - local unit shorthand
 
@@ -713,7 +752,9 @@ def format_report(report: Dict[str, Any]) -> str:
         if design.get('memtile_bytes'):
             line += f' ({design["memtile_bytes"]:,} B)'
         add(line)
-    add(f'  AIE clock: {clock} GHz' if clock else '  AIE clock: unknown (cycles omitted)')
+    device = report.get('device') or {}
+    on = f'  Device: {device["part"]} ({device["generation"] or "?"}), ' if device else '  '
+    add(on + (f'AIE clock: {clock} GHz' if clock else 'AIE clock: unknown (cycles omitted)'))
     chosen = report.get('optimizer')
     if chosen:
         add(
@@ -733,17 +774,19 @@ def format_report(report: Dict[str, Any]) -> str:
                 f'    latency        {first_cc:12,d} cc  {ns(first_cc):12,.1f} ns   '
                 'per sample, with samples at least one output interval apart'
             )
+        estimated = critical.get('estimated_stages', 0)
         if critical:
+            stages = f'{len(critical["chain"])} stages' + (f', {estimated} estimated' if estimated else '')
             add(
-                f'      compute      {critical["cycles"]:12,d} cc  {ns(critical["cycles"]):12,.1f} ns   '
-                f'critical path, {len(critical["chain"])} stages'
+                f'      compute      {approx(critical["cycles"], estimated, 12)} cc  '
+                f'{ns(critical["cycles"]):12,.1f} ns   critical path, {stages}'
             )
         if split and split['data_movement_cc'] < 0:
             # A stream kernel emits its first rows before it finishes, so the residual has no meaning.
             add('      data move             n/a   (output streams out before the kernel finishes)')
         elif split:
             add(
-                f'      data move    {split["data_movement_cc"]:12,d} cc  '
+                f'      data move    {approx(split["data_movement_cc"], estimated, 12)} cc  '
                 f'{ns(split["data_movement_cc"]):12,.1f} ns   {split["data_movement_pct"]}% memtile/DMA/lock etc.'
             )
 
@@ -771,14 +814,14 @@ def format_report(report: Dict[str, Any]) -> str:
             k = rows.get(name, {})
             busy = f'{k["busy_pct"]:5.1f}%' if k.get('busy_pct') is not None else '     -'
             add(
-                f'    {name:26s} {v["kernel"]:22s} {v["tiles"]:5d} {v["cycles"]:9,d} '
+                f'    {name:26s} {v["kernel"]:22s} {v["tiles"]:5d} {approx(v["cycles"], v["estimated"], 9)} '
                 f'{ns(v["cycles"]):9,.1f} {busy} {k.get("program_B", 0):7,d}'
             )
         add('')
         add('    by kernel class')
         for cls, cyc in bottleneck['per_kernel_class'].items():
             add(
-                f'        {cls:22s} {cyc:9,d} cc  {ns(cyc):9,.1f} ns  '
+                f'        {cls:22s} {approx(cyc, cls == "inlined", 9)} cc  {ns(cyc):9,.1f} ns  '
                 f'{100.0 * cyc / bottleneck["iteration_cycles"]:5.1f}%'
             )
 
@@ -802,6 +845,9 @@ def format_report(report: Dict[str, Any]) -> str:
         add('Not collected')
         for m in report['missing']:
             add(f'    - {m}')
+    if any(k.get('estimated') for k in report.get('kernels') or []):
+        add('')
+        add("~ inlined kernel: its tile's instructions per iteration (the kernel and its lock handling, no stalls)")
     return '\n'.join(out)
 
 
