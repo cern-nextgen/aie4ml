@@ -62,4 +62,5 @@ class MatmulConfig:
     rounding_mode: Optional[str]
     alternating_horizontal: bool
     flags: MatmulFlags
-    row_blocks: int = 2  # row microtiles its kernel computes a step: 2 (matmul.cpp) or 1 (matmul_vector.cpp)
+    # row microtiles its kernel computes a step: 2 (matmul.cpp), 1 (matmul_vector.cpp) or 4 (matmul_block4x2.cpp)
+    row_blocks: int = 2

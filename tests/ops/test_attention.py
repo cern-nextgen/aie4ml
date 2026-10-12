@@ -73,10 +73,11 @@ CASES = {
     'aie-ml': (AIE_ML, 16, 16, 16, {}),
     'aie-mlv2': (AIE_MLV2, 16, 16, 16, {}),
     'aie-mlv2-split': (AIE_MLV2, 16, 16, 32, SPLIT),
+    'aie-mlv2-block4x2': (AIE_MLV2, 32, 16, 32, SPLIT),
 }
 # The projections write K and V in the blocks the matmuls read them in, 8x8: the search takes 8x8x8 on AIE-ML too,
 # whose 4x8x8 would write 4-row blocks a memory tile re-tiles for the 8-row reads.
-THROUGH_MEMTILES = {'aie-ml': set(), 'aie-mlv2': set(), 'aie-mlv2-split': set()}
+THROUGH_MEMTILES = {'aie-ml': set(), 'aie-mlv2': set(), 'aie-mlv2-split': set(), 'aie-mlv2-block4x2': set()}
 
 
 @pytest.mark.parametrize('case', CASES)
@@ -86,6 +87,16 @@ def test_attention_hands_k_and_v_over_in_the_blocks_their_microtiles_read(case, 
     assert memtiles(ctx) == THROUGH_MEMTILES[case]
     if not THROUGH_MEMTILES[case]:
         assert {('k_aie', 'scores_aie'), ('v_aie', 'ctx_aie')} <= direct_edges(ctx)
+
+
+def test_mlv2_matmuls_take_the_4x2_block(tmp_path):
+    """Q.K^T, reading K transposed, and .V take matmul_block4x2.cpp on AIE-MLv2 when the tokens allow, as a cascade
+    and as chains; 16 tokens keep the 2x2 kernel."""
+    part, tokens, features, head_dim, directives = CASES['aie-mlv2-block4x2']
+    ctx = lower(_head(tokens, features, head_dim), tmp_path / 'tokens32', directives, part=part)
+    assert [ctx.ir.execution.get(name).config.row_blocks for name in ('scores_aie', 'ctx_aie')] == [4, 4]
+    ctx = lower(_head(16, features, head_dim), tmp_path / 'tokens16', directives, part=part)
+    assert [ctx.ir.execution.get(name).config.row_blocks for name in ('scores_aie', 'ctx_aie')] == [2, 2]
 
 
 @pytest.mark.requires_vitis

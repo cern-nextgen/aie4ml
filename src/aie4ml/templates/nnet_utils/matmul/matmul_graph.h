@@ -2,12 +2,13 @@
 #include <adf.h>
 #include <cstdint>
 #include "matmul.h"
+#include "matmul_block4x2.h"
 #include "matmul_vector.h"
 #include "parameters.h"
 
 using namespace adf;
 
-// The kernels by row microtiles per step: 2 (matmul.cpp) or 1 (matmul_vector.cpp).
+// The kernels by row microtiles per step: 2 (matmul.cpp), 1 (matmul_vector.cpp) or 4 (matmul_block4x2.cpp).
 template<typename ConfigT, int ROW_BLOCKS>
 struct matmul_kernels {
   using single = matmul_single<ConfigT>;
@@ -24,6 +25,15 @@ struct matmul_kernels<ConfigT, 1> {
   using middle = matmul_vector_middle<ConfigT>;
   using last = matmul_vector_last<ConfigT>;
   static constexpr const char* source = "matmul_vector.cpp";
+};
+
+template<typename ConfigT>
+struct matmul_kernels<ConfigT, 4> {
+  using single = matmul_block4x2_single<ConfigT>;
+  using first = matmul_block4x2_first<ConfigT>;
+  using middle = matmul_block4x2_middle<ConfigT>;
+  using last = matmul_block4x2_last<ConfigT>;
+  static constexpr const char* source = "matmul_block4x2.cpp";
 };
 
 template<typename ConfigT>

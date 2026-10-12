@@ -46,7 +46,14 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
         precision, accumulator_tag = resolve_operand_precision(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], directives.get('microtiling'))
         tiling = _resolve_parallelism(
-            node, device, microtiling, precision, self.contract, parallel_cfg, one_block_chains=True
+            node,
+            device,
+            microtiling,
+            precision,
+            self.contract,
+            parallel_cfg,
+            one_block_chains=True,
+            widest_row_blocks=self._widest_row_blocks(device, microtiling, precision, accumulator_tag),
         )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
         check_register_transpose(node, io_views, device)

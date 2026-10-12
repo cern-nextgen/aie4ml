@@ -48,6 +48,22 @@ class _BaseDenseMatmulVariant(OpImplVariant):
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism', 'microtiling'})
     row_blocks: ClassVar[int] = 2  # row microtiles the kernel computes per step, where the tiling allows
 
+    def _buffer_ports(self) -> bool:
+        return self.input_port_kind == PORT_KIND_BUFFER and self.output_port_kind == PORT_KIND_BUFFER
+
+    def _widest_row_blocks(self, device, microtiling, precision, accumulator_tag) -> int:
+        """The most row microtiles the kernel takes a step: four (the *_block4x2.cpp buffer kernels) where their 4x2
+        block of int8 8x8x8 microtiles, eight int32 accumulators, fills the AIE-MLv2 register file; else its own."""
+        fits = (
+            self.row_blocks == 2
+            and self._buffer_ports()
+            and device.generation == 'AIE-MLV2'
+            and accumulator_tag == 'acc32'
+            and int(precision['lhs'].width) == int(precision['rhs'].width) == 8
+            and (microtiling.microtile_m, microtiling.microtile_k, microtiling.microtile_n) == (8, 8, 8)
+        )
+        return 4 if fits else self.row_blocks
+
     def work(self, node, config) -> int:
         lhs = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
         return int(np.prod(lhs)) * int(config.io_views[node.outputs[0].name].tile[-1])
@@ -187,22 +203,6 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             lhs_inner_shards=lhs_inner_shards,
             row_blocks=tiling.row_blocks,
         )
-
-    def _buffer_ports(self) -> bool:
-        return self.input_port_kind == PORT_KIND_BUFFER and self.output_port_kind == PORT_KIND_BUFFER
-
-    def _widest_row_blocks(self, device, microtiling, precision, accumulator_tag) -> int:
-        """The most row microtiles the kernel takes a step: four (dense_block4x2.cpp, a buffer kernel) where its 4x2
-        block of int8 8x8x8 microtiles, eight int32 accumulators, fills the AIE-MLv2 register file; else its own."""
-        fits = (
-            self.row_blocks == 2
-            and self._buffer_ports()
-            and device.generation == 'AIE-MLV2'
-            and accumulator_tag == 'acc32'
-            and int(precision['lhs'].width) == int(precision['rhs'].width) == 8
-            and (microtiling.microtile_m, microtiling.microtile_k, microtiling.microtile_n) == (8, 8, 8)
-        )
-        return 4 if fits else self.row_blocks
 
     def input_inner_shards(self, node, config, tensor_name):
         return config.lhs_inner_shards if tensor_name == input_tensor_for_role(node, 'lhs').name else None
