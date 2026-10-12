@@ -121,8 +121,8 @@ help::
 	@echo "  make x86com       - AIE x86 compile"
 	@echo "  make x86sim       - Run x86 simulator"
 	@echo "  make aiesim       - Run AIE simulator"
-	@echo "  make profile      - AIE sim with profiling"
-	@echo "  make trace        - AIE sim with trace"
+	@echo "  make profile      - AIE sim with per-kernel profiling"
+	@echo "  make trace        - AIE sim with a waveform database for Vitis Analyzer"
 	@echo "  make analyze      - Open Vitis Analyzer"
 	@echo "  make clean        - Remove build artifacts"
 
@@ -152,7 +152,7 @@ x86sim:
 	x86simulator --pkg-dir=$(X86_WORKDIR) |& tee -a log
 
 profile:
-	aiesimulator --online -wdb -text --profile |& tee -a log
+	aiesimulator --pkg-dir=$(AIE_WORKDIR) --profile |& tee -a log
 
 trace:
 	aiesimulator --online -wdb -text |& tee -a log
