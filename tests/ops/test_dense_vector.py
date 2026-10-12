@@ -109,10 +109,10 @@ def test_one_sample_matches_onnx(tmp_path, part):
 
 
 def test_mlv2_batch_takes_four_row_blocks(tmp_path):
-    """Rows in whole groups of four 8-row microtiles take dense_block4x2.cpp on AIE-MLv2, split by columns or by rows;
-    other rows, and AIE-ML, keep the 2x2 kernel rather than pad."""
+    """Rows in whole groups of four 8-row microtiles take dense_block4x2.cpp on AIE-MLv2, split by columns or by rows,
+    but for a ReLU over a K slice of 16 (`d1`); other rows, and AIE-ML, keep the 2x2 kernel rather than pad."""
     ctx = lower(_mlp(rows=32), tmp_path / 'block4x2', SPLIT, part=MLV2_PART)
-    assert {inst.config.row_blocks for inst in ctx.ir.execution} == {4}
+    assert {inst.name: inst.config.row_blocks for inst in ctx.ir.execution} == {'d0_aie': 4, 'd1_aie': 2, 'd2_aie': 4}
 
     row_split = {'d0': {'parallelism': {'cas_num': 2, 'contract': 'outer'}}}
     ctx = lower(_mlp(rows=64), tmp_path / 'outer', row_split, part=MLV2_PART)

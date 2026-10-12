@@ -53,7 +53,9 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
             self.contract,
             parallel_cfg,
             one_block_chains=True,
-            widest_row_blocks=self._widest_row_blocks(device, microtiling, precision, accumulator_tag),
+            widest_row_blocks=lambda tiling: self._widest_row_blocks(
+                device, microtiling, precision, accumulator_tag, tiling
+            ),
         )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
         check_register_transpose(node, io_views, device)

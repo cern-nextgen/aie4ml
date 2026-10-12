@@ -51,9 +51,11 @@ class _BaseDenseMatmulVariant(OpImplVariant):
     def _buffer_ports(self) -> bool:
         return self.input_port_kind == PORT_KIND_BUFFER and self.output_port_kind == PORT_KIND_BUFFER
 
-    def _widest_row_blocks(self, device, microtiling, precision, accumulator_tag) -> int:
+    def _widest_row_blocks(self, device, microtiling, precision, accumulator_tag, tiling, relu=False) -> int:
         """The most row microtiles the kernel takes a step: four (the *_block4x2.cpp buffer kernels) where their 4x2
-        block of int8 8x8x8 microtiles, eight int32 accumulators, fills the AIE-MLv2 register file; else its own."""
+        block of int8 8x8x8 microtiles, eight int32 accumulators, fills the AIE-MLv2 register file; else its own.
+        Not for a ReLU over a K slice of one aligned step: its max keeps every shift out of the stores, and the
+        eight shifts of a block outweigh its few MACs, which the 2x2 block schedules better."""
         fits = (
             self.row_blocks == 2
             and self._buffer_ports()
@@ -61,6 +63,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             and accumulator_tag == 'acc32'
             and int(precision['lhs'].width) == int(precision['rhs'].width) == 8
             and (microtiling.microtile_m, microtiling.microtile_k, microtiling.microtile_n) == (8, 8, 8)
+            and not (relu and tiling.tile_inner_lhs <= 2 * microtiling.microtile_k)
         )
         return 4 if fits else self.row_blocks
 
@@ -133,6 +136,8 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             parallel_cfg['cas_length'] = required_cas_length
             required_microtile = inherited_microtile(node, input_contracts)
 
+        fused_act = node.traits.get('fused_activation')
+        use_relu = fused_act is not None and fused_act.data['activation'] == 'relu'
         # A kernel of one row block pays for every row of its microtile, so it takes the fewest rows the part
         # offers -- unless its producer writes a microtile the part also offers, which keeps the hand-off direct.
         one_block = self.row_blocks == 1
@@ -156,7 +161,9 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             row_blocks=self.row_blocks,
             # dense_vector.cpp, a buffer kernel, takes a chain whose rows the two-block kernel cannot hold
             one_block_chains=self._buffer_ports(),
-            widest_row_blocks=self._widest_row_blocks(device, microtiling, precision, accumulator_tag),
+            widest_row_blocks=lambda tiling: self._widest_row_blocks(
+                device, microtiling, precision, accumulator_tag, tiling, relu=use_relu
+            ),
         )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
         check_register_transpose(node, io_views, device)
@@ -178,9 +185,6 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
         )
         shift += resolve_output_scale_shift(node, is_float=is_float)
-
-        fused_act = node.traits.get('fused_activation')
-        use_relu = fused_act is not None and fused_act.data['activation'] == 'relu'
 
         return DenseConfig(
             precision=precision,
