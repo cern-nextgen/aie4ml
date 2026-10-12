@@ -192,8 +192,8 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         return self.input_port_kind == PORT_KIND_BUFFER and self.output_port_kind == PORT_KIND_BUFFER
 
     def _widest_row_blocks(self, device, microtiling, precision, accumulator_tag) -> int:
-        """The most row microtiles the kernel takes a step: four (dense_rows4.cpp, a buffer kernel) where its 4x2 block
-        of int8 8x8x8 microtiles, eight int32 accumulators, fills the AIE-MLv2 register file; else the variant's own."""
+        """The most row microtiles the kernel takes a step: four (dense_block4x2.cpp, a buffer kernel) where its 4x2
+        block of int8 8x8x8 microtiles, eight int32 accumulators, fills the AIE-MLv2 register file; else its own."""
         fits = (
             self.row_blocks == 2
             and self._buffer_ports()

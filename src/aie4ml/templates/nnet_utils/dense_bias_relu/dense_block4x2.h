@@ -9,7 +9,7 @@
 using namespace adf;
 
 template<typename ConfigT>
-class dense_rows4_base {
+class dense_block4x2_base {
 public:
   using data_t        = typename ConfigT::data_t;
   using weight_t      = typename ConfigT::weight_t;
@@ -17,17 +17,17 @@ public:
   using bias_t   = typename ConfigT::bias_t;
   using acc_scalar_t  = typename ConfigT::acc_scalar_t;
 
-  dense_rows4_base();
+  dense_block4x2_base();
 };
 
 template<typename ConfigT>
-class dense_rows4_single : public dense_rows4_base<ConfigT> {
+class dense_block4x2_single : public dense_block4x2_base<ConfigT> {
 public:
   using data_t        = typename ConfigT::data_t;
   using weight_t      = typename ConfigT::weight_t;
   using result_t      = typename ConfigT::result_t;
-  using acc_scalar_t  = typename dense_rows4_base<ConfigT>::acc_scalar_t;
-  using bias_t   = typename dense_rows4_base<ConfigT>::bias_t;
+  using acc_scalar_t  = typename dense_block4x2_base<ConfigT>::acc_scalar_t;
+  using bias_t   = typename dense_block4x2_base<ConfigT>::bias_t;
 
   void run(input_buffer<data_t>&       ifm,
            const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
@@ -35,55 +35,55 @@ public:
            output_buffer<result_t>&      ofm);
 
   static void registerKernelClass() {
-    REGISTER_FUNCTION(dense_rows4_single::run);
+    REGISTER_FUNCTION(dense_block4x2_single::run);
   }
 };
 
 template<typename ConfigT>
-class dense_rows4_first : public dense_rows4_base<ConfigT> {
+class dense_block4x2_first : public dense_block4x2_base<ConfigT> {
 public:
   using data_t        = typename ConfigT::data_t;
   using weight_t      = typename ConfigT::weight_t;
   using result_t      = typename ConfigT::result_t;
-  using acc_scalar_t  = typename dense_rows4_base<ConfigT>::acc_scalar_t;
-  using bias_t   = typename dense_rows4_base<ConfigT>::bias_t;
+  using acc_scalar_t  = typename dense_block4x2_base<ConfigT>::acc_scalar_t;
+  using bias_t   = typename dense_block4x2_base<ConfigT>::bias_t;
 
   void run(input_buffer<data_t>&          ifm,
             const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
             const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
             output_cascade<acc_scalar_t>* outCascade);
 
-  static void registerKernelClass() { REGISTER_FUNCTION(dense_rows4_first::run); }
+  static void registerKernelClass() { REGISTER_FUNCTION(dense_block4x2_first::run); }
 };
 
 template<typename ConfigT>
-class dense_rows4_middle : public dense_rows4_base<ConfigT> {
+class dense_block4x2_middle : public dense_block4x2_base<ConfigT> {
 public:
   using data_t        = typename ConfigT::data_t;
   using weight_t      = typename ConfigT::weight_t;
   using result_t      = typename ConfigT::result_t;
-  using acc_scalar_t  = typename dense_rows4_base<ConfigT>::acc_scalar_t;
+  using acc_scalar_t  = typename dense_block4x2_base<ConfigT>::acc_scalar_t;
 
   void run(input_buffer<data_t>&          ifm,
             const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
             input_cascade<acc_scalar_t>*  inCascade,
             output_cascade<acc_scalar_t>* outCascade);
 
-  static void registerKernelClass() { REGISTER_FUNCTION(dense_rows4_middle::run); }
+  static void registerKernelClass() { REGISTER_FUNCTION(dense_block4x2_middle::run); }
 };
 
 template<typename ConfigT>
-class dense_rows4_last : public dense_rows4_base<ConfigT> {
+class dense_block4x2_last : public dense_block4x2_base<ConfigT> {
 public:
   using data_t        = typename ConfigT::data_t;
   using weight_t      = typename ConfigT::weight_t;
   using result_t      = typename ConfigT::result_t;
-  using acc_scalar_t  = typename dense_rows4_base<ConfigT>::acc_scalar_t;
+  using acc_scalar_t  = typename dense_block4x2_base<ConfigT>::acc_scalar_t;
 
   void run(input_buffer<data_t>&         ifm,
             const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
             input_cascade<acc_scalar_t>* inCascade,
             output_buffer<result_t>&        ofm);
 
-  static void registerKernelClass() { REGISTER_FUNCTION(dense_rows4_last::run); }
+  static void registerKernelClass() { REGISTER_FUNCTION(dense_block4x2_last::run); }
 };

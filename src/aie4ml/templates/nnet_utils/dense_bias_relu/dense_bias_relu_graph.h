@@ -6,13 +6,13 @@
 #include <vector>
 #include "dense_bias_relu.h"
 #include "dense_bias_relu_stream.h"
-#include "dense_rows4.h"
+#include "dense_block4x2.h"
 #include "dense_vector.h"
 #include "parameters.h"
 
 using namespace adf;
 
-// The buffer kernels by row microtiles per step: 2 (dense_bias_relu.cpp), 1 (dense_vector.cpp) or 4 (dense_rows4.cpp).
+// The buffer kernels by row microtiles per step: 2 (dense_bias_relu.cpp), 1 (dense_vector.cpp) or 4 (dense_block4x2.cpp).
 template<typename ConfigT, int ROW_BLOCKS>
 struct dense_buffer_kernels {
   using single = dense_single<ConfigT>;
@@ -33,11 +33,11 @@ struct dense_buffer_kernels<ConfigT, 1> {
 
 template<typename ConfigT>
 struct dense_buffer_kernels<ConfigT, 4> {
-  using single = dense_rows4_single<ConfigT>;
-  using first = dense_rows4_first<ConfigT>;
-  using middle = dense_rows4_middle<ConfigT>;
-  using last = dense_rows4_last<ConfigT>;
-  static constexpr const char* source = "dense_rows4.cpp";
+  using single = dense_block4x2_single<ConfigT>;
+  using first = dense_block4x2_first<ConfigT>;
+  using middle = dense_block4x2_middle<ConfigT>;
+  using last = dense_block4x2_last<ConfigT>;
+  static constexpr const char* source = "dense_block4x2.cpp";
 };
 
 template<typename ConfigT>
