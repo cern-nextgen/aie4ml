@@ -271,7 +271,7 @@ def measured_latency_cc(project: Path) -> Optional[int]:
     project = Path(project)
     log = project / 'log'
     clock = _aie_clock_ghz(project)
-    starts = _LATENCY_RE.findall(log.read_text(errors='replace')) if log.exists() else []
+    starts = [s for s in (_LATENCY_RE.findall(log.read_text(errors='replace')) if log.exists() else []) if int(s)]
     data_dir = project / 'aiesimulator_output' / 'data'
     first_beat = _first_beat_ns(data_dir / 'y_p0.txt')
     complete = (_analyze_aie_out_interval(project, _pipeline(project)) or {}).get('first_output_from_sim_start_ns')
@@ -723,7 +723,10 @@ def collect_report(model_or_path) -> 'Report':
     if clock is None:
         missing.append("AIE clock (cycles for latency and interval): compile the design ('make all')")
     if latency and latency.get('latency_cc') is None:
-        missing.append('latency: re-run the aie simulation of a project generated with this aie4ml version')
+        missing.append(
+            'latency: the aie simulation timed no input against the output (an event::start_profiling error in the '
+            'log), or the project predates this aie4ml version'
+        )
     report['missing'] = missing
     return Report(report)
 
@@ -774,6 +777,8 @@ def format_report(report: Dict[str, Any]) -> str:
                 f'    latency        {first_cc:12,d} cc  {ns(first_cc):12,.1f} ns   '
                 'per sample, with samples at least one output interval apart'
             )
+        else:
+            add('    latency               n/a   (not measured: see Not collected)')
         estimated = critical.get('estimated_stages', 0)
         if critical:
             stages = f'{len(critical["chain"])} stages' + (f', {estimated} estimated' if estimated else '')
