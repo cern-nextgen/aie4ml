@@ -1,7 +1,8 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Graph-aware kernel placement for the AIE backend."""
+"""Graph-aware kernel placement for the AIE backend: the kernels and the hand-overs between them as placement sees
+them, and the pass placing them by the constraint solver (`placement_solver`)."""
 
 from __future__ import annotations
 
@@ -11,9 +12,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..errors import ConfigRefused
 from ..ir import get_backend_context
-from ..op_impls.base import BufferLocation
+from ..op_impls.base import BufferLocation, StreamLocation
 from .base import AIEPass
-from .shared_buffer import location_problem, static_problem
+from .estimate import kernel_cycles, leg_cycles
+from .shared_buffer import port_reach, static_problem
+from .transport.model import Connection
 
 # ---------------------------------------------------------------------------
 # Geometry model
@@ -53,6 +56,7 @@ class Rect:
 
     extras: Dict[str, Any] = field(default_factory=dict)
     buffer_locations: Optional[Callable[[int], Tuple[BufferLocation, ...]]] = None
+    stream_locations: Optional[Callable[[int], Tuple[StreamLocation, ...]]] = None
     _locations: Dict[int, Tuple[BufferLocation, ...]] = field(default_factory=dict, repr=False, compare=False)
 
     def locations_at(self, anchor_row: int) -> Tuple[BufferLocation, ...]:
@@ -69,12 +73,13 @@ class Rect:
 class NodeSpec:
     """Placement-facing adapter for one kernel node."""
 
-    node: Any
     name: str
-    index: int
     rect: Rect
     anchor: Optional[Tuple[int, int]] = None  # local device coordinates
     outputs: frozenset = frozenset()  # its output port groups: their unshared buffers take an MM2S channel
+    cycles: int = 0  # one call of its kernels (`estimate.kernel_cycles`)
+    arrival: Tuple[int, int] = (0, 0)  # (latency, interval) of its slowest leg from the graph's inputs
+    departure: Tuple[int, int] = (0, 0)  # the same of its legs to the graph's outputs
 
 
 @dataclass(frozen=True)
@@ -89,41 +94,22 @@ class EdgeSpec:
     src_group: str = ''
     dst_group: str = ''
     port_pairs: Tuple[Tuple[int, int], ...] = ()
-    shared: bool = False  # both ports must pin the buffer to the same memory: one buffer, no DMA
-    shareable: bool = False  # the ports could hand over one buffer, placed right (`shared_buffer.static_problem`)
+    dst_tensor: Optional[str] = None  # the consumer's input the edge feeds
+    shared: bool = False  # the consumer requires it in shared memory: one buffer both ports reach, no DMA
+    shareable: bool = False  # its port pairs may each be one buffer, placed right (`shared_buffer.static_problem`)
+    cycles: Tuple[int, int] = (0, 0)  # (latency, interval) the leg takes where it is not one shared buffer
 
 
 @dataclass
 class GraphSpec:
-    """Kernel-only placement DAG."""
+    """The kernels placement places, the edges between them, and the device's rules it places them by."""
 
-    order: List[str]
     specs: Dict[str, NodeSpec]
     edges: List[EdgeSpec]
-    preds: Dict[str, List[str]]
-    succs: Dict[str, List[str]]
+    stream_ports: Dict[str, int]  # a switch's ports each way
     dma_channels: int = 0  # a tile DMA's channels each way; 0 counts none
-    _between: Dict[Tuple[str, str], Tuple[EdgeSpec, ...]] = field(default_factory=dict, repr=False, compare=False)
-
-    def edges_between(self, src: str, dst: str) -> Tuple[EdgeSpec, ...]:
-        """The edges from `src` to `dst`: the search asks for them of every pair of ops it checks, so they are
-        indexed once."""
-        if not self._between and self.edges:
-            for edge in self.edges:
-                self._between[(edge.src, edge.dst)] = self._between.get((edge.src, edge.dst), ()) + (edge,)
-        return self._between.get((src, dst), ())
-
-    @cached_property
-    def partners(self) -> Dict[Tuple[str, str, int], Tuple[str, str, int]]:
-        """By kernel buffer port (op, group, port), the port it may hand one shared buffer to; a port not listed is
-        copied by a DMA wherever the two are placed."""
-        partners = {}
-        for edge in self.edges:
-            if edge.shareable:
-                for src_port, dst_port in edge.port_pairs:
-                    partners[edge.src, edge.src_group, src_port] = (edge.dst, edge.dst_group, dst_port)
-                    partners[edge.dst, edge.dst_group, dst_port] = (edge.src, edge.src_group, src_port)
-        return partners
+    alternating_horizontal: bool = False  # AIE: odd-row cores reach east, not west (`memory_reach`)
+    below: Dict[str, Tuple[Tuple[str, str, int], ...]] = field(default_factory=dict)  # `_transport_edges`
 
 
 @dataclass
@@ -135,6 +121,7 @@ class Placed:
     y: int
     rect: Rect
     _banks: Dict[Tuple[str, int], frozenset] = field(default_factory=dict, repr=False, compare=False)
+    _reach: Dict[Tuple[str, int], frozenset] = field(default_factory=dict, repr=False, compare=False)
 
     @cached_property
     def tiles(self) -> frozenset:
@@ -144,7 +131,7 @@ class Placed:
         )
 
     def banks(self, group: str, port: int) -> frozenset:
-        """The (column, row, banks) its port's buffers are pinned to; asked of a placement at every state below it."""
+        """The (column, row, banks) its port's buffers are pinned to."""
         key = (group, int(port))
         if key not in self._banks:
             self._banks[key] = frozenset(
@@ -154,32 +141,37 @@ class Placed:
             )
         return self._banks[key]
 
-    @cached_property
-    def memory(self) -> frozenset:
-        """The tiles whose memory its transport-visible buffers use, as it declares them."""
-        return frozenset((self.x + loc.rel_col, self.y + loc.rel_row) for loc in self.rect.locations_at(self.y))
+    def reach(self, group: str, port: int, alternating_horizontal: bool) -> frozenset:
+        """The tiles whose memory the one kernel reading an input port reaches (`shared_buffer.port_reach`)."""
+        key = (group, int(port))
+        if key not in self._reach:
+            locations = self.rect.locations_at(self.y)
+            self._reach[key] = port_reach(locations, group, port, self.x, self.y, alternating_horizontal)
+        return self._reach[key]
+
+    def port_tiles(self, group: str, port: int) -> frozenset:
+        """The tiles a port streams from or to: its buffers', or its stream's kernel's (`routing.port_tiles`)."""
+        tiles = frozenset((col, row) for col, row, _ in self.banks(group, port))
+        if tiles or self.rect.stream_locations is None:
+            return tiles
+        return frozenset(
+            (self.x + loc.rel_col, self.y + loc.rel_row)
+            for loc in self.rect.stream_locations(self.y)
+            if loc.port_group == group and loc.port == int(port)
+        )
 
 
 class PlacementInfeasibleError(ConfigRefused):
-    """Raised when no legal placement exists within the current search domain."""
+    """Raised when no legal placement exists within the current search domain; `proven` False where the placer only
+    found none in its time."""
+
+    def __init__(self, message: str, proven: bool = True):
+        super().__init__(message)
+        self.proven = proven
 
 
 # ---------------------------------------------------------------------------
-# Generic helpers
-# ---------------------------------------------------------------------------
-
-
-def _interval_distance(a0: float, a1: float, b0: float, b1: float) -> float:
-    """Distance between two closed 1D intervals."""
-    if a1 < b0:
-        return b0 - a1
-    if b1 < a0:
-        return a0 - b1
-    return 0.0
-
-
-# ---------------------------------------------------------------------------
-# Footprint parsing
+# Footprint parsing and geometry
 # ---------------------------------------------------------------------------
 
 
@@ -244,11 +236,6 @@ def _coerce_rect(footprint: Any) -> Rect:
     )
 
 
-# ---------------------------------------------------------------------------
-# Geometry
-# ---------------------------------------------------------------------------
-
-
 def _face_abs_box(placed: Placed, face: PortFace) -> Tuple[float, float, float, float]:
     """
     Return the absolute axis-aligned span of a face as:
@@ -276,112 +263,144 @@ def _face_abs_box(placed: Placed, face: PortFace) -> Tuple[float, float, float, 
     raise ValueError(f'Unsupported face side: {face.side!r}')
 
 
-def _face_cost(
-    a_box: Tuple[float, float, float, float],
-    b_box: Tuple[float, float, float, float],
-    lam: float,
-) -> float:
-    """Minimum weighted Manhattan distance between two face boxes."""
-    ax0, ax1, ay0, ay1 = a_box
-    bx0, bx1, by0, by1 = b_box
-    dx = _interval_distance(ax0, ax1, bx0, bx1)
-    dy = _interval_distance(ay0, ay1, by0, by1)
-    return dx + lam * dy
-
-
-_UNSHARED_BUFFER_COST = 16.0
-"""What a shareable direct edge costs on top of its distance when its two advertised buffer locations do not
-coincide: its buffer is then copied by a DMA rather than shared, which is worth a long detour to avoid."""
-
-
-def _edge_cost(edge: EdgeSpec, src: Placed, dst: Placed, lam: float) -> float:
-    cost = _edge_cost_between_placements(src, dst, lam)
-    if not edge.shareable:
-        return cost
-    for src_port, dst_port in edge.port_pairs:
-        written = _absolute_bank_locations(src, group=edge.src_group, port=src_port)
-        read = _absolute_bank_locations(dst, group=edge.dst_group, port=dst_port)
-        if written and read and written != read:
-            cost += _UNSHARED_BUFFER_COST
-    return cost
-
-
-def _edge_cost_between_placements(src: Placed, dst: Placed, lam: float) -> float:
-    return _face_cost(
-        _face_abs_box(src, src.rect.output_face),
-        _face_abs_box(dst, dst.rect.input_face),
-        lam,
-    )
-
-
-def _absolute_bank_locations(
-    placed: Placed,
-    *,
-    group: str,
-    port: int,
-) -> frozenset:
-    return placed.banks(group, port)
-
-
-def _aliased_tiles(producer: Placed, consumer: Placed, graph: GraphSpec) -> set[Tuple[int, int]]:
-    """The tiles where a direct edge from `producer` to `consumer` puts one buffer both ports name."""
-    tiles = set()
-    for edge in graph.edges_between(producer.name, consumer.name):
-        if not (edge.direct and edge.one_to_one):
+def _places(spec: NodeSpec, W: int, H: int, pairable: frozenset) -> List[Tuple[Placed, frozenset]]:
+    """Every place of an op on a `W` x `H` array -- its pinned place alone where it has one -- with the input ports,
+    (group, port), whose buffers would lie past the array's far edges there: the place requires those read in their
+    producer's buffer, which only `pairable` ones may be. Its kernels lie within the array, and every other buffer
+    short of its far edges: one may lie west of or below the placement region, where the device starts before it."""
+    if spec.anchor is not None:
+        candidates = [Placed(spec.name, spec.anchor[0], spec.anchor[1], spec.rect)]
+    else:
+        rows, columns = range(H - spec.rect.h + 1), range(W - spec.rect.w + 1)
+        candidates = [Placed(spec.name, x, y, spec.rect) for y in rows for x in columns]
+    found = []
+    for p in candidates:
+        if p.x < 0 or p.y < 0 or p.x + p.rect.w > W or p.y + p.rect.h > H:
             continue
-        for src_port, dst_port in edge.port_pairs:
-            source = _absolute_bank_locations(producer, group=edge.src_group, port=src_port)
-            if source and source == _absolute_bank_locations(consumer, group=edge.dst_group, port=dst_port):
-                tiles.update((col, row) for col, row, _ in source)
-    return tiles
+        past = frozenset(
+            (loc.port_group, loc.port)
+            for loc in p.rect.locations_at(p.y)
+            if p.x + loc.rel_col >= W or p.y + loc.rel_row >= H
+        )
+        if past <= pairable:
+            found.append((p, past))
+    if spec.anchor is not None and not found:
+        raise PlacementInfeasibleError(f'Invalid fixed anchor for {spec.name}: out of bounds.')
+    return found
 
 
-def _shared_edges_coincide(a: Placed, b: Placed, graph: GraphSpec) -> bool:
-    """Whether every edge between the two that must be shared pins both of its ports to the same
-    memory -- the same (column, row, banks) -- so the compiler has one buffer to place, and no DMA."""
-    for edge in (*graph.edges_between(a.name, b.name), *graph.edges_between(b.name, a.name)):
-        if not edge.shared:
-            continue
-        src, dst = (a, b) if edge.src == a.name else (b, a)
-        for src_port, dst_port in edge.port_pairs:
-            written = _absolute_bank_locations(src, group=edge.src_group, port=src_port)
-            if location_problem(written, _absolute_bank_locations(dst, group=edge.dst_group, port=dst_port)):
-                return False
-    return True
+def share_offsets(
+    src: Rect, src_group: str, dst: Rect, dst_group: str, port_pairs, H: int, alternating_horizontal: bool
+) -> Dict[Tuple[int, int], set]:
+    """Per (producer anchor row, consumer anchor row) of an array `H` rows high, the consumer's column offsets at
+    which every port pair hands over one buffer its reading core reaches (`pair_offsets`); none where no placement
+    shares them all. An op's buffer locations depend on its anchor row alone, so each pair of rows shares at a few
+    column offsets or none."""
+    found = None
+    for src_port, dst_port in port_pairs:
+        aligned = pair_offsets(src, src_group, src_port, dst, dst_group, dst_port, H, alternating_horizontal)
+        found = aligned if found is None else {rows: found[rows] & aligned[rows] for rows in found}
+    return {rows: offsets for rows, offsets in (found or {}).items() if offsets}
 
 
-def _placements_conflict(a: Placed, b: Placed, graph: GraphSpec) -> bool:
-    """Two ops conflict when they share a tile, or when one keeps buffers in a tile's memory that the
-    other occupies or also keeps buffers in -- unless it is the one buffer a direct edge between them
-    shares there."""
-    if a.tiles & b.tiles:
-        return True
-    clash = (a.memory & b.memory) | ((a.memory - a.tiles) & b.tiles) | ((b.memory - b.tiles) & a.tiles)
-    return bool(clash) and bool(clash - _aliased_tiles(a, b, graph) - _aliased_tiles(b, a, graph))
+def pair_offsets(
+    src: Rect,
+    src_group: str,
+    src_port: int,
+    dst: Rect,
+    dst_group: str,
+    dst_port: int,
+    H: int,
+    alternating_horizontal: bool,
+    reached: bool = True,
+) -> Dict[Tuple[int, int], set]:
+    """Per (producer anchor row, consumer anchor row), the consumer's column offsets at which the two ports hand over
+    one buffer (`_alignments`): one both pin, or with `reached`, one the consumer's reading core reaches."""
+    found = {}
+    for src_row in range(H - src.h + 1):
+        written = Placed('', 0, src_row, src).banks(src_group, src_port)
+        for dst_row in range(H - dst.h + 1):
+            reader = Placed('', 0, dst_row, dst)
+            reach = reader.reach(dst_group, dst_port, alternating_horizontal) if reached else frozenset()
+            found[src_row, dst_row] = _alignments(written, reader.banks(dst_group, dst_port), reach)
+    return found
 
 
-def _in_bounds(p: Placed, W: int, H: int) -> bool:
-    return (
-        p.x >= 0
-        and p.y >= 0
-        and p.x + p.rect.w <= W
-        and p.y + p.rect.h <= H
-        # A buffer may sit west of or below the placement region -- the device starts before it -- but
-        # never past its far edges, where the device ends.
-        and all(col < W and row < H for col, row in p.memory)
-    )
+def _alignments(written: frozenset, read: frozenset, reach: frozenset) -> set:
+    """The column offsets moving a reader whose port pins `read` and whose core reaches `reach` to share the buffer
+    pinned at `written` (`shared_buffer.location_problem`)."""
+    if not written or not read:
+        return set()
+    offsets = set()
+    offset = min(written)[0] - min(read)[0]
+    if frozenset((col + offset, row, banks) for col, row, banks in read) == written:
+        offsets.add(offset)
+    if len(written) == 1:
+        ((col, row, _),) = written
+        offsets.update(col - reached_col for reached_col, reached_row in reach if reached_row == row)
+    return offsets
+
+
+def _buffers(graph: GraphSpec, placed: Dict[str, Placed], shares) -> Dict[str, List[Tuple[int, int, Tuple[int, ...]]]]:
+    """Where each op's buffer locations sit once placed, as (column, row, banks) in the order it lists them: where
+    it lists them, but an input port that reads its producer's buffer (`shares`, by (op, group, port)) where the
+    producer pins that buffer, which its reading core reaches."""
+    written = {
+        (edge.dst, edge.dst_group, dst_port): (edge.src, edge.src_group, src_port)
+        for edge in graph.edges
+        for src_port, dst_port in edge.port_pairs
+    }
+    buffers = {}
+    for name, p in placed.items():
+        buffers[name] = []
+        for loc in p.rect.locations_at(p.y):
+            at = (p.x + loc.rel_col, p.y + loc.rel_row, tuple(loc.banks))
+            if (name, loc.port_group, loc.port) in shares:
+                src, group, port = written[name, loc.port_group, loc.port]
+                source = placed[src].banks(group, port)
+                if at not in source:  # read where the producer pins it, not pinned there alike
+                    (at,) = source
+            buffers[name].append(at)
+    return buffers
 
 
 # ---------------------------------------------------------------------------
-# Graph helpers
+# The placement graph
 # ---------------------------------------------------------------------------
 
 
-def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
-    """Build placement connectivity from collected semantic transport legs."""
+def _transport_entries(ctx) -> list:
     state = ctx.ir.physical.plan.get('_memory_plan_state')
     if state is None:
         raise RuntimeError('Placement requires collected transport entries.')
+    return state['entries']
+
+
+def _copy_cycles(ctx, entry, leg: Connection) -> Tuple[int, int]:
+    """(latency, interval) a classified leg takes where it is not one shared buffer (`estimate.leg_cycles`)."""
+    return leg_cycles(leg, entry.decision.realization, False, ctx.ir.execution, ctx.device)
+
+
+def _boundary_cycles(ctx, kernel_names: Sequence[str]) -> Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """By kernel, the (latency, interval) of its slowest leg from the graph's inputs and of its slowest to its
+    outputs."""
+    boundary = {name: [(0, 0), (0, 0)] for name in kernel_names}
+    for entry in _transport_entries(ctx):
+        if entry.producer.node is None:
+            for connection in entry.consumers:
+                ends = boundary[connection.consumer.node.name]
+                ends[0] = tuple(map(max, ends[0], _copy_cycles(ctx, entry, connection)))
+        elif entry.graph_output:
+            leg = Connection(entry.logical_tensor, entry.producer, None)
+            ends = boundary[entry.producer.node.name]
+            ends[1] = tuple(map(max, ends[1], _copy_cycles(ctx, entry, leg)))
+    return {name: tuple(ends) for name, ends in boundary.items()}
+
+
+def _transport_edges(ctx, kernel_names: Sequence[str]) -> Tuple[List[EdgeSpec], Dict[str, tuple]]:
+    """Build placement connectivity from collected semantic transport legs: the kernel-to-kernel edges, and by kernel
+    its (direction, group, port) streams from or to below -- a PLIO or a memory tile."""
+    entries = _transport_entries(ctx)
 
     def producer_ports(entry) -> Tuple[int, ...]:
         if entry.unit is not None:
@@ -400,8 +419,20 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
         return consumer.selected_ports(int(binding.count))
 
     kernel_set = set(kernel_names)
+    below: Dict[str, set] = {name: set() for name in kernel_names}
+    for entry in entries:
+        memtile = entry.decision is not None and entry.decision.realization == 'memtile'
+        if entry.producer.node is not None and (memtile or entry.graph_output):
+            below[entry.producer.node.name].update(
+                ('outputs', entry.producer.group, port) for port in producer_ports(entry)
+            )
+        for connection in entry.consumers:
+            if connection.consumer is not None and (memtile or entry.producer.node is None):
+                below[connection.consumer.node.name].update(
+                    ('inputs', connection.consumer.group, port) for port in consumer_ports(entry, connection.consumer)
+                )
     producer_port_uses = {}
-    for entry in state['entries']:
+    for entry in entries:
         if entry.producer.node is None:
             continue
         for port in producer_ports(entry):
@@ -410,7 +441,7 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
 
     edges = []
     seen = set()
-    for entry in state['entries']:
+    for entry in entries:
         src = entry.producer.node
         if src is None:
             continue
@@ -442,7 +473,6 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                     for problem in (
                         static_problem(
                             ctx,
-                            entry.producer.tensor,
                             producer_inst,
                             entry.producer.group,
                             p_port,
@@ -482,339 +512,78 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                     src_group=entry.producer.group,
                     dst_group=consumer.group,
                     port_pairs=tuple(zip(entry_producer_ports, entry_consumer_ports)) if direct else (),
+                    dst_tensor=consumer.tensor,
                     shared=shared,
-                    shareable=direct and one_to_one and not problems,
+                    shareable=one_to_one and not problems,
+                    cycles=_copy_cycles(ctx, entry, connection),
                 )
             )
-    return edges
-
-
-def _topological_order(
-    names: Sequence[str],
-    edges: Sequence[EdgeSpec],
-    stable_index: Dict[str, int],
-) -> List[str]:
-    indeg = {n: 0 for n in names}
-    succs: Dict[str, List[str]] = {n: [] for n in names}
-
-    for e in edges:
-        if e.src in indeg and e.dst in indeg:
-            indeg[e.dst] += 1
-            succs[e.src].append(e.dst)
-
-    ready = sorted([n for n, d in indeg.items() if d == 0], key=lambda n: stable_index[n])
-    order: List[str] = []
-
-    while ready:
-        n = ready.pop(0)
-        order.append(n)
-        for m in sorted(succs[n], key=lambda x: stable_index[x]):
-            indeg[m] -= 1
-            if indeg[m] == 0:
-                ready.append(m)
-                ready.sort(key=lambda x: stable_index[x])
-
-    if len(order) != len(names):
-        raise RuntimeError(f'placement: the kernel graph has a cycle through {sorted(set(names) - set(order))}.')
-    return order
+    return edges, {name: tuple(sorted(ends)) for name, ends in below.items()}
 
 
 def _placement_hint(ctx, node) -> Dict[str, Any]:
-    """Where a kernel is pinned: the user's placement directive, else the design search's choice."""
-    return node.directives.get('placement') or ctx.ir.optimizer.get('placement', {}).get(node.name, {})
+    """Where the user pins a kernel (its placement directive)."""
+    return node.directives.get('placement') or {}
+
+
+def placer_time(ctx) -> float:
+    """The CP-SAT placer's deterministic time per solve (AIEConfig PlacerTime), in the solver's units -- about a second
+    of one worker's search each, the same however loaded the machine."""
+    if 'PlacerSeconds' in ctx.aie_config:
+        raise ValueError(
+            "AIEConfig PlacerSeconds is replaced by PlacerTime, the placer's deterministic time per solve "
+            '(default 400).'
+        )
+    return float(ctx.aie_config.get('PlacerTime', 400))
+
+
+def instance_rect(inst, row_offset: int) -> Rect:
+    """The tiles an instance takes and where it pins its buffers and streams, an anchor row counted from the array's
+    row `row_offset`."""
+    footprint = inst.variant.footprint(inst.node, inst.config)
+    if footprint is None:
+        raise RuntimeError(f'{inst.node.name}: kernel variant did not provide a footprint.')
+    rect = _coerce_rect(footprint)
+    rect.buffer_locations = lambda anchor_row: inst.variant.buffer_locations(
+        inst.node, inst.config, int(anchor_row) + row_offset
+    )
+    rect.stream_locations = lambda anchor_row: inst.variant.stream_locations(
+        inst.node, inst.config, int(anchor_row) + row_offset
+    )
+    return rect
 
 
 def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
-    specs: Dict[str, NodeSpec] = {}
-    stable_index: Dict[str, int] = {}
-
-    for idx, inst in enumerate(ctx.ir.execution):
-        node = inst.node
-        footprint = inst.variant.footprint(node, inst.config)
-        if footprint is None:
-            raise RuntimeError(f'{node.name}: kernel variant did not provide a footprint.')
-
-        rect = _coerce_rect(footprint)
-        rect.buffer_locations = lambda anchor_row, inst=inst, node=node: inst.variant.buffer_locations(
-            node, inst.config, int(anchor_row) + row_offset
-        )
-
-        placement_hint = _placement_hint(ctx, node)
+    names = [inst.name for inst in ctx.ir.execution]
+    edges, below = _transport_edges(ctx, names)
+    boundary = _boundary_cycles(ctx, names)
+    specs = {}
+    for inst in ctx.ir.execution:
+        placement_hint = _placement_hint(ctx, inst.node)
         anchor: Optional[Tuple[int, int]] = None
         if placement_hint.get('col') is not None and placement_hint.get('row') is not None:
             anchor = (
                 int(placement_hint['col']) - col_offset,
                 int(placement_hint['row']) - row_offset,
             )
-
-        specs[node.name] = NodeSpec(
-            node=node,
-            name=node.name,
-            index=idx,
-            rect=rect,
+        specs[inst.name] = NodeSpec(
+            name=inst.name,
+            rect=instance_rect(inst, row_offset),
             anchor=anchor,
             outputs=frozenset(binding.group for binding in inst.ports.outputs.values()),
+            cycles=kernel_cycles(inst, ctx.device),
+            arrival=boundary[inst.name][0],
+            departure=boundary[inst.name][1],
         )
-        stable_index[node.name] = idx
-
-    edges = _transport_edges(ctx, list(specs))
-
-    preds = {name: [] for name in specs}
-    succs = {name: [] for name in specs}
-
-    for e in edges:
-        preds[e.dst].append(e.src)
-        succs[e.src].append(e.dst)
-
-    order = _topological_order(list(specs), edges, stable_index)
-
+    device = ctx.device
     return GraphSpec(
-        order=order,
         specs=specs,
         edges=edges,
-        preds=preds,
-        succs=succs,
-        dma_channels=int(ctx.device.tile_dma.channels),
+        dma_channels=int(device.tile_dma.channels),
+        alternating_horizontal=device.alternating_horizontal,
+        stream_ports=dict(device.stream_switch_ports),
+        below=below,
     )
-
-
-# ---------------------------------------------------------------------------
-# Beam search
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _State:
-    """A partial placement: its cost, its compactness (the sum of col * H + row over its ops: smaller packs the
-    array tighter, from the west and the bottom), its ops, and which ops claim each tile, by its core or memory."""
-
-    cost: float
-    compactness: int
-    placed: Dict[str, Placed]
-    claims: Dict[Tuple[int, int], Tuple[str, ...]]
-    dma: Dict[Tuple[Tuple[int, int], str], int] = field(default_factory=dict)  # (tile, MM2S|S2MM) -> buffers
-
-    def extend(self, p: Placed, cost: float, compactness: int, graph: GraphSpec) -> '_State':
-        """This placement with `p` added, which brings it to `cost` and `compactness`."""
-        claims = dict(self.claims)
-        for cell in p.tiles | p.memory:
-            claims[cell] = claims.get(cell, ()) + (p.name,)
-        dma = dict(self.dma)
-        for key, count in self._dma_use(p, graph).items():
-            dma[key] = dma.get(key, 0) + count
-        return _State(cost, compactness, {**self.placed, p.name: p}, claims, dma)
-
-    def fits(self, p: Placed, graph: GraphSpec) -> bool:
-        """Whether `p` is legal beside the ops placed (`fits_memory`) with no tile's DMA needing more channels than
-        it has."""
-        return self.fits_memory(p, graph) and (
-            not graph.dma_channels
-            or all(self.dma.get(key, 0) + n <= graph.dma_channels for key, n in self._dma_use(p, graph).items())
-        )
-
-    def fits_memory(self, p: Placed, graph: GraphSpec) -> bool:
-        """Whether `p`'s tiles and buffers are legal beside the ops placed: only an op claiming one of its tiles can
-        conflict with it, and only a neighbour can share a buffer with it."""
-        if any(_placements_conflict(p, self.placed[name], graph) for name in self._claimants(p)):
-            return False
-        return all(
-            _shared_edges_coincide(p, self.placed[name], graph)
-            for name in (*graph.preds[p.name], *graph.succs[p.name])
-            if name in self.placed
-        )
-
-    def _dma_use(self, p: Placed, graph: GraphSpec) -> Dict[Tuple[Tuple[int, int], str], int]:
-        """The DMA channels placing `p` decides, by (tile, direction): each kernel buffer that is not one shared
-        buffer takes a channel on the tile holding it (`verify_tile_dma_channels`). A port with no partner to
-        share with is decided now; one with a partner when both are placed, for both of them."""
-        if not graph.dma_channels:
-            return {}
-        use: Dict[Tuple[Tuple[int, int], str], int] = {}
-
-        def take(op: Placed, group: str, port: int) -> None:
-            direction = 'MM2S' if group in graph.specs[op.name].outputs else 'S2MM'
-            for location in op.rect.locations_at(op.y):
-                if location.port_group == group and location.port == port:
-                    key = ((op.x + location.rel_col, op.y + location.rel_row), direction)
-                    use[key] = use.get(key, 0) + 1
-
-        for group, port in sorted({(loc.port_group, int(loc.port)) for loc in p.rect.locations_at(p.y)}):
-            partner = graph.partners.get((p.name, group, port))
-            if partner is None:
-                take(p, group, port)
-                continue
-            other = self.placed.get(partner[0])
-            if other is None:
-                continue
-            written = p.banks(group, port)
-            if not written or written != other.banks(partner[1], partner[2]):
-                take(p, group, port)
-                take(other, partner[1], partner[2])
-        return use
-
-    def _claimants(self, p: Placed) -> set:
-        return {name for cell in p.tiles | p.memory for name in self.claims.get(cell, ())}
-
-
-def _places(spec: NodeSpec, W: int, H: int) -> List[List[Placed]]:
-    """Every in-bounds place of an op, a list per anchor row, west to east; its pinned place alone where it has one."""
-    if spec.anchor is not None:
-        pinned = Placed(spec.name, spec.anchor[0], spec.anchor[1], spec.rect)
-        if not _in_bounds(pinned, W, H):
-            raise PlacementInfeasibleError(f'Invalid fixed anchor for {spec.name}: out of bounds.')
-        return [[pinned]]
-    xs, ys = range(W - spec.rect.w + 1), range(H - spec.rect.h + 1)
-    rows = ([Placed(spec.name, x, y, spec.rect) for x in xs] for y in ys)
-    return [places for row in rows if (places := [p for p in row if _in_bounds(p, W, H)])]
-
-
-def _share_slots(graph: GraphSpec, H: int) -> Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]]:
-    """Where an op's neighbour may sit to share a buffer of a shareable edge between them: by (op, neighbour) and
-    the op's anchor row, the neighbour's (column offset, anchor row) places. An op's buffer locations depend on its
-    anchor row alone, so each port's pair of rows lines its two buffers up at one column offset or none."""
-    slots: Dict[Tuple[str, str], Dict[int, List[Tuple[int, int]]]] = {}
-    for edge in graph.edges:
-        if not edge.shareable:
-            continue
-        src, dst = graph.specs[edge.src].rect, graph.specs[edge.dst].rect
-        for src_row in range(H - src.h + 1):
-            written = [Placed(edge.src, 0, src_row, src).banks(edge.src_group, port) for port, _ in edge.port_pairs]
-            for dst_row in range(H - dst.h + 1):
-                read = [Placed(edge.dst, 0, dst_row, dst).banks(edge.dst_group, port) for _, port in edge.port_pairs]
-                for offset in sorted({_alignment(*buffers) for buffers in zip(written, read)} - {None}):
-                    slots.setdefault((edge.src, edge.dst), {}).setdefault(src_row, []).append((offset, dst_row))
-                    slots.setdefault((edge.dst, edge.src), {}).setdefault(dst_row, []).append((-offset, src_row))
-    return slots
-
-
-def _alignment(written: frozenset, read: frozenset) -> Optional[int]:
-    """The column offset that moves a read buffer's locations onto its written one's, or None."""
-    if not written or not read:
-        return None
-    offset = min(written)[0] - min(read)[0]
-    return offset if frozenset((col + offset, row, banks) for col, row, banks in read) == written else None
-
-
-def _placement_order(graph: GraphSpec, slots: Dict[Tuple[str, str], Any]) -> List[str]:
-    """The order the beam places ops in: the pinned ones, then each time the op that may share the most buffers with
-    the ops placed (`_share_slots`), then with the most neighbours among them, earliest in dataflow first. A consumer
-    that may share its producer's buffer thus follows it."""
-    shares: Dict[Tuple[str, str], int] = {}
-    for edge in graph.edges:
-        pairs = len(edge.port_pairs) if (edge.src, edge.dst) in slots else 0
-        shares[edge.src, edge.dst] = shares.get((edge.src, edge.dst), 0) + pairs
-        shares[edge.dst, edge.src] = shares.get((edge.dst, edge.src), 0) + pairs
-    neighbours = {name: set(graph.preds[name]) | set(graph.succs[name]) for name in graph.specs}
-    position = {name: i for i, name in enumerate(graph.order)}
-
-    order = [name for name in graph.order if graph.specs[name].anchor is not None]
-    placed = set(order)
-    while len(order) < len(graph.order):
-
-        def affinity(name: str) -> Tuple[int, int, int]:
-            near = neighbours[name] & placed
-            return (sum(shares[name, other] for other in near), len(near), -position[name])
-
-        name = max((name for name in graph.order if name not in placed), key=affinity)
-        order.append(name)
-        placed.add(name)
-    return order
-
-
-def _keep(children: List[tuple], width: int) -> List[tuple]:
-    """The partial placements the beam keeps of `children` (cost, compactness, ...): those no other is both cheaper
-    and more compact than, from the cheapest to the most compact, spread evenly when there are more than `width`;
-    then the cheapest of the rest. A cost-led placement can leave gaps no later op fits in; the compact ones keep a
-    packed array placeable."""
-    children.sort(key=lambda child: child[:5])
-    front, rest = [], []
-    for child in children:
-        (front if not front or child[1] < front[-1][1] else rest).append(child)
-    if len(front) > width:
-        return [front[round(i * (len(front) - 1) / (width - 1))] for i in range(width)]
-    return front + rest[: width - len(front)]
-
-
-def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: int) -> Dict[str, Placed]:
-    """
-    Place the ops one at a time (`_placement_order`), keeping `width` partial placements (`_keep`). Each grows by
-    up to three places per anchor row: the westmost legal one; the cheapest legal one, by the edges to the ops placed
-    and the row bias; and the westmost legal one that leaves each neighbour still to place a free place sharing its
-    buffers (`_share_slots`), on whichever side that is (`leaves_room`). Legal includes each tile's DMA channels. The
-    cheapest complete placement wins.
-    """
-    places = {name: _places(spec, W, H) for name, spec in graph.specs.items()}
-    slots = _share_slots(graph, H)
-    incident = {name: [edge for edge in graph.edges if name in (edge.src, edge.dst)] for name in graph.specs}
-
-    def added_cost(p: Placed, placed: Dict[str, Placed]) -> float:
-        cost = mu * p.y
-        for edge in incident[p.name]:
-            if edge.src == p.name and edge.dst in placed:
-                cost += _edge_cost(edge, p, placed[edge.dst], lam)
-            elif edge.dst == p.name and edge.src in placed:
-                cost += _edge_cost(edge, placed[edge.src], p, lam)
-        return cost
-
-    def leaves_room(p: Placed, state: _State, partners: List[str]) -> bool:
-        """Whether each of `partners` has an in-bounds place sharing `p`'s buffers whose tiles nothing holds yet."""
-        held = set(state.claims) | p.tiles
-        return all(
-            any(
-                _in_bounds(q := Placed(other, p.x + offset, row, graph.specs[other].rect), W, H) and not q.tiles & held
-                for offset, row in slots[p.name, other].get(p.y, ())
-            )
-            for other in partners
-        )
-
-    states = [_State(0.0, 0, {}, {})]
-    for name in _placement_order(graph, slots):
-        neighbours = sorted(set(graph.preds[name]) | set(graph.succs[name]))
-        sharers = [other for other in neighbours if (name, other) in slots]
-        costs: Dict[tuple, Dict[Tuple[int, int], float]] = {}  # by the places of the op's placed neighbours
-        children = []
-        for rank, state in enumerate(states):
-            near = tuple((n, state.placed[n].x, state.placed[n].y) for n in neighbours if n in state.placed)
-            known = costs.setdefault(near, {})
-
-            def cost(p: Placed) -> float:
-                if (p.x, p.y) not in known:
-                    known[p.x, p.y] = added_cost(p, state.placed)
-                return known[p.x, p.y]
-
-            partners = [other for other in sharers if other not in state.placed]
-            grown = {}
-            for row in places[name]:
-                westmost = next((p for p in row if state.fits(p, graph)), None)
-                if westmost is None:
-                    continue
-                cheapest = next(p for p in sorted(row, key=lambda p: (cost(p), p.x)) if state.fits(p, graph))
-                grown.update({(p.x, p.y): p for p in (westmost, cheapest)})
-                if partners:
-                    roomy = next((p for p in row if leaves_room(p, state, partners) and state.fits(p, graph)), None)
-                    if roomy is not None:
-                        grown[roomy.x, roomy.y] = roomy
-            children.extend(
-                (state.cost + cost(p), state.compactness + p.x * H + p.y, rank, p.x, p.y, state, p)
-                for p in grown.values()
-            )
-        if not children:
-            if graph.specs[name].anchor is not None:
-                raise PlacementInfeasibleError(f'Invalid fixed anchor for {name}: conflicts with another anchor.')
-            if any(state.fits_memory(p, graph) for state in states for row in places[name] for p in row):
-                raise PlacementInfeasibleError(
-                    f'{name}: every place left beside the {len(states[0].placed)} ops placed before it needs more '
-                    f'than the {graph.dma_channels} DMA channels a tile has each way (each kernel buffer not shared '
-                    'with the kernel at its other end takes one).'
-                )
-            raise PlacementInfeasibleError(
-                f'{name}: no legal place left beside the {len(states[0].placed)} ops placed before it, in any of '
-                f'the {len(states)} partial placements kept.'
-            )
-        states = [
-            state.extend(p, cost, compactness, graph) for cost, compactness, *_, state, p in _keep(children, width)
-        ]
-    return min(states, key=lambda state: (state.cost, state.compactness)).placed
 
 
 # ---------------------------------------------------------------------------
@@ -824,53 +593,34 @@ def _beam_place(graph: GraphSpec, W: int, H: int, lam: float, mu: float, width: 
 
 class PlaceKernels(AIEPass):
     """
-    Graph-aware AIE kernel placement.
+    Graph-aware AIE kernel placement: the placement the constraint solver (`placement_solver`) ranks best by the
+    design's ranking (`ranking.RANKING`, AIEConfig Optimize), deciding which hand-overs are one shared buffer. A design
+    the search tries is ranked against its bound (`solve_placement`); the one it keeps, already ranked, is only laid
+    out (`tidy_placement`).
 
     Parameters
     ----------
     lam:
-        Weight on vertical edge distance in the objective:
+        Weight on vertical edge distance in the layout, the last criterion:
           |Δcol| + lam * |Δrow|
 
     mu:
-        Row-bias weight in the objective:
+        Row-bias weight in the layout:
           + mu * Σ(node.row)
-
-    width:
-        Partial placements the beam search keeps (`_beam_place`), at least 2: the cheapest and the most compact.
     """
 
-    def __init__(self, lam: float = 1.0, mu: float = 0.05, width: int = 16):
-        if int(width) < 2:
-            raise ValueError('PlaceKernels: width must be at least 2, to keep the cheapest and the most compact.')
+    def __init__(self, lam: float = 1.0, mu: float = 0.05):
         self.name = 'place_kernels'
         self._lam = float(lam)
         self._mu = float(mu)
-        self._width = int(width)
 
     def transform(self, model_or_ctx) -> bool:
+        from .placement_solver import solve_placement, tidy_placement  # they build on this module's rules
+        from .ranking import RANKING, optimize_mode
+
         ctx = get_backend_context(model_or_ctx)
         device = ctx.device
-        region, preferred = int(device.column_start), int(device.preferred_column_start)
-        pinned = [_placement_hint(ctx, inst.node).get('col') for inst in ctx.ir.execution]
-        # Start next to the PLIOs when the design fits there, else use the whole region.
-        if preferred > region and all(col is None or int(col) >= preferred for col in pinned):
-            try:
-                placements = self._place(ctx, preferred)
-            except PlacementInfeasibleError:
-                placements = self._place(ctx, region)
-        else:
-            placements = self._place(ctx, region)
-        if placements is None:
-            return False
-        changed = placements != ctx.ir.physical.placements
-        ctx.ir.physical.placements = placements
-        return changed
-
-    def _place(self, ctx, col_offset: int) -> Optional[Dict[str, Dict[str, int]]]:
-        """Every kernel's place in the region from column `col_offset`, or None when there is no kernel."""
-        device = ctx.device
-        row_offset = int(device.row_start)
+        col_offset, row_offset = int(device.column_start), int(device.row_start)
         W = int(device.columns) - col_offset
         H = int(device.rows) - row_offset
         if W <= 0 or H <= 0:
@@ -881,15 +631,32 @@ class PlaceKernels(AIEPass):
 
         graph = _build_graph(ctx, col_offset, row_offset)
         if not graph.specs:
-            return None
+            return False
 
-        placed = _beam_place(graph, W, H, self._lam, self._mu, self._width)
-        return {
+        time, searched = placer_time(ctx), ctx.ir.optimizer.get('placement')
+        if searched is None:
+            floors = ctx.ir.optimizer.get('bound')
+            placed, shares, estimate = solve_placement(graph, W, H, time, RANKING[optimize_mode(ctx)], floors)
+        else:
+            start = {
+                name: Placed(name, int(at['col']) - col_offset, int(at['row']) - row_offset, graph.specs[name].rect)
+                for name, at in searched.items()
+            }
+            first = int(device.preferred_column_start) - col_offset  # the layout packs from the PLIOs' columns
+            estimate = ctx.ir.optimizer['estimate']
+            placed, shares, estimate = tidy_placement(graph, W, H, self._lam, self._mu, first, time, start, estimate)
+        buffers = _buffers(graph, placed, shares)
+        placements = {
             name: {
                 'col': int(p.x + col_offset),
                 'row': int(p.y + row_offset),
                 'width': int(p.rect.w),  # the tiles reserved, not only the anchor
                 'height': int(p.rect.h),
+                'buffers': [[col + col_offset, row + row_offset, list(banks)] for col, row, banks in buffers[name]],
             }
             for name, p in placed.items()
         }
+        changed = placements != ctx.ir.physical.placements
+        ctx.ir.physical.placements = placements
+        ctx.ir.physical.estimate = estimate
+        return changed

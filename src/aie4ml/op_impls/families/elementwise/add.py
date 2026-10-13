@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Dict
 
 from ....aie_types import FloatIntent
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
-from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
+from ...base import KERNEL_BANKS, PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
 from ...utils import (
@@ -187,7 +187,7 @@ class AddOpImplVariant(OpImplVariant):
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode=rounding_mode,
-            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
+            alternating_horizontal=device.alternating_horizontal,
             adopted_staging=None if adopted is None else adopted.port_staging,
             flags=flags,
             microtile=microtile,
@@ -247,9 +247,9 @@ class AddOpImplVariant(OpImplVariant):
         locations = []
         for row in range(int(config.parallelism.cas_num)):
             flow = row_flow(config.alternating_horizontal, int(anchor_row) + row, 1)
-            locations.append(BufferLocation('in1', row, flow.input_col, row, (0, 3)))
-            locations.append(BufferLocation('in2', row, 0, row, (1, 2)))
-            locations.append(BufferLocation('out1', row, flow.output_col, row, (0, 3)))
+            locations.append(BufferLocation('in1', row, flow.input_col, row, PING_PONG_BANKS, reader=(0, row)))
+            locations.append(BufferLocation('in2', row, 0, row, KERNEL_BANKS, reader=(0, row)))
+            locations.append(BufferLocation('out1', row, flow.output_col, row, PING_PONG_BANKS))
         return tuple(locations)
 
     def build_ports(self, node: OpNode, config: AddConfig):

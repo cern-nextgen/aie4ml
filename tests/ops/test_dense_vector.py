@@ -78,7 +78,7 @@ SPLIT = {
 @pytest.mark.parametrize('part, rows', [(AIE1_PART, 2), (PART, 2), (MLV2_PART, 4)], ids=PARTS.keys())
 def test_one_sample_takes_one_row_block(tmp_path, part, rows):
     """The fewest rows of a microtile a Dense of the same microtile reads directly: the chain stays direct. A batch
-    keeps the 2x2 kernel."""
+    takes no vector kernel."""
     ctx = lower(_mlp(), tmp_path / 'one', SPLIT, part=part)
     for name in ('d0_aie', 'd1_aie', 'd2_aie'):
         inst = ctx.ir.execution.get(name)
@@ -88,7 +88,7 @@ def test_one_sample_takes_one_row_block(tmp_path, part, rows):
     assert {('d0_aie', 'd1_aie'), ('d1_aie', 'd2_aie')} <= direct_edges(ctx) and ctx.ir.physical.plan['buffers'] == []
 
     batch = lower(_mlp(rows=8), tmp_path / 'eight', SPLIT, part=part)
-    assert {inst.variant.variant_id for inst in batch.ir.execution} == {'dense.b.r.v1'}
+    assert 'dense.b.r.vector.v1' not in {inst.variant.variant_id for inst in batch.ir.execution}
 
 
 @pytest.mark.requires_vitis

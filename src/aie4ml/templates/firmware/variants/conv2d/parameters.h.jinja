@@ -60,8 +60,6 @@ struct {{L.struct_name}} {
   static constexpr bool POOL = {{ 'true' if P.pool else 'false' }};
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};
-  // The Dense bank contract for a buffer port: activation copies in banks 0 and 3, stack and bias in
-  // bank 1, weights in bank 2.
 {{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
 {{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
   using acc_scalar_t = {{ P.accumulator_tag }};

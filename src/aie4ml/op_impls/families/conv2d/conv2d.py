@@ -18,7 +18,7 @@ from ....ir.graph import (
     input_tensor_for_role,
 )
 from ....passes.utils import sanitize_identifier
-from ...base import BufferLocation, LayoutConversion, OpImplFootprint, OpImplVariant, StreamLocation, cascade_ports
+from ...base import LayoutConversion, OpImplFootprint, OpImplVariant, StreamLocation, cascade_locations, cascade_ports
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -289,7 +289,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             spatial_blocks=spatial_blocks,
             spatial=spatial,
             groups=int(node.metadata['groups']),
-            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
+            alternating_horizontal=device.alternating_horizontal,
             bank_mem_bytes=int(device.bank_mem_bytes),
             flags=Conv2dFlags(use_relu=use_relu, emit_flattened=flatten),
             pool=pool,
@@ -459,8 +459,8 @@ class Conv2dOpImplVariant(OpImplVariant):
                 f'class(es) but the padded frame holds {params["in_cols"]} columns.'
             )
         if self.input_port_kind == PORT_KIND_BUFFER:
-            # Dense's bank schedule: one frame copy per bank (0 and 3) wherever the op contract puts it,
-            # the weights in bank 2 of the kernel's tile, stack and bias in bank 1.
+            # Dense's bank schedule: one frame copy per bank (`PING_PONG_BANKS`) wherever the op contract puts it,
+            # the weights in `WEIGHT_BANK` of the kernel's tile, stack and bias in `STACK_BANK`.
             bank = int(config.bank_mem_bytes)
             for what, size, splits in (
                 (
@@ -618,8 +618,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         )
 
     def buffer_locations(self, _node, config: Conv2dConfig, anchor_row):
-        """Dense's contract (`cascade_ports`), mirroring `place_graph`: each hand-over in banks 0 and 3."""
-        return tuple(BufferLocation(g, p, col, row, (0, 3)) for g, p, row, _, col in cascade_ports(config, anchor_row))
+        """Dense's contract (`cascade_locations`), mirroring `place_graph`."""
+        return cascade_locations(config, anchor_row)
 
     def band_rows(self, node, config: Conv2dConfig) -> int:
         """Output rows one core call covers. A buffer kernel does the whole tile in one call; a

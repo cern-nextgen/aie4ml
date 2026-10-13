@@ -29,6 +29,8 @@ MEASURED = [
     (AIE_ML, _walk((8, 4), (32, 8), (40, 8), offset=(32, 0)), 8),  # padded tiles after each row's data fold
     (AIE_MLV2, _walk((8, 8), (48, 16), (36, 8)), 12),  # full, partial, then zeros: 3 runs
     (AIE_ML, _walk((8, 4), (48, 8), (36, 8)), 24),  # the same on two rows of data: 6 runs, past a BD pool
+    (AIE_ML, _walk((8, 4), (32, 40), (32, 36)), 8),  # a zero row of tiles after 9 data rows: no fourth pad dimension
+    (AIE_MLV2, _walk((8, 4), (48, 48), (48, 44)), 8),  # ... nor on AIE-MLv2
 ]
 
 
@@ -69,7 +71,14 @@ def test_a_padded_walk_of_higher_rank_is_refused_as_unmeasured():
 
 def test_channels_draw_from_the_pool_of_their_parity():
     dma = resolve_device('xilinx_vek280_base_202610_1', {})[0].memtile_dma
-    assert pool_use([4, 8, 8, 8, 8], dma) == [20, 16]
+    assert pool_use([4, 8, 8, 8, 8], dma) == [[20, 16]]
+
+
+def test_ports_past_a_memory_tiles_channels_take_the_next_tiles():
+    # The bf16 dense-chain probe (test_float_sim): an input buffer's 8 writers and 8 readers, 4 BDs each, took
+    # BDs 0-47 of one memory tile and 0-3, 4-7, 24-27, 28-31 of the next.
+    dma = resolve_device('vek385_base', {})[0].memtile_dma
+    assert pool_use([4] * 8, dma) == [[12, 12], [4, 4]]
 
 
 def test_a_compute_tile_port_repeats_its_bd_for_every_loop_past_the_dma_dimensions():

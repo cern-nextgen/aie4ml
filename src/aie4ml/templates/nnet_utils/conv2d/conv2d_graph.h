@@ -38,13 +38,13 @@ public:
       const int tileRow = ROW_START + chain;
       adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
       if constexpr (!STREAM_IO) {
-        // The Dense bank schedule: stack and bias in bank 1, weights in bank 2, and the activations
+        // The Dense bank schedule: stack and bias in the stack bank, weights in the weight bank, and the activations
         // where IN1/OUT1_BUFFER_LOCATIONS put them -- one copy per bank.
         pin_buffer(kk[idx].in[0], ConfigT::IN1_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
-        adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
-        adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
+        adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK);
+        adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, AIE4ML_WEIGHT_BANK);
         if (pos == 0) {  // the chain's first kernel seeds its accumulators with the bias
-          adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 1);
+          adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK);
         }
         if (pos == CAS_LENGTH - 1) {
           pin_buffer(kk[idx].out[0], ConfigT::OUT1_BUFFER_LOCATIONS[chain], COL_START, ROW_START);

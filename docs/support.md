@@ -22,6 +22,20 @@ where it must (`AIEConfig`):
 All rank designs by a rough, relative estimate of cycles, not a timing model: each kernel's multiply-accumulates or loads,
 plus each hand-over's bytes (none where two kernels share a buffer, twice through a memory tile).
 
+Placement keeps a hand-over in one shared buffer where the consumer's core reaches the producer's memory (west, north
+or south; east on AIE odd rows), and decides which hand-overs to share: it solves the whole placement at once
+(OR-Tools CP-SAT), every stream within the switches' ports, ranked like the designs (`Optimize`): latency, interval
+and the hand-overs a DMA copies, then the layout. Each solve takes up to `PlacerTime` (default 400), in the
+solver's deterministic time units (about a second of one worker's search each), so a loaded machine finds the same; a
+rerun may return another placement ranking alike.
+
+The search builds designs in the order of their best case -- every hand-over some placement can share taken as shared
+-- until none left can beat the best placed one, which then is the best there is (`proven`). Whether hand-overs some
+placement shares each can all be shared at once only placement tells, so on a crowded array many designs may rank
+better than they place: at most `SearchBuilds` designs are built (default 4), and the best of them is kept, not proven
+the best. A design placement finds no placement for in its time halves the tiles the designs after it may fill,
+between the fullest design placed and it.
+
 A layer's split can be fixed per layer (`LayerDirectives` in the ONNX config, or the hls4ml layer config); the
 compiler keeps what is given and chooses the rest:
 
@@ -150,9 +164,9 @@ These never become kernels of their own:
   tile on AIE-ML and AIE-MLv2; on AIE1, give the boundary Dense a stream end.
 - An output may feed several layers (branches, residual Adds); each consumer is planned separately.
 - The graph input and output move over PLIO ports, split to match the first and last layers' tiles.
-- Placement starts at the device's first column with PL interfaces, next to the PLIOs, and spreads into the columns
-  before it (from column 1) only when the design does not fit otherwise; each column between a kernel and its PLIO
-  adds about 8 cycles of latency. `AIEConfig: ColumnStart` fixes where the placement region starts.
+- Placement uses every column from column 1; its layout packs east from the device's first column with PL interfaces,
+  next to the PLIOs, and takes the columns before it last, as each column between a kernel and its PLIO adds about 8
+  cycles of latency. `AIEConfig: ColumnStart` fixes where the placement region starts.
 - Not implemented: more than one memory-tile stage between two layers, and AIE-to-PL-to-AIE paths inside a model.
 
 ## Frontends

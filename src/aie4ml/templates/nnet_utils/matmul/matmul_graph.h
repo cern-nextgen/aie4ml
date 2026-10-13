@@ -4,6 +4,7 @@
 #include "matmul.h"
 #include "matmul_block4x2.h"
 #include "matmul_vector.h"
+#include "buffer_location.h"
 #include "parameters.h"
 
 using namespace adf;
@@ -87,47 +88,20 @@ public:
       const int chain = idx / CAS_LENGTH;
       const bool is_last = pos == CAS_LENGTH - 1;
       const bool reverse = ConfigT::ALTERNATING_HORIZONTAL && ((ROW_START + chain) % 2 != 0);
-      const auto lhsLocation = ConfigT::INA_BUFFER_LOCATIONS[idx];
-      const auto rhsLocation = ConfigT::INB_BUFFER_LOCATIONS[idx];
       const int tileCol = COL_START + (reverse ? CAS_LENGTH - 1 - pos : pos);
       const int tileRow = ROW_START + chain;
 
       adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
 
-      if (lhsLocation.bank_count == 1) {
-        adf::location<adf::buffer>(kk[idx].in[0]) = adf::bank(
-          COL_START + lhsLocation.col, ROW_START + lhsLocation.row, lhsLocation.bank0);
-      } else {
-        adf::location<adf::buffer>(kk[idx].in[0]) = {
-          adf::bank(COL_START + lhsLocation.col, ROW_START + lhsLocation.row, lhsLocation.bank0),
-          adf::bank(COL_START + lhsLocation.col, ROW_START + lhsLocation.row, lhsLocation.bank1)
-        };
-      }
+      pin_buffer(kk[idx].in[0], ConfigT::INA_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
 
-      if (rhsLocation.bank_count == 1) {
-        adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(
-          COL_START + rhsLocation.col, ROW_START + rhsLocation.row, rhsLocation.bank0);
-      } else {
-        adf::location<adf::buffer>(kk[idx].in[1]) = {
-          adf::bank(COL_START + rhsLocation.col, ROW_START + rhsLocation.row, rhsLocation.bank0),
-          adf::bank(COL_START + rhsLocation.col, ROW_START + rhsLocation.row, rhsLocation.bank1)
-        };
-      }
+      pin_buffer(kk[idx].in[1], ConfigT::INB_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
 
       // Stack shares one B bank, but let compiler choose the offset.
-      adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
+      adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK);
 
       if (is_last) {
-        const auto outputLocation = ConfigT::OUTC_BUFFER_LOCATIONS[idx / CAS_LENGTH];
-        if (outputLocation.bank_count == 1) {
-          adf::location<adf::buffer>(kk[idx].out[0]) = adf::bank(
-            COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0);
-        } else {
-          adf::location<adf::buffer>(kk[idx].out[0]) = {
-            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0),
-            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank1)
-          };
-        }
+        pin_buffer(kk[idx].out[0], ConfigT::OUTC_BUFFER_LOCATIONS[idx / CAS_LENGTH], COL_START, ROW_START);
       }
     }
   }

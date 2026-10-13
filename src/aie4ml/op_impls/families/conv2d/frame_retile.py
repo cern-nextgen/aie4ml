@@ -10,7 +10,7 @@ from dataclasses import asdict
 
 import numpy as np
 
-from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
+from ...base import PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PortBinding, PortMap
 from .common import describe_frame_staging, describe_logical_staging
 from .config import FrameRetileConfig
@@ -30,7 +30,7 @@ class FrameRetileOpImplVariant(OpImplVariant):
 
     def validate_config(self, node, config: FrameRetileConfig, device) -> None:
         # The op contract's bank schedule, as for the conv it feeds: one copy of each kernel's input,
-        # and of its frame, per bank (0 and 3), its stack in bank 1.
+        # and of its frame, per bank (`PING_PONG_BANKS`), its stack in `STACK_BANK`.
         frame = int(np.prod(config.frame_view.tile))
         for what, size in [('frame', frame)] + [('input', window.transfer_bytes) for window in config.windows]:
             if int(size) > int(config.bank_mem_bytes):
@@ -42,12 +42,12 @@ class FrameRetileOpImplVariant(OpImplVariant):
 
     def buffer_locations(self, _node, config: FrameRetileConfig, anchor_row):
         """The op contract (`row_flow`), as for Dense and the conv it feeds: each kernel's input and frame
-        in banks 0 and 3 of the neighbouring tile both kernels of the hand-over reach."""
+        in `PING_PONG_BANKS` of the neighbouring tile both kernels of the hand-over reach."""
         locations = []
         for window in range(int(config.parallelism.cas_num)):
             flow = row_flow(config.alternating_horizontal, int(anchor_row) + window, 1)
-            locations.append(BufferLocation('in1', window, flow.input_col, window, (0, 3)))
-            locations.append(BufferLocation('out1', window, flow.output_col, window, (0, 3)))
+            locations.append(BufferLocation('in1', window, flow.input_col, window, PING_PONG_BANKS))
+            locations.append(BufferLocation('out1', window, flow.output_col, window, PING_PONG_BANKS))
         return tuple(locations)
 
     def kernel_params(self, node, config: FrameRetileConfig):

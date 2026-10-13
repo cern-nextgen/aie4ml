@@ -8,6 +8,7 @@
 #include "dense_bias_relu_stream.h"
 #include "dense_block4x2.h"
 #include "dense_vector.h"
+#include "buffer_location.h"
 #include "parameters.h"
 
 using namespace adf;
@@ -83,36 +84,18 @@ void place_graph(int COL_START, int ROW_START)
     adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
 
     if constexpr (!STREAM_IN) {
-      const auto inputLocation = ConfigT::IN1_BUFFER_LOCATIONS[idx];
-      if (inputLocation.bank_count == 1) {
-        adf::location<adf::buffer>(kk[idx].in[0]) = adf::bank(
-          COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0);
-      } else {
-        adf::location<adf::buffer>(kk[idx].in[0]) = {
-          adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0),
-          adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank1)
-        };
-      }
+      pin_buffer(kk[idx].in[0], ConfigT::IN1_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
     }
 
-    adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
-    adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
+    adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK);
+    adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, AIE4ML_WEIGHT_BANK);
     if (pos == 0) {  // the chain's first kernel seeds its accumulators with the bias
-      adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 1);
+      adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK);
     }
 
     if (is_last) {
       if constexpr (!STREAM_OUT) {
-        const auto outputLocation = ConfigT::OUT1_BUFFER_LOCATIONS[idx / CAS_LENGTH];
-        if (outputLocation.bank_count == 1) {
-          adf::location<adf::buffer>(kk[idx].out[0]) = adf::bank(
-            COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0);
-        } else {
-          adf::location<adf::buffer>(kk[idx].out[0]) = {
-            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0),
-            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank1)
-          };
-        }
+        pin_buffer(kk[idx].out[0], ConfigT::OUT1_BUFFER_LOCATIONS[idx / CAS_LENGTH], COL_START, ROW_START);
       }
     }
   }

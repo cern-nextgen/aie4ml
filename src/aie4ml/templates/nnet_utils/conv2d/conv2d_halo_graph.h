@@ -93,9 +93,9 @@ private:
     using role = conv2d_halo_role<ConfigT, B>;
     constexpr int WTS = 1 + role::TOP + role::BOTTOM;
     adf::location<adf::kernel>(kk[B]) = adf::tile(COL_START, ROW_START + B);
-    adf::location<adf::stack>(kk[B]) = adf::bank(COL_START, ROW_START + B, 1);
-    adf::location<adf::buffer>(kk[B].in[WTS]) = adf::bank(COL_START, ROW_START + B, 2);
-    adf::location<adf::buffer>(kk[B].in[WTS + 1]) = adf::bank(COL_START, ROW_START + B, 1);
+    adf::location<adf::stack>(kk[B]) = adf::bank(COL_START, ROW_START + B, AIE4ML_STACK_BANK);
+    adf::location<adf::buffer>(kk[B].in[WTS]) = adf::bank(COL_START, ROW_START + B, AIE4ML_WEIGHT_BANK);
+    adf::location<adf::buffer>(kk[B].in[WTS + 1]) = adf::bank(COL_START, ROW_START + B, AIE4ML_STACK_BANK);
     pin_buffer(kk[B].in[0], ConfigT::IN1_BUFFER_LOCATIONS[B], COL_START, ROW_START);
     if constexpr (role::TOP) pin_buffer(kk[B].in[1], ConfigT::IN1_BUFFER_LOCATIONS[top_port(B)], COL_START, ROW_START);
     if constexpr (role::BOTTOM)

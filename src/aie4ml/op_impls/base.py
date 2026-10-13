@@ -10,13 +10,18 @@ from .common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortMap
 @dataclass(frozen=True)
 class BufferLocation:
     """A port buffer's footprint-relative location; the op's graph pins it there, ping and pong one
-    per bank. Weights, stacks and cascade resources are not listed."""
+    per bank. Weights, stacks and cascade resources are not listed.
+
+    `reader` is the footprint-relative tile of the kernel whose core reads an input buffer, None for an output:
+    a buffer handed over in shared memory may then sit in any memory that core reaches (`memory_reach`), its
+    producer's, instead of here (`shared_buffer.location_problem`)."""
 
     port_group: str
     port: int
     rel_col: int
     rel_row: int
     banks: Tuple[int, ...]
+    reader: Optional[Tuple[int, int]] = None
 
     def __post_init__(self) -> None:
         if not self.port_group or self.port < 0:
@@ -61,6 +66,22 @@ def row_flow(alternating_horizontal: bool, row: int, cas_length: int) -> RowFlow
     return RowFlow(reversed=False, input_col=-1, output_col=0)
 
 
+STACK_BANK = 1
+"""The bank every op's graph pins each kernel's stack and small parameters (bias, scales) to, in its own tile."""
+WEIGHT_BANK = 2
+"""The bank every op's graph pins each kernel's weights to, in its own tile."""
+KERNEL_BANKS = (STACK_BANK, WEIGHT_BANK)
+PING_PONG_BANKS = (0, 3)
+"""The banks a buffer port's ping and pong take: those `KERNEL_BANKS` leave free in every tile."""
+
+
+def memory_reach(alternating_horizontal: bool, row: int) -> Tuple[Tuple[int, int], ...]:
+    """The tiles, relative to a core on `row`, whose data memory it reads and writes directly: its own, north and
+    south, and west -- east on AIE odd rows, which mirror their memory (`row_flow`)."""
+    side = 1 if alternating_horizontal and int(row) % 2 else -1
+    return ((0, 0), (side, 0), (0, 1), (0, -1))
+
+
 def cascade_ports(config, anchor_row: int):
     """The hand-over ports of a grid of cascades, chain c on row c, as (group, port, row, kernel column, buffer
     column): each kernel's input `in1` (a port per kernel 'outer', per position 'inner'), each chain's output `out1`
@@ -74,6 +95,15 @@ def cascade_ports(config, anchor_row: int):
             yield 'in1', chain * cas_length + pos if outer else pos, chain, col, col + flow.input_col
         last = 0 if flow.reversed else cas_length - 1
         yield 'out1', chain, chain, last, last + flow.output_col
+
+
+def cascade_locations(config, anchor_row: int) -> Tuple[BufferLocation, ...]:
+    """`cascade_ports` as buffer locations, each hand-over in `PING_PONG_BANKS`; each input read by the kernel at its
+    position."""
+    return tuple(
+        BufferLocation(group, port, col, row, PING_PONG_BANKS, reader=(kernel, row) if group == 'in1' else None)
+        for group, port, row, kernel, col in cascade_ports(config, anchor_row)
+    )
 
 
 @dataclass(frozen=True)
@@ -208,10 +238,11 @@ class OpImplVariant:
     def footprint(self, node: OpNode, config: Any) -> OpImplFootprint:
         raise NotImplementedError
 
-    def work(self, node: OpNode, config: Any) -> int:
-        """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which the
-        parallelism search compares designs. A proxy for time, not a measure of it."""
-        raise NotImplementedError(f'{node.name}: {self.variant_id} gives no work estimate to compare designs by.')
+    def work(self, node: OpNode, config: Any) -> Optional[int]:
+        """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which designs
+        are compared (`estimate.kernel_cycles`). A proxy for time, not a measure of it. None for a variant that only
+        moves data, which its loads alone estimate."""
+        return None
 
     def build_ports(self, _node: OpNode, _config: Any) -> PortMap:
         """Assemble the PortMap for this variant.  Must be overridden."""

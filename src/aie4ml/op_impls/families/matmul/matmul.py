@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ....aie_types import FloatIntent
 from ....ir.graph import ExecutionInstance, OpNode, input_role, input_tensor_for_role
-from ...base import BufferLocation, OpImplFootprint, row_flow
+from ...base import KERNEL_BANKS, PING_PONG_BANKS, BufferLocation, OpImplFootprint, row_flow
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, parse_directives
@@ -82,7 +82,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
-            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
+            alternating_horizontal=device.alternating_horizontal,
             flags=MatmulFlags(
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
                 transpose_rhs=io_views[rhs_tensor.name].is_transposed,
@@ -129,10 +129,13 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
                 idx = row * cas_length + pos
                 tile_col = cas_length - 1 - pos if flow.reversed else pos
                 lhs_port = idx if outer else pos
-                locations.append(BufferLocation('inA', lhs_port, tile_col + flow.input_col, row, (0, 3)))
-                locations.append(BufferLocation('inB', idx, tile_col, row, (1, 2)))
+                reader = (tile_col, row)
+                locations.append(
+                    BufferLocation('inA', lhs_port, tile_col + flow.input_col, row, PING_PONG_BANKS, reader)
+                )
+                locations.append(BufferLocation('inB', idx, tile_col, row, KERNEL_BANKS, reader))
             last = 0 if flow.reversed else cas_length - 1
-            locations.append(BufferLocation('outC', row, last + flow.output_col, row, (0, 3)))
+            locations.append(BufferLocation('outC', row, last + flow.output_col, row, PING_PONG_BANKS))
         return tuple(locations)
 
     def build_ports(self, node: OpNode, config: MatmulConfig):

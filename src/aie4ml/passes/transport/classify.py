@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from typing import List
+
 from ...errors import ConfigRefused
 from ...ir import get_backend_context
 from ...ir.graph import ROUTE_MODES
 from ...op_impls.utils.tensor_view import staging_tile_shape
 from ..base import AIEPass
-from ..shared_buffer import other_readers
 from .boundary import direct_boundary_access
 from .descriptors import describes_natural_order, rebase_descriptor_offset
 from .dma_resources import KERNEL_BUFFERS, tile_port_bds
@@ -56,6 +57,15 @@ def gathers(execution, device, leg: Connection) -> bool:
     return bool(device.packet_ordered_merge) and not other_readers(
         execution, leg.producer.tensor, leg.consumer.node.name
     )
+
+
+def other_readers(execution, tensor: str, consumer: str) -> List[str]:
+    """What reads `tensor` besides the kernel graph `consumer`: other kernels, views over it, the graph boundary."""
+    readers = sorted(
+        {inst.name for inst in execution if any(item.tensor == tensor for item in inst.inputs)} - {consumer}
+    )
+    views = [v.name for v in execution.values.values() if v.view is not None and tensor in v.view.sources]
+    return readers + views + (['the graph boundary'] if tensor in execution.graph_outputs else [])
 
 
 def direct_unit(execution, leg: Connection, *, merge: bool) -> TransportUnit:

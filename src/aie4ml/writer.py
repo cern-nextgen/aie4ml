@@ -7,6 +7,8 @@ from shutil import copyfile
 
 from jinja2 import Environment, FileSystemLoader
 
+from .op_impls.base import STACK_BANK, WEIGHT_BANK
+from .passes.shared_buffer import pinned_buffers
 from .passes.utils import sanitize_identifier
 from .serialization import dump_pipeline_ir
 
@@ -101,6 +103,7 @@ class AIEProjectEmitter:
 
             sanitized_name = sanitize_identifier(inst.name)
             entry = _layer(inst, placement, f'L{layer_index}Cfg')
+            entry['op_impl']['parameters']['buffer_locations'] = pinned_buffers(ctx, inst)
             entry.update(
                 index=layer_index,
                 inst_name=sanitized_name,
@@ -117,7 +120,7 @@ class AIEProjectEmitter:
         for L in layers:
             for spec in L.get('artifacts', ()):
                 if 'storage' not in spec:
-                    raise RuntimeError(f"{L['inst_name']}: artifact {spec.get('name')} missing storage metadata.")
+                    raise RuntimeError(f'{L["inst_name"]}: artifact {spec.get("name")} missing storage metadata.')
                 if spec.get('array') is None:
                     continue
 
@@ -172,6 +175,8 @@ class AIEProjectEmitter:
             'plio_bitwidth': ctx.device.plio_width_bits,
             'iterations': int(ctx.aie_config['Iterations']),
             'pl_freq_mhz': float(ctx.aie_config['PLClockFreqMHz']),
+            'stack_bank': STACK_BANK,
+            'weight_bank': WEIGHT_BANK,
         }
         self._render_template(env, 'aie.cfg.jinja', output_dir / 'aie.cfg', context)
         self._render_template(env, 'graph_plan.h.jinja', output_dir / 'src' / 'graph_plan.h', context)

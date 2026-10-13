@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Dict
 from ....aie_types import AIEDataType, FloatIntent
 from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
-from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
+from ...base import PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
 from ...utils import (
@@ -178,7 +178,7 @@ class _SoftmaxVariantBase(OpImplVariant):
             parallelism=ParallelismConfig(cas_num=int(cas_num), contract='outer'),
             vec_size=int(vec_size),
             accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
-            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
+            alternating_horizontal=device.alternating_horizontal,
             io_views=io_views,
             io_route=io_route,
             layout=self.layout_name,
@@ -239,8 +239,8 @@ class _SoftmaxVariantBase(OpImplVariant):
         locations = []
         for row in range(int(config.parallelism.cas_num)):
             flow = row_flow(config.alternating_horizontal, int(anchor_row) + row, 1)
-            locations.append(BufferLocation('in1', row, flow.input_col, row, (0, 3)))
-            locations.append(BufferLocation('out1', row, flow.output_col, row, (0, 3)))
+            locations.append(BufferLocation('in1', row, flow.input_col, row, PING_PONG_BANKS, reader=(0, row)))
+            locations.append(BufferLocation('out1', row, flow.output_col, row, PING_PONG_BANKS))
         return tuple(locations)
 
     def build_ports(self, node: OpNode, config: SoftmaxConfig):

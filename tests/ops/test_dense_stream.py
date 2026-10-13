@@ -95,8 +95,7 @@ def test_stream_dense_plan_has_no_buffers_or_dma(stream_dense_model, tmp_path, p
 
     assert execution.get('l1_aie').variant.variant_id == 'dense.b.r.stream.v1'
     assert execution.get('lo_aie').variant.variant_id == 'dense.b.r.row.stream.v1'
-    l2 = execution.get('l2_aie')
-    assert l2.variant.variant_id == 'dense.b.r.stream.v1'
+    l2 = execution.get('l2_aie')  # one chain: either contract splits it alike
     assert (l2.config.parallelism.cas_length, l2.config.parallelism.cas_num) == (2, 1)
     for name in ('l1_aie', 'l2_aie', 'lo_aie'):
         inst = execution.get(name)
@@ -250,12 +249,12 @@ def test_one_stream_end_moves_the_boundary_without_dma(mixed_dense_model, tmp_pa
     for name in 'abcd':
         inst = ctx.ir.execution.get(f'{name}_aie')
         (inputs,), (outputs,) = inst.ports.inputs.values(), inst.ports.outputs.values()
-        kinds[name] = (inst.variant.variant_id, inputs.kind, outputs.kind)
+        kinds[name] = (inputs.kind, outputs.kind)
     assert kinds == {
-        'a': ('dense.b.r.stream_in.v1', 'stream', 'buffer'),
-        'b': ('dense.b.r.stream_out.v1', 'buffer', 'stream'),
-        'c': ('dense.b.r.stream_in.v1', 'stream', 'buffer'),
-        'd': ('dense.b.r.stream_out.v1', 'buffer', 'stream'),
+        'a': ('stream', 'buffer'),
+        'b': ('buffer', 'stream'),
+        'c': ('stream', 'buffer'),
+        'd': ('buffer', 'stream'),
     }
     plan = ctx.ir.physical.plan
     assert plan['buffers'] == [] and plan['kernel_read_accesses'] == [] and plan['kernel_write_accesses'] == []

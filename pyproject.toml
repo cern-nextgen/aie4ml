@@ -34,6 +34,7 @@ classifiers = [
 dependencies = [
   "jinja2>=3.0",
   "numpy",
+  "ortools>=9.8",
 ]
 
 [project.optional-dependencies]

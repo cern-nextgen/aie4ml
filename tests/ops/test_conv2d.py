@@ -497,15 +497,16 @@ def _conv_fanout_model():
 
 def test_frame_readers_with_other_windows_read_through_a_memory_tile(tmp_path):
     """The 1x1 conv reads the image its producer writes directly; the padded 3x3, which reads another window, takes
-    its frame through a memory tile. The Add takes its operands' frame as its own layout: one arrives in shared
-    memory, the other by DMA, and the sum goes on to the next conv in shared memory."""
+    its frame through a memory tile. The Add takes its operands' frame as its own layout: both arrive in shared
+    memory, the second from a producer whose memory its core reaches north or south, and the sum goes on to the next
+    conv in shared memory."""
     ctx = lower(_conv_fanout_model(), tmp_path, part=PART)
     plan = ctx.ir.physical.plan
     edges = {(e['source'].split('.')[0], e['target']): e.get('realization') for e in plan['direct_edges']}
     assert {target.split('.')[0] for source, target in edges if source == 'c_aie'} == {'w1_aie'}
     assert [buffer['tensor'] for buffer in plan['buffers']] == ['c_relu']
     assert edges[('p1_aie', 'sum_aie.in1[0]')] == 'shared_memory'
-    assert edges[('p2_aie', 'sum_aie.in2[0]')] == 'dma'
+    assert edges[('p2_aie', 'sum_aie.in2[0]')] == 'shared_memory'
     assert edges[('sum_aie', 'p3_aie.in1[0]')] == 'shared_memory'
 
 
@@ -1002,12 +1003,17 @@ def test_strided_conv_retiles_its_producers_frame(tmp_path):
 
 
 def test_shared_edge_needs_room_for_one_buffer(tmp_path):
-    """Pinning the strided conv right beside its producer puts the conv's input memory in the
-    producer's tile, where no buffer of theirs is shared, and leaves no tile for the retiler whose
-    frame it must share: placement refuses rather than accept a DMA hop."""
+    """Pinning the strided conv right beside its producer on a one-row array leaves the retiler, whose frame the
+    conv must share, no tile its core reaches -- not west, where the producer sits, nor north or south: placement
+    refuses rather than accept a DMA hop, naming the pins and the share that conflict. With a second row the retiler
+    shares from above the conv."""
     directives = {'first': {'placement': {'col': 7, 'row': 0}}, 'second': {'placement': {'col': 8, 'row': 0}}}
-    with pytest.raises(ConfigRefused, match='conflicts with another anchor'):
-        lower(_strided_chain_model(), tmp_path, directives, part=AIE1_PART)
+    with pytest.raises(ConfigRefused, match='pinned place, second_aie_retile -> second_aie in one buffer cannot all'):
+        lower(_strided_chain_model(), tmp_path / 'one-row', directives, part=AIE1_PART, aie_config={'Rows': 1})
+    ctx = lower(_strided_chain_model(), tmp_path / 'two-rows', directives, part=AIE1_PART, aie_config={'Rows': 2})
+    assert ctx.ir.physical.placements['second_aie_retile']['row'] == 1
+    frame = ctx.ir.execution.get('second_aie').inputs[0].tensor
+    assert [e['realization'] for e in ctx.ir.physical.plan['direct_edges'] if e['tensor'] == frame] == ['shared_memory']
 
 
 @pytest.mark.requires_vitis
@@ -1248,7 +1254,7 @@ def test_strided_conv_splits_by_rows(tmp_path):
 def test_physical_plan_proves_each_shared_edge(tmp_path):
     """A shared edge is proven before any code exists: the verifier re-derives it from the finished
     plan and refuses one whose ports no longer name one memory, or that a DMA access pattern would
-    turn into a copy."""
+    turn into a copy; and a buffer placed where its op cannot have it."""
     from aie4ml.passes.verify_physical import verify_physical
 
     ctx = lower(_strided_chain_model(), tmp_path, part=AIE1_PART)
@@ -1263,8 +1269,15 @@ def test_physical_plan_proves_each_shared_edge(tmp_path):
         verify_physical(ctx)
     ctx.ir.physical.plan['kernel_read_accesses'].pop()
 
-    ctx.ir.physical.placements['second_aie_retile']['row'] += 1
+    buffers = ctx.ir.physical.placements['second_aie']['buffers']
+    frame = buffers[0]
+    buffers[0] = [*frame[:2], [1, 2]]  # in the memory the retiler writes, but other banks: two buffers, not one
     with pytest.raises(RuntimeError, match='not one memory'):
+        verify_physical(ctx)
+    buffers[0] = frame
+
+    ctx.ir.physical.placements['second_aie_retile']['row'] += 2  # an op moved without its buffers
+    with pytest.raises(RuntimeError, match='neither where its graph lists it'):
         verify_physical(ctx)
 
 
@@ -1742,7 +1755,9 @@ def test_a_memory_tile_serves_only_the_readers_its_buffer_descriptors_cover(tmp_
 
     assert readers(lower(model, tmp_path / 'four', fc(4, contract='outer'))) == [4]
     # its microtile twins fail alike, but the search kept one of them, so it reports a search limit
-    with pytest.raises((ConfigRefused, RuntimeError), match=r'1 writers and 8 readers need \[36, 32\] BDs'):
+    with pytest.raises(
+        (ConfigRefused, RuntimeError), match=r'1 writers and 8 readers need \[\[28, 24\], \[8, 8\]\] BDs'
+    ):
         lower(model, tmp_path / 'eight', fc(8, contract='outer'))
     assert readers(lower(model, tmp_path / 'one', fc(8))) == [8]
 
@@ -1786,11 +1801,12 @@ def test_an_add_of_nchw_activations_is_their_nhwc_tensor(tmp_path):
 
 def test_an_add_takes_the_frame_its_operands_arrive_in(tmp_path):
     """A conv's frame is stored channel block by channel block; an add sums element by element, so it takes that
-    frame as the layout of all its tensors: no memory tile, one operand in shared memory, the other by DMA."""
+    frame as the layout of all its tensors: no memory tile, both operands in shared memory, the skip from a
+    producer whose memory its core reaches north or south."""
     ctx = lower(_residual_model(), tmp_path, part=PART)
     plan = ctx.ir.physical.plan
     assert plan['buffers'] == []
     edges = {(e['source'].split('.')[0], e['target']): e.get('realization') for e in plan['direct_edges']}
     assert edges[('main_c_aie', 'sum_aie.in1[0]')] == 'shared_memory'
-    assert edges[('skip_c_aie', 'sum_aie.in2[0]')] == 'dma'
+    assert edges[('skip_c_aie', 'sum_aie.in2[0]')] == 'shared_memory'
     assert edges[('sum_aie', 'proj_c_aie.in1[0]')] == 'shared_memory'

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 import pytest
 from aie4ml.errors import ConfigRefused
@@ -9,11 +11,13 @@ from aie4ml.frontends.onnx import from_onnx
 from aie4ml.op_impls import get_family_resolver_registry
 from aie4ml.op_impls.families.conv2d.conv2d import Conv2dOpImplVariant
 from aie4ml.passes import choose_parallelism, placement
-from aie4ml.passes.resolve import resolve_instance
+from aie4ml.passes.base import run_aie_passes
+from aie4ml.passes.ranking import MODES
+from aie4ml.passes.resolve import logical_values, resolve_instance
 from aie4ml.passes.transport.collect import TransportCollector
 from aie4ml.passes.transport.legality import direct_pairing
 from frontends.test_onnx_aie1 import _dense_model, _normalization_chain_model
-from frontends.test_onnx_aie1_views import _split_model
+from frontends.test_onnx_aie1_views import _concat_model, _split_model
 from helpers import (
     PART,
     TensorProto,
@@ -170,7 +174,25 @@ def test_a_design_placement_refuses_gives_way_to_the_next(tmp_path, monkeypatch)
 
     monkeypatch.setattr(placement.PlaceKernels, 'transform', refuse_first)
     ctx = lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'throughput', 'MaxTiles': 8})
-    assert ctx.ir.optimizer['designs_tried'] == 2
+    # two designs tried; the pipeline then places the design found once more, at the places its trial found
+    assert ctx.ir.optimizer['designs_tried'] == 2 == len(calls) - 1
+
+
+def test_designs_placement_finds_nothing_for_in_its_time_halve_the_fills_tried(tmp_path, monkeypatch):
+    """Placement runs out of time on every design of more than three tiles: the search halves the fills it tries
+    rather than stepping a tile at a time, and finds one within its builds, not proven the best."""
+    place = placement.PlaceKernels.transform
+
+    def time_out_when_full(self, ctx):
+        rects = [placement.instance_rect(inst, 0) for inst in ctx.ir.execution]
+        if sum(rect.w * rect.h for rect in rects) > 3:
+            raise placement.PlacementInfeasibleError('no placement in its time', proven=False)
+        return place(self, ctx)
+
+    monkeypatch.setattr(placement.PlaceKernels, 'transform', time_out_when_full)
+    ctx = lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'throughput', 'MaxTiles': 8})
+    assert ctx.ir.optimizer['tiles'] <= 3 and not ctx.ir.optimizer['proven']
+    assert any('were not all tried' in doubt for doubt in ctx.ir.optimizer['doubts'])
 
 
 def test_a_search_that_builds_nothing_says_whether_it_hit_a_limit(tmp_path, monkeypatch):
@@ -181,9 +203,8 @@ def test_a_search_that_builds_nothing_says_whether_it_hit_a_limit(tmp_path, monk
     pinned = {'dense': {'parallelism': {'cas_num': 1, 'cas_length': 1, 'contract': 'inner'}}}
     with pytest.raises(ConfigRefused, match=r'none of the 1 designs within the tile budget can be built'):
         lower(_dense_model(), tmp_path / 'one', pinned, part=PART)
-    monkeypatch.setattr(choose_parallelism, 'MAX_PLACEMENT_TRIALS', 2)
-    with pytest.raises(RuntimeError, match=r'(?s)search limit.*A design may still exist'):
-        lower(_dense_model(), tmp_path / 'many', part=PART)
+    with pytest.raises(RuntimeError, match=r'(?s)search limit.*SearchBuilds.*A design may still exist'):
+        lower(_dense_model(), tmp_path / 'many', part=PART, aie_config={'SearchBuilds': 1})
 
 
 def test_an_error_that_is_not_a_refusal_stops_the_search(tmp_path, monkeypatch):
@@ -211,15 +232,67 @@ def test_dense_offers_splits_its_tiling_pads(tmp_path):
     assert inst.config.io_views[node.outputs[0].name].tile[-1] * 3 > 40
 
 
+def test_the_program_finds_the_design_every_combination_ranks_best(tmp_path):
+    """Two layers' outputs concatenated into a third: the constraint program's design ranks as the best of every
+    combination of an alternative per layer and an arrival per tensor it reads, of a layout its producer's
+    alternative publishes, within the tile budget and the room."""
+    from aie4ml.pipeline import DEFAULT_PIPELINE
+
+    model = from_onnx(
+        _concat_model(8, 8),
+        {'Part': AIE1_PART, 'AIEConfig': {'Iterations': 1, 'Optimize': 'latency'}},
+        output_dir=tmp_path,
+        project_name='concat',
+    )
+    ctx = model.context
+    run_aie_passes(
+        ctx, [cls() for cls in DEFAULT_PIPELINE[: DEFAULT_PIPELINE.index(choose_parallelism.ChooseParallelism)]]
+    )
+    shared = choose_parallelism._Shared(logical_values(ctx.ir.logical))
+    search = choose_parallelism._Search(ctx, 'latency', 16, shared)
+    alternatives = search._alternatives()
+    assert any(len(alt.arrivals) == 2 for alt in alternatives['tail_aie'])
+
+    def designs():
+        names = list(alternatives)
+        for chosen in itertools.product(*(range(len(alternatives[name])) for name in names)):
+            alts = {name: alternatives[name][i] for name, i in zip(names, chosen)}
+            published = {tensor: sig for alt in alts.values() for tensor, sig in alt.published}
+            ways = [
+                [(name, tensor, c) for c, arrival in enumerate(found) if published[tensor] in arrival.layouts]
+                for name, alt in alts.items()
+                for tensor, found in alt.arrivals
+            ]
+            for taken in itertools.product(*ways):
+                arrivals = {name: {} for name in names}
+                for name, tensor, c in taken:
+                    arrivals[name][tensor] = c
+                design = search._design(alternatives, {name: (i, arrivals[name]) for name, i in zip(names, chosen)})
+                if design.tiles <= search.max_tiles and design.tiles + design.reserved <= search.room:
+                    yield design
+
+    best = min(search.rank(design) for design in designs())
+    assert search.rank(search._design(alternatives, search._solve(alternatives, []))) == best
+
+
 def test_latency_mode_ranks_latency_before_interval():
     """Of a design that finishes the first inference sooner and one that takes the next one sooner, 'latency' ranks
     the first best and 'throughput' the second."""
-    soon = choose_parallelism._Design(0, 8, 0, 2000, 5000, (), (), ())
-    steady = choose_parallelism._Design(0, 8, 0, 1000, 9000, (), (), ())
+    soon = choose_parallelism._Design(0, 8, 0, 2000, 5000, 0)
+    steady = choose_parallelism._Design(0, 8, 0, 1000, 9000, 0)
     search = object.__new__(choose_parallelism._Search)
     for mode, best in (('latency', soon), ('throughput', steady)):
         search.mode = mode
         assert min((soon, steady), key=search.rank) is best
+
+
+def test_of_designs_alike_the_one_sharing_the_most_buffers_ranks_best():
+    shared = choose_parallelism._Design(0, 8, 0, 1000, 5000, 0)
+    copied = choose_parallelism._Design(0, 8, 0, 1000, 5000, 2)  # two hand-overs a DMA copies
+    search = object.__new__(choose_parallelism._Search)
+    for mode in MODES:
+        search.mode = mode
+        assert search.rank(shared) < search.rank(copied)
 
 
 def test_an_unknown_mode_is_refused(tmp_path):

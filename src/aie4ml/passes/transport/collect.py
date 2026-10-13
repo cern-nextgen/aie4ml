@@ -25,24 +25,44 @@ class TransportCollector:
 
     def input_connections(self, inst) -> List[Connection]:
         """The legs into one instance: from a kernel, through a folded view, or from the graph boundary."""
-        connections: List[Connection] = []
-        for item in inst.inputs:
-            tname = item.tensor
-            cg = inst.ports.inputs[tname].group
-            view = self.execution.values[tname].view
-            if view is not None:
-                if view.kind == 'concat':
-                    connections.extend(self._concat_connections(inst.node, tname, cg, view))
-                else:
-                    connections.append(self._slice_connection(inst.node, tname, cg, view))
-            elif tname in self.producers:
-                p, pg = self.producers[tname]
-                connections.append(Connection(tname, Endpoint(p, tname, pg), Endpoint(inst.node, tname, cg)))
-            else:
-                connections.append(
-                    Connection(tname, Endpoint(None, tname, 'graph_input'), Endpoint(inst.node, tname, cg))
-                )
-        return connections
+        return [leg for item in inst.inputs for leg in self.item_connections(inst, item)]
+
+    def item_connections(self, inst, item) -> List[Connection]:
+        """The legs into one input of an instance."""
+        tname = item.tensor
+        cg = inst.ports.inputs[tname].group
+        view = self.execution.values[tname].view
+        if view is not None:
+            if view.kind == 'concat':
+                return self._concat_connections(inst.node, tname, cg, view)
+            return [self._slice_connection(inst.node, tname, cg, view)]
+        if tname in self.producers:
+            p, pg = self.producers[tname]
+            return [Connection(tname, Endpoint(p, tname, pg), Endpoint(inst.node, tname, cg))]
+        return [Connection(tname, Endpoint(None, tname, 'graph_input'), Endpoint(inst.node, tname, cg))]
+
+    def ports_read(self, value: str, source: str) -> Tuple[int, ...]:
+        """The ports of `source`'s producer that reading `value` reads: all of them for `source` itself or a concat
+        over it, those a slice of it covers, none where `value` is not read from `source`."""
+        inst = self._kernel_inst(self.producers[source][0])
+        every = tuple(range(int(inst.ports.outputs[source].count)))
+        view = self.execution.values[value].view
+        if view is None:
+            return every if value == source else ()
+        if source not in view.sources:
+            return ()
+        if view.kind == 'concat':
+            return every
+        part = view.parts[0]
+        return self._slice_producer_ports(inst.node, source, view.axis, part.start, part.extent)[0]
+
+    def port_readers(self, tensor: str, port: int) -> List[str]:
+        """Who reads port `port` of `tensor`'s producer: each instance once per input reading it, whole or through a
+        view covering it, and the graph boundary where `tensor` is a graph output."""
+        readers = [
+            inst.name for inst in self.execution for item in inst.inputs if port in self.ports_read(item.tensor, tensor)
+        ]
+        return readers + (['the graph boundary'] if tensor in self.execution.graph_outputs else [])
 
     def output_connections(self, inst, read) -> List[Connection]:
         """The graph-boundary legs out of one instance: its graph outputs, and any output nothing in `read` reads."""

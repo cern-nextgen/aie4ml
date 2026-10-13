@@ -509,7 +509,8 @@ class ExecutionIR:
                                 f'{inst.name}: reads the view {item.tensor!r} over {name!r} before '
                                 f'{source.producer} writes it.'
                             )
-                if item.shared_memory and value.producer is None:
+                writers = [value] if value.view is None else [self.values[name] for name in value.view.sources]
+                if item.shared_memory and any(writer.producer is None for writer in writers):
                     raise RuntimeError(
                         f'{inst.name}: requires {item.tensor!r} through shared memory, but no kernel writes it.'
                     )
@@ -537,15 +538,20 @@ class PhysicalIR:
 
     placements: Dict[str, Dict[str, int]] = field(default_factory=dict)
     plan: Dict[str, Any] = field(default_factory=dict)
+    # placement's estimate of the placed design (`placement_solver`): latency, interval and copies in cycles and
+    # hand-overs, and whether its solves proved them the best of its placements
+    estimate: Dict[str, Any] = field(default_factory=dict)
 
     def reset(self) -> None:
         self.placements.clear()
         self.plan.clear()
+        self.estimate.clear()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             'placements': _deep_copy(self.placements),
             'plan': _deep_copy(self.plan),
+            'estimate': _deep_copy(self.estimate),
         }
 
 

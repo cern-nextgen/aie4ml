@@ -1,6 +1,7 @@
 """The physical plan's invariants, checked before any code is generated.
 
-Exactly the kernel graphs are placed, and every edge the execution graph requires in shared memory is realised
+Exactly the kernel graphs are placed, each buffer where its graph lists it or, an input, in a memory its reading core
+reaches, and every edge the execution graph requires in shared memory is realised
 as one on each of its ports: a direct hand-over per port, legal by the rule placement searched under
 (`shared_buffer`), its two ports pinned to the same memory, recorded as `shared_memory`, and carrying no
 DMA access pattern.
@@ -10,12 +11,14 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from itertools import zip_longest
 
 from ..errors import ConfigRefused
 from ..ir import get_backend_context
+from ..op_impls.base import KERNEL_BANKS
 from ..op_impls.common_types import PORT_KIND_BUFFER
 from .base import AIEPass
-from .shared_buffer import SHARED_MEMORY, location_problem, pinned_locations, static_problem
+from .shared_buffer import SHARED_MEMORY, hand_over_problem, placed_buffers, placed_locations, reached
 from .transport.dma_resources import KERNEL_BUFFERS, memtile_port_bds, pool_use, tile_port_bds
 from .transport.routing import BELOW, port_tiles, route_overflow
 from .utils import sanitize_identifier
@@ -29,11 +32,6 @@ def _port(endpoint: str, graphs):
     if match is None or match['graph'] not in graphs:
         raise RuntimeError(f'physical plan endpoint {endpoint!r} names no placed kernel graph port.')
     return graphs[match['graph']], match['group'], int(match['port'])
-
-
-def _pinned(ctx, inst, group: str, port: int):
-    placement = ctx.ir.physical.placements[inst.name]
-    return pinned_locations(inst, group, port, int(placement['col']), int(placement['row']))
 
 
 def _kernel_ports(inst, group: str, port: int, direction: str):
@@ -51,6 +49,16 @@ def verify_physical(ctx) -> None:
         raise RuntimeError(
             f'physical plan places {sorted(physical.placements)}, not the kernel graphs {sorted(execution.instances)}.'
         )
+    for inst in execution:
+        placement = physical.placements[inst.name]
+        col, row = int(placement['col']), int(placement['row'])
+        for loc, at in placed_buffers(ctx, inst):
+            listed = (col + loc.rel_col, row + loc.rel_row, tuple(loc.banks))
+            if at != listed and at[:2] not in reached(loc, col, row, ctx.device.alternating_horizontal):
+                raise RuntimeError(
+                    f'{inst.name}.{loc.port_group}[{loc.port}]: placed at {at}, neither where its graph lists it '
+                    f'({listed}) nor in a memory its reading core reaches.'
+                )
     graphs = {}
     for inst in execution:
         name = sanitize_identifier(inst.name)
@@ -66,8 +74,11 @@ def verify_physical(ctx) -> None:
         for item in inst.inputs:
             if not item.shared_memory:
                 continue
-            legs = [e for e in edges if e['tensor'] == item.tensor and _port(e['target'], graphs)[0] is inst]
-            ports = inst.ports.inputs[item.tensor].count
+            group, ports = inst.ports.inputs[item.tensor].group, inst.ports.inputs[item.tensor].count
+            name = sanitize_identifier(inst.name)
+            legs = [
+                e for e in edges if (end := _PORT.match(e['target'])) and (end['graph'], end['group']) == (name, group)
+            ]
             if len(legs) != ports:
                 raise RuntimeError(
                     f'{inst.name}: must read {item.tensor!r} through shared memory on each of its {ports} ports, '
@@ -76,10 +87,7 @@ def verify_physical(ctx) -> None:
             for leg in legs:
                 producer, p_group, p_port = _port(leg['source'], graphs)
                 _, c_group, c_port = _port(leg['target'], graphs)
-                problem = static_problem(ctx, item.tensor, producer, p_group, p_port, inst, c_group, c_port)
-                problem = problem or location_problem(
-                    _pinned(ctx, producer, p_group, p_port), _pinned(ctx, inst, c_group, c_port)
-                )
+                problem = hand_over_problem(ctx, producer, p_group, p_port, inst, c_group, c_port)
                 if not problem and leg.get('realization') != SHARED_MEMORY:
                     problem = f"the plan records it as {leg.get('realization')!r}"
                 kernel_ports = _kernel_ports(producer, p_group, p_port, 'outputs') | _kernel_ports(
@@ -89,6 +97,48 @@ def verify_physical(ctx) -> None:
                     problem = f'{sorted(accessed & kernel_ports)} carry a DMA access pattern'
                 if problem:
                     raise RuntimeError(f'{leg["source"]} -> {leg["target"]}: must be shared memory, but {problem}.')
+
+
+def verify_memory_banks(ctx) -> None:
+    """No two ops hold one core or memory bank -- a kernel's core and its tile's `KERNEL_BANKS`, a buffer's banks --
+    but the buffer a shared hand-over names at both its ends; and a buffer placed away from where its graph lists it
+    holds no bank its own op holds otherwise."""
+    physical = ctx.ir.physical
+    graphs = {sanitize_identifier(inst.name): inst for inst in ctx.ir.execution}
+    holders = defaultdict(set)
+    for inst in ctx.ir.execution:
+        placement = physical.placements[inst.name]
+        col, row = int(placement['col']), int(placement['row'])
+        tiles = [
+            (col + dc, row + dr) for dc in range(int(placement['width'])) for dr in range(int(placement['height']))
+        ]
+        held = {(c, r, 'core') for c, r in tiles} | {(c, r, bank) for c, r in tiles for bank in KERNEL_BANKS}
+        moved = []
+        for loc, at in placed_buffers(ctx, inst):
+            banks = {(at[0], at[1], bank) for bank in at[2]}
+            if at == (col + loc.rel_col, row + loc.rel_row, tuple(loc.banks)):
+                held |= banks
+            else:
+                moved.append((loc, banks))
+        for loc, banks in moved:
+            if banks & held:
+                raise RuntimeError(
+                    f'{inst.name}.{loc.port_group}[{loc.port}]: placed on banks {sorted(banks & held)} its own op '
+                    'holds.'
+                )
+            held |= banks
+        for resource in held:
+            holders[resource].add(inst.name)
+    shared = {}
+    for edge in physical.plan.get('direct_edges', ()):
+        if edge.get('realization') == SHARED_MEMORY:
+            producer, group, port = _port(edge['source'], graphs)
+            consumer = _port(edge['target'], graphs)[0]
+            for c, r, banks in placed_locations(ctx, producer, group, port):
+                shared.update({(c, r, bank): {producer.name, consumer.name} for bank in banks})
+    for resource, names in sorted(holders.items(), key=str):
+        if len(names) > 1 and names != shared.get(resource):
+            raise ConfigRefused(f'{sorted(names)} all hold {resource}: one core or memory bank, two ops.')
 
 
 def verify_dma_resources(ctx) -> None:
@@ -108,11 +158,13 @@ def verify_dma_resources(ctx) -> None:
         readers = [
             memtile_port_bds(r['descriptor'], count, device.generation, buffer['name']) for r in buffer['readers']
         ]
-        pools = [w + r for w, r in zip(pool_use(writers, dma), pool_use(readers, dma))]
-        if max(pools) > dma.bds // dma.bd_pools:
+        unused = [0] * dma.bd_pools
+        tiles = zip_longest(pool_use(writers, dma), pool_use(readers, dma), fillvalue=unused)
+        pools = [[w + r for w, r in zip(written, read)] for written, read in tiles]
+        if max(map(max, pools)) > dma.bds // dma.bd_pools:
             raise ConfigRefused(
-                f"{buffer['name']}: its {len(writers)} writers and {len(readers)} readers need {pools} BDs from a "
-                f'memory tile whose pools hold {dma.bds // dma.bd_pools} each.'
+                f"{buffer['name']}: its {len(writers)} writers and {len(readers)} readers need {pools} BDs (per pool "
+                f'of each memory tile they take) from memory tiles whose pools hold {dma.bds // dma.bd_pools} each.'
             )
 
     graphs = {sanitize_identifier(inst.name): inst for inst in ctx.ir.execution}
@@ -141,7 +193,7 @@ def verify_dma_resources(ctx) -> None:
                 for port, endpoints in enumerate(binding.endpoints):
                     if f'{name}.{binding.group}[{port}]' in shared:
                         continue
-                    owners = sorted({(col, row) for col, row, _ in _pinned(ctx, inst, binding.group, port)})
+                    owners = sorted({(col, row) for col, row, _ in placed_locations(ctx, inst, binding.group, port)})
                     for index, endpoint in enumerate(endpoints):
                         where = f'{name}.{endpoint}'
                         owner = owners[0] if len(owners) == 1 else owners[index]
@@ -167,7 +219,7 @@ def verify_tile_dma_channels(ctx, graphs, shared) -> None:
                 for port, endpoints in enumerate(binding.endpoints):
                     if f'{name}.{binding.group}[{port}]' in shared:
                         continue
-                    owners = sorted({(col, row) for col, row, _ in _pinned(ctx, inst, binding.group, port)})
+                    owners = sorted({(col, row) for col, row, _ in placed_locations(ctx, inst, binding.group, port)})
                     if len(owners) not in (1, len(endpoints)):
                         raise RuntimeError(f'{name}.{binding.group}[{port}]: its buffers sit on {owners}.')
                     for index, endpoint in enumerate(endpoints):
@@ -193,10 +245,12 @@ def verify_stream_routes(ctx) -> None:
     def tiles(endpoint: str, direction: str):
         match = _PORT.match(endpoint)
         if match is not None and match['graph'] in graphs:
-            inst = graphs[match['graph']]
+            inst, group, port = graphs[match['graph']], match['group'], int(match['port'])
+            binding = next(b for b in getattr(inst.ports, direction).values() if b.group == group)
+            if binding.kind == PORT_KIND_BUFFER:
+                return {(col, row) for col, row, _ in placed_locations(ctx, inst, group, port)}
             placement = physical.placements[inst.name]
-            col, row = int(placement['col']), int(placement['row'])
-            return port_tiles(inst, direction, match['group'], int(match['port']), col, row)
+            return port_tiles(inst, direction, group, port, int(placement['col']), int(placement['row']))
         if _PLIO.match(endpoint) or (match is not None and match['graph'] in buffers):
             return {BELOW}
         raise RuntimeError(f'stream endpoint {endpoint!r} names no kernel graph, memory-tile buffer or PLIO port.')
@@ -233,6 +287,7 @@ class VerifyPhysicalPlan(AIEPass):
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         verify_physical(ctx)
+        verify_memory_banks(ctx)
         verify_dma_resources(ctx)
         verify_stream_routes(ctx)
         return False

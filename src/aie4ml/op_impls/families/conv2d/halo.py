@@ -6,7 +6,7 @@ from typing import Tuple
 
 from ....errors import ConfigRefused
 from ....ir.graph import VIEW_FLATTEN_2D, OpNode, input_tensor_for_role
-from ...base import BufferLocation, row_flow
+from ...base import KERNEL_BANKS, PING_PONG_BANKS, BufferLocation, row_flow
 from ...common_types import PORT_KIND_BUFFER, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, SpatialAccess2D, TensorView, shared_consumer_spatial_access
@@ -205,7 +205,7 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         super().validate_config(node, config, device)
         # Each band's tile holds, per bank, the buffers it pins there (`buffer_locations`; a buffer two kernels share
         # is pinned by both, and counted in the tile it is in), one copy each of ping and pong, beside the bias in
-        # bank 1 and the weights in bank 2. Where the buffers go depends on the row's parity on AIE1.
+        # `STACK_BANK` and the weights in `WEIGHT_BANK`. Where the buffers go depends on the row's parity on AIE1.
         params = self.build_template_params(node, config, {'row': 0, 'col': 0})
         bands = int(config.parallelism.cas_num)
         window = self._frame_bytes(config, 'lhs', params['in_elements'])
@@ -239,14 +239,14 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         flows = [row_flow(config.alternating_horizontal, int(anchor_row) + band, 1) for band in range(bands)]
         locations = []
         for band, flow in enumerate(flows):
-            locations.append(BufferLocation('in1', band, flow.input_col, band, (0, 3)))
-            locations.append(BufferLocation('out1', band, flow.output_col, band, (0, 3)))
-        # Halo rows are a row or two: they go beside the stack, bias and weights, and leave banks 0 and 3 to the
+            locations.append(BufferLocation('in1', band, flow.input_col, band, PING_PONG_BANKS))
+            locations.append(BufferLocation('out1', band, flow.output_col, band, PING_PONG_BANKS))
+        # Halo rows are a row or two: they go beside the stack, bias and weights, and leave the ping-pong banks to the
         # windows.
         for index, port in enumerate(self._halo(node, config, 'lhs')[1], start=bands):
-            locations.append(BufferLocation('in1', index, flows[port.reader].input_col, port.reader, (1, 2)))
+            locations.append(BufferLocation('in1', index, flows[port.reader].input_col, port.reader, KERNEL_BANKS))
         for index, port in enumerate(self._halo(node, config, 'output')[1], start=bands):
-            locations.append(BufferLocation('out1', index, 0, port.reader, (1, 2)))
+            locations.append(BufferLocation('out1', index, 0, port.reader, KERNEL_BANKS))
         return tuple(locations)
 
     def output_staging_contract(self, _node, config, _tensor_name):

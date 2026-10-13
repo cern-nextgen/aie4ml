@@ -12,7 +12,7 @@
 using namespace adf;
 
 // A retiler kernel per window -- CAS_NUM of them, no cascade -- window `w` on row `w`, on the Dense bank contract: its input and frame
-// where IN1/OUT1_BUFFER_LOCATIONS put them -- one copy per bank -- and its stack in bank 1. Each
+// where IN1/OUT1_BUFFER_LOCATIONS put them -- one copy per bank -- and its stack in the stack bank. Each
 // window's kernel is configured by `ConfigT::window<w>::type`; FOLD picks the kernel that folds the frame.
 template<typename ConfigT>
 class frame_retile_graph : public graph {
@@ -25,7 +25,7 @@ public:
   {
     for (int w = 0; w < ConfigT::CAS_NUM; ++w) {
       adf::location<adf::kernel>(kk[w]) = adf::tile(COL_START, ROW_START + w);
-      adf::location<adf::stack>(kk[w]) = adf::bank(COL_START, ROW_START + w, 1);
+      adf::location<adf::stack>(kk[w]) = adf::bank(COL_START, ROW_START + w, AIE4ML_STACK_BANK);
       pin_buffer(kk[w].in[0], ConfigT::IN1_BUFFER_LOCATIONS[w], COL_START, ROW_START);
       pin_buffer(kk[w].out[0], ConfigT::OUT1_BUFFER_LOCATIONS[w], COL_START, ROW_START);
     }

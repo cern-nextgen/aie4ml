@@ -8,7 +8,7 @@ from ....aie_types import FloatIntent
 from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role, shard_major_order
 from ....passes.utils import sanitize_identifier
-from ...base import BufferLocation, OpImplFootprint, OpImplVariant, StreamLocation, cascade_ports
+from ...base import OpImplFootprint, OpImplVariant, StreamLocation, cascade_locations, cascade_ports
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
@@ -198,7 +198,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
             bank_mem_bytes=int(device.bank_mem_bytes),
-            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
+            alternating_horizontal=device.alternating_horizontal,
             flags=DenseFlags(
                 use_relu=use_relu,
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
@@ -259,7 +259,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         )
 
     def buffer_locations(self, _node, config, anchor_row):
-        return tuple(BufferLocation(g, p, col, row, (0, 3)) for g, p, row, _, col in cascade_ports(config, anchor_row))
+        return cascade_locations(config, anchor_row)
 
     def get_artifacts(self, inst: ExecutionInstance):
         inst_name = sanitize_identifier(inst.name)

@@ -14,6 +14,10 @@ struct aie4ml_buffer_location {
   int bank1;
 };
 
+// The banks of its own tile each kernel's stack and small parameters, and its weights, take (op_impls/base.py).
+constexpr int AIE4ML_STACK_BANK = {{ stack_bank }};
+constexpr int AIE4ML_WEIGHT_BANK = {{ weight_bank }};
+
 {% for L in layers %}
 {% set tpl = 'variants/' ~ L.op_impl.param_template ~ '/parameters.h.jinja' %}
 {% include tpl %}

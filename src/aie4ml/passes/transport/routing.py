@@ -6,8 +6,7 @@ router fails. Memory tiles have no east or west links, so their streams enter th
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from ...op_impls.common_types import PORT_KIND_BUFFER
 from ..shared_buffer import pinned_locations
@@ -15,6 +14,7 @@ from ..shared_buffer import pinned_locations
 BELOW = None  # a memory tile or PLIO end
 
 Tile = Tuple[int, int]
+Link = Tuple[int, int, str]  # (column, row, side) of a switch, row -1 under the array
 
 
 def port_tiles(inst, direction: str, group: str, port: int, col: int, row: int) -> Set[Tile]:
@@ -57,23 +57,29 @@ def _vertical(col: int, r1: int, r2: int):
     return [(col, r, 'North') for r in range(r1, r2)] + [(col, r, 'South') for r in range(r1, r2, -1)]
 
 
+def route(demand: Dict[Link, frozenset], stream, source, target, ports, columns: Optional[int] = None) -> List[Link]:
+    """Route one branch of `stream` into `demand` (each link's streams): of its candidate routes within `columns`, the
+    one whose fullest link stays emptiest. A stream's branches share the links they cross."""
+    options = [r for r in _routes(source, target) if columns is None or all(0 <= c < columns for c, *_ in r)]
+    chosen = min(
+        options,
+        key=lambda r: max((len(demand.get(link, frozenset()) | {stream}) / ports[link[2]] for link in r), default=0.0),
+    )
+    for link in chosen:
+        demand[link] = demand.get(link, frozenset()) | {stream}
+    return chosen
+
+
 def route_overflow(
     streams: Dict[object, Tuple[Optional[Tile], Iterable[Optional[Tile]]]], ports, columns: Optional[int] = None
 ) -> Optional[str]:
     """Why `streams` ({stream: (source, targets)}) need more ports on some link than it has, or None. Each branch
     takes the route within `columns` whose fullest link stays emptiest; a stream's branches share links. Whatever
     fits routes, given memory tiles beside their readers."""
-    demand = defaultdict(set)
-
-    def fullest(route, stream) -> float:
-        return max((len(demand[link] | {stream}) / ports[link[2]] for link in route), default=0.0)
-
+    demand: Dict[Link, frozenset] = {}
     for stream, (source, targets) in streams.items():
         for target in sorted(targets, key=str):
-            routes = [r for r in _routes(source, target) if columns is None or all(0 <= c < columns for c, *_ in r)]
-            route = min(routes, key=lambda option: fullest(option, stream))
-            for link in route:
-                demand[link].add(stream)
+            route(demand, stream, source, target, ports, columns)
     over = sorted(((len(held), link) for link, held in demand.items() if len(held) > ports[link[2]]), reverse=True)
     if not over:
         return None

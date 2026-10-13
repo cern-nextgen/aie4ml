@@ -12,7 +12,7 @@ from ...ir import get_backend_context
 from ...op_impls.common_types import PORT_KIND_STREAM
 from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, staging_tile_shape
 from ..base import AIEPass
-from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, location_problem, pinned_locations, static_problem
+from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, hand_over_problem
 from ..utils import sanitize_identifier
 from .boundary import (
     direct_boundary_access,
@@ -180,19 +180,11 @@ class _MemoryPlanMaterializer:
                 edge['realization'] = STREAM
             else:
                 # Both ops' graphs pin their buffer ports where they list them. One buffer is shared where
-                # the two locations coincide and nothing else reads it (`shared_buffer`); counted as a DMA
+                # the producer pins it in a memory the consumer's reader reaches and nothing else reads it
+                # (`shared_buffer`), the consumer's graph then pinning its port there too; counted as a DMA
                 # copy anywhere else, which is what it is wherever the locations differ.
-                written = pinned_locations(producer, p.group, p_port, *self._placed_at(producer))
-                read = pinned_locations(consumer, c.group, c_port, *self._placed_at(consumer))
-                if not written or not read:
-                    raise RuntimeError(
-                        f'{edge["source"]} -> {edge["target"]}: a buffer port without a buffer location; every '
-                        'buffer-port op lists where its graph pins them.'
-                    )
-                shared = (
-                    list(p_ports).count(p_port) == 1  # a port broadcast to several readers copies to each
-                    and not location_problem(written, read)
-                    and not static_problem(self.ctx, p.tensor, producer, p.group, p_port, consumer, c.group, c_port)
+                shared = list(p_ports).count(p_port) == 1 and not hand_over_problem(  # a broadcast copies to each
+                    self.ctx, producer, p.group, p_port, consumer, c.group, c_port
                 )
                 edge['realization'] = SHARED_MEMORY if shared else DMA
             self.direct_edges.append(edge)
@@ -452,10 +444,6 @@ class _MemoryPlanMaterializer:
 
     def _kernel_inst(self, node):
         return self.ctx.ir.execution.get(node.name) if node else None
-
-    def _placed_at(self, inst):
-        placement = self.ctx.ir.physical.placements[inst.name]
-        return int(placement['col']), int(placement['row'])
 
     @staticmethod
     def _producer_endpoint(node, group, port):

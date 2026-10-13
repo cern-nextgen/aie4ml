@@ -653,7 +653,7 @@ def test_aie1_tiled_normalization_chain_uses_direct_acc48_kernels(tmp_path):
         ('softmax', 'softmax_graph.h'),
     ):
         graph = (kernel_dir / family / graph_name).read_text()
-        assert 'adf::bank(tileCol, tileRow, 1)' in graph
+        assert 'adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK)' in graph
 
 
 def test_aie1_outer_parallel_dense_uses_direct_boundary_ports(tmp_path):

@@ -61,7 +61,7 @@ class DeviceSpec:
     columns: int
     rows: int
     column_start: int  # the placement region's first column
-    preferred_column_start: int  # where placement starts when the design fits from there
+    preferred_column_start: int  # the first column with a PL interface: placement packs the layout east from it
     row_start: int
     plio_width_bits: int
     core_stream_inputs: int
@@ -91,6 +91,11 @@ class DeviceSpec:
     bram: Optional[RamPool]
     tile_dma: DmaSpec
     memtile_dma: Optional[DmaSpec]  # None without memory tiles
+
+    @property
+    def alternating_horizontal(self) -> bool:
+        """Whether odd rows mirror their memory and cascades (AIE): a core there reaches east, not west."""
+        return self.cascade_layout == 'alternating_horizontal'
 
     @classmethod
     def from_config(cls, platform: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
@@ -132,7 +137,7 @@ class DeviceSpec:
             columns=int(require(cfg, 'Columns')),
             rows=int(require(cfg, 'Rows')),
             # A user's ColumnStart bounds the region. Otherwise it spans every column but 0 -- a kernel keeps
-            # buffers in its west neighbour -- and placement prefers to start at the first shim column with a PL
+            # buffers in its west neighbour -- and placement packs the layout from the first shim column with a PL
             # interface, where the PLIOs sit next to the kernels.
             column_start=int(cfg.get('ColumnStart', 1)),
             preferred_column_start=int(cfg['ColumnStart'] if 'ColumnStart' in cfg else require(cfg, 'PLColumnStart')),

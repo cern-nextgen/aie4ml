@@ -35,9 +35,10 @@ def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
     return contracts
 
 
-def resolve_instance(node, device, input_contracts, choice=None) -> ExecutionInstance:
+def resolve_instance(node, device, input_contracts, choice=None, shared=()) -> ExecutionInstance:
     """The kernel graph that implements `node`, given the contracts its inputs arrive in and, when given, a design
-    search's choice of directives to resolve it under instead of its own. Pure: nothing is registered."""
+    search's choice of directives to resolve it under instead of its own, and of the inputs it reads in their
+    producer's buffer (`ExecutionInput.shared_memory`). Pure: nothing is registered."""
     directives = {**(node.directives or {}), **(choice or {})}
     directives['io_route'] = resolve_io_route(node)  # user intents
 
@@ -51,7 +52,13 @@ def resolve_instance(node, device, input_contracts, choice=None) -> ExecutionIns
     ports = variant.build_ports(node, config)
     variant.validate_ports(node, ports, device)
 
-    inputs = tuple(ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter)
+    inputs = tuple(
+        ExecutionInput(t.name, input_role(node, t.name), shared_memory=t.name in shared)
+        for t in node.inputs
+        if not t.is_parameter
+    )
+    if set(shared) - {item.tensor for item in inputs}:
+        raise RuntimeError(f'{node.name}: shares {sorted(shared)}, but reads {[item.tensor for item in inputs]}.')
     outputs = tuple(t.name for t in node.outputs)
     _check_port_frames(node, config, variant, ports)
     return ExecutionInstance(
@@ -179,7 +186,8 @@ class Resolve(AIEPass):
                 if node.name in (chosen := ctx.ir.optimizer.get(key, {}))
             }
             choice.update(ctx.ir.optimizer.get('kernel', {}).get(node.name, {}))
-            inst = resolve_instance(node, ctx.device, inputs, choice)
+            shared = ctx.ir.optimizer.get('shared', {}).get(node.name, ())
+            inst = resolve_instance(node, ctx.device, inputs, choice, shared)
             execution.add(inst)
             execution.tensor_contracts.update(output_contracts(inst))
 

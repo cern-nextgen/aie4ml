@@ -9,10 +9,9 @@ buffer before it forwards it.
 from __future__ import annotations
 
 from math import prod
-from typing import Optional, Tuple
+from typing import Tuple
 
 from ..op_impls.utils.precision import element_bytes, resolve_exact_storage_dtype
-from .shared_buffer import port_problem
 from .transport.model import Connection
 
 CALL_CYCLES = 30  # locks and loop set-up: a 16x16x16 int8 Dense takes 53 cc on AIE-ML for 16 cc of loads
@@ -20,11 +19,11 @@ LOAD_BYTES_PER_CYCLE = 32  # a batch-1 Dense reads its 32 KB of weights in about
 CASCADE_HOP_CYCLES = 30  # a light conv took 29 cc longer per cascade stage added
 
 
-def kernel_cycles(inst, work: Optional[int], device) -> int:
+def kernel_cycles(inst, device) -> int:
     """One call of the instance's kernels, from its first stage starting to its last finishing. Its parameters
-    are taken as spread evenly over its tiles; `work` (multiply-accumulates per tile) is None where the variant
-    gives none."""
+    are taken as spread evenly over its tiles; its multiply-accumulates per tile are its variant's `work`."""
     node, config = inst.node, inst.config
+    work = inst.variant.work(node, config)
     footprint = inst.variant.footprint(node, config)
     widths = [element_bytes(inst.variant.input_precision(config, item.role)) for item in inst.inputs]
     loads = sum(prod(inst.port_views[item.tensor].tile) * width for item, width in zip(inst.inputs, widths))
@@ -53,21 +52,3 @@ def leg_cycles(leg: Connection, realization: str, shared: bool, execution, devic
     nbytes = prod(inst.port_views[endpoint.tensor].tile) * element_bytes(dtype)
     transfer = nbytes * 8 // device.stream_switch_width_bits
     return (2 if realization == 'memtile' else 1) * transfer, transfer
-
-
-def shareable(leg: Connection, realization: str, execution, readers: int) -> bool:
-    """Whether a direct kernel-to-kernel leg can be one buffer both kernels reach, placed right: one port to one
-    port, buffer ports bound to one kernel each, and the value its consumer's alone (`shared_buffer`)."""
-    producer, consumer = leg.producer, leg.consumer
-    if realization != 'direct' or producer.node is None or consumer is None:
-        return False
-    if producer.tensor != consumer.tensor or readers != 1 or producer.tensor in execution.graph_outputs:
-        return False
-    source, sink = execution.get(producer.node.name), execution.get(consumer.node.name)
-    written = producer.selected_ports(source.ports.outputs[producer.tensor].count)
-    read = consumer.selected_ports(sink.ports.inputs[consumer.tensor].count)
-    return (
-        len(written) == len(read)
-        and not any(port_problem(source, producer.group, port, 'outputs') for port in written)
-        and not any(port_problem(sink, consumer.group, port, 'inputs') for port in read)
-    )
