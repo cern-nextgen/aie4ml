@@ -152,7 +152,10 @@ def resolve_accumulator_output_shift(
     lhs_frac = to_quant_intent(lhs_precision).frac
     out_frac = to_quant_intent(output_precision).frac
     rhs_frac = to_quant_intent(rhs_precision).frac if rhs_precision is not None else 0
-    return max(0, int(lhs_frac + rhs_frac - out_frac))
+    shift = int(lhs_frac + rhs_frac - out_frac)
+    if shift < 0:
+        raise ValueError(f'output frac {out_frac} exceeds the accumulator frac {lhs_frac + rhs_frac}: no left shift.')
+    return shift
 
 
 def element_bytes(dtype: Optional[AIEDataType]) -> int:
