@@ -83,6 +83,9 @@ public:
 dut_graph dut;
 
 #if defined(__AIESIM__) || defined(__X86SIM__)
+// Graph iterations the simulator runs.
+#define N_ITER {{ iterations }}
+
 int main() {
   dut.init();
 

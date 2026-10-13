@@ -111,12 +111,13 @@ XPFM_GUARD :=
 .PHONY: hw hw_emu aiecom kernels xsa_hw xsa_hw_emu host package_hw package_hw_emu run_emu
 {% endif %}
 
-.PHONY: help clean compile all x86all x86com x86sim sim profile trace analyze
+.PHONY: help clean compile all ps x86all x86com x86sim sim profile trace analyze
 
 help::
 	@echo "Makefile Usage:"
 	@echo "  make all          - AIE hw compile (libadf.a)"
 	@echo "  make compile      - same as 'all'"
+	@echo "  make ps           - rebuild only the aiesim host program after a host-only app.cpp edit"
 	@echo "  make x86all       - x86 build then sim"
 	@echo "  make x86com       - AIE x86 compile"
 	@echo "  make x86sim       - Run x86 simulator"
@@ -139,6 +140,11 @@ $(STAMP_MARKER):
 
 $(LIBADF): $(MY_SOURCES) aie.cfg $(STAMP_MARKER)
 	set -o pipefail; v++ --compile --config aie.cfg --mode aie --target=hw $(AIE_FLAGS_HW) $(AIE_JOBS) |& tee log
+
+# A host-only edit to app.cpp (N_ITER, weight values) needs only aiesimulator's host program rebuilt; a graph change
+# (ports, kernels, buffer sizes) needs 'make compile'.
+ps:
+	$(MAKE) -C $(AIE_WORKDIR)/ps/c_rts/systemC all
 
 x86all: clean x86com x86sim
 
