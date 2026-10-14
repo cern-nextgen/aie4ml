@@ -1005,10 +1005,10 @@ def test_strided_conv_retiles_its_producers_frame(tmp_path):
 def test_shared_edge_needs_room_for_one_buffer(tmp_path):
     """Pinning the strided conv right beside its producer on a one-row array leaves the retiler, whose frame the
     conv must share, no tile its core reaches -- not west, where the producer sits, nor north or south: placement
-    refuses rather than accept a DMA hop, naming the pins and the share that conflict. With a second row the retiler
-    shares from above the conv."""
+    refuses rather than accept a DMA hop, naming the pins that conflict. With a second row the retiler shares from
+    above the conv."""
     directives = {'first': {'placement': {'col': 7, 'row': 0}}, 'second': {'placement': {'col': 8, 'row': 0}}}
-    with pytest.raises(ConfigRefused, match='pinned place, second_aie_retile -> second_aie in one buffer cannot all'):
+    with pytest.raises(ConfigRefused, match="first_aie's pinned place, second_aie's pinned place"):
         lower(_strided_chain_model(), tmp_path / 'one-row', directives, part=AIE1_PART, aie_config={'Rows': 1})
     ctx = lower(_strided_chain_model(), tmp_path / 'two-rows', directives, part=AIE1_PART, aie_config={'Rows': 2})
     assert ctx.ir.physical.placements['second_aie_retile']['row'] == 1

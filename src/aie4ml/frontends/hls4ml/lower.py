@@ -23,6 +23,7 @@ from ...ir import (
 from ...ir.context import AIEBackendContext, ProjectConfig
 from ...ir.graph import VIEW_FLATTEN_2D
 from ...passes.utils import is_pointwise_dense
+from ..common import LAYER_NODE_SUFFIX
 from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
 
 
@@ -83,7 +84,7 @@ class LowerToAieIr(ModelOptimizerPass):
             if layer.class_name.lower() == 'input':
                 continue
             node = OpNode(
-                name=f'{layer.name}_aie',
+                name=f'{layer.name}{LAYER_NODE_SUFFIX}',
                 op_type=self._map_op_type(layer),
             )
             self._collect_metadata(layer, node)

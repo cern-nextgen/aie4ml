@@ -39,7 +39,7 @@ from ortools.sat.python import cp_model
 from ..errors import ConfigRefused
 from ..ir import get_backend_context
 from ..ir.graph import ExecutionIR, ExecutionValue, OpNode
-from ..op_impls import get_family_resolver_registry
+from ..op_impls.family_registry import get_family_resolver_registry
 from .base import AIEPass, run_aie_passes
 from .estimate import kernel_cycles, leg_cycles
 from .legalize_layouts import convert_inputs

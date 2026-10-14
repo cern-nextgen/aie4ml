@@ -253,7 +253,7 @@ class _Model:
             if edge.direct:
                 copies += [1 if pair is None else 1 - pair for pair in held]
                 pairs += len(held)
-            if held and None not in held:  # nothing where every pair is one buffer
+            if held and all(pair is not None for pair in held):  # nothing where every pair is one buffer
                 copied = model.NewBoolVar('')
                 for pair in held:
                     model.Add(copied >= 1 - pair)

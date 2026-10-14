@@ -7,7 +7,7 @@ import numpy as np
 
 from ..ir import get_backend_context
 from ..ir.graph import has_input_role
-from ..op_impls import get_family_resolver_registry
+from ..op_impls.family_registry import get_family_resolver_registry
 from .base import AIEPass
 
 

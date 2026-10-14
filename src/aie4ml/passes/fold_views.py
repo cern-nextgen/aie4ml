@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..ir import TraitInstance, get_backend_context
-from ..op_impls import get_family_resolver_registry
+from ..op_impls.family_registry import get_family_resolver_registry
 from .base import AIEPass
 from .utils import keeps_values
 

@@ -12,6 +12,7 @@ import numpy as np
 from ...aie_types import FloatFormat, FloatIntent, QuantIntent
 from ...ir.context import AIEBackendContext
 from ...ir.graph import LogicalIR, OpNode, TensorVar
+from ..common import LAYER_NODE_SUFFIX
 from .utils import intent_from_initializer
 
 _ONNX_FLOAT = 1
@@ -247,7 +248,7 @@ class OnnxImportContext:
         roles: Optional[Sequence[str]] = None,
     ) -> OpNode:
         """Create a semantic OpNode, wire it, and register its outputs."""
-        op = OpNode(name=f'{node_name}_aie', op_type=op_type)
+        op = OpNode(name=f'{node_name}{LAYER_NODE_SUFFIX}', op_type=op_type)
         op.metadata.update(metadata)
         if roles is not None:
             op.metadata['input_roles'] = list(roles)

@@ -5,7 +5,14 @@ import pytest
 pytest.importorskip('ortools')
 
 from aie4ml.op_impls.base import BufferLocation  # noqa: E402
-from aie4ml.passes.placement import EdgeSpec, GraphSpec, NodeSpec, PlacementInfeasibleError, PortFace, Rect  # noqa: E402
+from aie4ml.passes.placement import (  # noqa: E402
+    EdgeSpec,
+    GraphSpec,
+    NodeSpec,
+    PlacementInfeasibleError,
+    PortFace,
+    Rect,
+)
 from aie4ml.passes.placement_solver import solve_placement, tidy_placement  # noqa: E402
 from aie4ml.passes.ranking import RANKING  # noqa: E402
 from passes.test_placement import _crossing_graph, _tail_graph, _three_branch_graph  # noqa: E402

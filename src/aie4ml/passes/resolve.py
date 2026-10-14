@@ -11,7 +11,7 @@ from ..ir.graph import (
     ViewPart,
     input_role,
 )
-from ..op_impls import get_family_resolver_registry
+from ..op_impls.family_registry import get_family_resolver_registry
 from ..op_impls.utils.io import check_io_view, resolve_io_route
 from .base import AIEPass
 

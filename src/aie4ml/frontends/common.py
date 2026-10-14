@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+import json
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from ..ir.graph import ROUTE_MODES, STAGING_CONTRACTS, TENSOR_LAYOUTS
 from ..op_impls.common_types import PORT_KIND_BUFFER, PORT_KINDS
@@ -13,6 +15,7 @@ _DIRECTIVE_FIELDS = {
     'hccs': ('B', 'S', 'Dmax', 'param_sets', 'inv_shift', 'use_clb'),
 }
 DIRECTIVES = frozenset({*_DIRECTIVE_FIELDS, 'layout', 'ports', 'approximation'})
+LAYER_NODE_SUFFIX = '_aie'  # a layer's node is `<layer>_aie`
 
 
 def _group(name: str, key: str, value: Any) -> Dict[str, Any]:
@@ -88,3 +91,30 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
         directives['hccs'] = _group(name, 'hccs', raw['hccs'])
 
     return directives
+
+
+def design_directives(
+    pipeline: Path, directives: Optional[Dict[str, Dict[str, Any]]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """`directives` (LayerDirectives) with the design a lowering recorded in `pipeline`, its aie_pipeline.json,
+    pinned: each layer's parallelism, microtiling and kernel as the design search chose them, and its place. Lowering
+    the same model with them builds that design again without searching; the kernels the compiler adds and the
+    hand-overs it shares follow from the layers pinned. A directive the record contradicts is refused."""
+    recorded = json.loads(Path(pipeline).read_text())
+    chosen, placed = recorded['optimizer'], recorded['physical']['placements']
+    merged = {layer: dict(given) for layer, given in (directives or {}).items()}
+    for node in recorded['logical']:
+        name = node['name']
+        design = {key: chosen[key][name] for key in ('parallelism', 'microtiling') if name in chosen[key]}
+        design.update(chosen['kernel'].get(name, {}))
+        if name in placed:
+            design['placement'] = {key: placed[name][key] for key in ('col', 'row')}
+        if not design:
+            continue
+        layer = merged.setdefault(name.removesuffix(LAYER_NODE_SUFFIX), {})
+        for key, value in design.items():
+            given = layer.get(key)
+            if given is not None and given != ({k: value.get(k) for k in given} if isinstance(value, dict) else value):
+                raise ValueError(f'{name}: directive {key}={given} contradicts the recorded design ({value}).')
+            layer[key] = value
+    return merged

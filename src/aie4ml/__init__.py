@@ -6,7 +6,7 @@ except ImportError:
     version_tuple = (0, 0, 0)
 
 
-from .frontends.onnx import from_onnx
+from .frontends.onnx import design_directives, from_onnx
 from .model import AIEModel, from_hls4ml
 
-__all__ = ['__version__', 'version_tuple', 'AIEModel', 'from_hls4ml', 'from_onnx']
+__all__ = ['__version__', 'version_tuple', 'AIEModel', 'design_directives', 'from_hls4ml', 'from_onnx']
