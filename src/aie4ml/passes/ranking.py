@@ -95,37 +95,41 @@ def solve_ranked(
     bounded to the end of its best value's step; the others several at once, weighted so they still rank in turn, as
     many as MAX_WEIGHT keeps apart. The bounds stay in `model`, so a later call ranks among its best solutions.
     `floors` holds a value no solution goes below for some criteria: a stage whose criteria all have one ends, proven,
-    at the first solution reaching them, which spares the solver proving it.
+    at the first solution reaching them, which spares the solver proving it, and takes no solve where the solution
+    before reaches them.
 
     None where no solution was found: the model is infeasible where the second is True, else the first solve ran out
     of time. A later solve that runs out of time without a solution leaves the one before it, not proven."""
     criteria, floors = dict(criteria), floors or {}
     solution, proven = None, True
     for stage, stepped in _stages(order, criteria) if order else [((), False)]:
-        objective, weight, floor = 0, 1, 0
+        objective, weight, floor, value = 0, 1, 0, 0
         for name in reversed(stage):
             objective += weight * criteria[name][0]
             floor = None if floor is None or name not in floors else floor + weight * floors[name]
+            value += 0 if solution is None else weight * solution.criteria[name]
             weight *= criteria[name][1] + 1
-        model.Minimize(objective)
-        start = solution.decisions if solution is not None else hint
-        model.ClearHints()
-        for variable in decisions:
-            if start is not None and variable.Index() in start:
-                model.AddHint(variable, start[variable.Index()])
-        reached = _Reached(floor) if stage and floor is not None else None
-        status = solver.Solve(model, reached)
-        if status == cp_model.INFEASIBLE:
-            if solution is not None:  # each stage keeps the solution before it: a solver fault, not the model's
-                raise RuntimeError('solve_ranked: a later stage refused the solution of the stage before it.')
-            return None, True
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return solution, False
-        proven = proven and (status == cp_model.OPTIMAL or (reached is not None and reached.reached))
-        solution = Solution(
-            {variable.Index(): solver.Value(variable) for variable in decisions},
-            {name: solver.Value(expression) for name, (expression, _) in criteria.items()},
-        )
+        # a solution before that reaches the floor is the stage's best: no solve
+        if not (stage and solution is not None and floor is not None and value <= floor):
+            model.Minimize(objective)
+            start = solution.decisions if solution is not None else hint
+            model.ClearHints()
+            for variable in decisions:
+                if start is not None and variable.Index() in start:
+                    model.AddHint(variable, start[variable.Index()])
+            reached = _Reached(floor) if stage and floor is not None else None
+            status = solver.Solve(model, reached)
+            if status == cp_model.INFEASIBLE:
+                if solution is not None:  # each stage keeps the solution before it: a solver fault, not the model's
+                    raise RuntimeError('solve_ranked: a later stage refused the solution of the stage before it.')
+                return None, True
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                return solution, False
+            proven = proven and (status == cp_model.OPTIMAL or (reached is not None and reached.reached))
+            solution = Solution(
+                {variable.Index(): solver.Value(variable) for variable in decisions},
+                {name: solver.Value(expression) for name, (expression, _) in criteria.items()},
+            )
         # Each criterion bounded by its value, which keeps exactly the solutions ranking alike on them, as one bound
         # on the weighted sum would, but which the solves after it propagate far better.
         for name in stage:
