@@ -367,31 +367,31 @@ def _route_streams(model, graph, places, chosen, held, W, H) -> Tuple[List[cp_mo
     streams.update((name, group, port) for name, ends in graph.below.items() for _, group, port in ends)
     if len(streams) <= min(stream_ports.values()):
         return [], 0
-    tiles: Dict[Tuple[str, str, int, int], Dict[str, Dict[int, cp_model.IntVar]]] = {}
+    tiles: Dict[Tuple[str, str, int, int], Dict[str, Dict[int, Any]]] = {}
 
     def endpoint(name, group, port, index):
         """Flags of where a port's `index`-th tile (`Placed.port_tiles`) sits: its column and row, equal to, at most
-        and at least each value."""
+        and at least each value; constants where its op has one place."""
         key = (name, group, port, index)
         if key not in tiles:
-            col, row = [], []
-            for p, literal in zip(places[name], chosen[name]):
-                at_col, at_row = sorted(p.port_tiles(group, port))[index]
-                col.append(at_col * literal)
-                row.append(at_row * literal)
             found = {}
-            for axis, terms, extent in (('col', col, W), ('row', row, H)):
-                at = model.NewIntVar(-1, extent, '')
-                model.Add(at == sum(terms))
-                found[axis + 'le'], found[axis + 'eq'] = {}, {}
-                for value in range(-1, extent + 1):
-                    le, eq = model.NewBoolVar(''), model.NewBoolVar('')
-                    model.Add(at <= value).OnlyEnforceIf(le)
-                    model.Add(at > value).OnlyEnforceIf(le.Not())
-                    model.Add(at == value).OnlyEnforceIf(eq)
-                    model.Add(at != value).OnlyEnforceIf(eq.Not())
-                    found[axis + 'le'][value], found[axis + 'eq'][value] = le, eq
-                found[axis + 'ge'] = {value: found[axis + 'le'][value - 1].Not() for value in range(0, extent + 1)}
+            axes = zip(*(sorted(p.port_tiles(group, port))[index] for p in places[name]))
+            for axis, extent, values in zip(('col', 'row'), (W, H), axes):
+                if len(values) == 1:
+                    found[axis + 'le'] = {value: int(values[0] <= value) for value in range(-1, extent + 1)}
+                    found[axis + 'eq'] = {value: int(values[0] == value) for value in range(-1, extent + 1)}
+                else:
+                    at = model.NewIntVar(-1, extent, '')
+                    model.Add(at == sum(value * literal for value, literal in zip(values, chosen[name])))
+                    found[axis + 'le'], found[axis + 'eq'] = {}, {}
+                    for value in range(-1, extent + 1):
+                        le, eq = model.NewBoolVar(''), model.NewBoolVar('')
+                        model.Add(at <= value).OnlyEnforceIf(le)
+                        model.Add(at > value).OnlyEnforceIf(le.Not())
+                        model.Add(at == value).OnlyEnforceIf(eq)
+                        model.Add(at != value).OnlyEnforceIf(eq.Not())
+                        found[axis + 'le'][value], found[axis + 'eq'][value] = le, eq
+                found[axis + 'ge'] = {value: _not(found[axis + 'le'][value - 1]) for value in range(0, extent + 1)}
             tiles[key] = found
         return tiles[key]
 
@@ -417,18 +417,12 @@ def _route_streams(model, graph, places, chosen, held, W, H) -> Tuple[List[cp_mo
     for stream, legs in branches.items():
         links: Dict[Tuple[int, int, str], cp_model.IntVar] = {}
         crossings: Dict[Tuple[int, str], cp_model.IntVar] = {}
-        for active, s, t in legs:
-            if s is None or t is None:
-                continue
-            for c in range(W - 1):
-                for side, a, b in (
-                    ('East', s['colle'][c], t['colge'][c + 1]),
-                    ('West', s['colge'][c + 1], t['colle'][c]),
-                ):
-                    if (c, side) not in crossings:
-                        crossings[c, side] = model.NewBoolVar('')
-                        cuts[c, side].append(crossings[c, side])
-                    model.Add(crossings[c, side] >= active + a + b - 2)
+
+        def crossing(key):
+            if key not in crossings:
+                crossings[key] = model.NewBoolVar('')
+                cuts[key].append(crossings[key])
+            return crossings[key]
 
         def link(key):
             if key not in links:
@@ -438,23 +432,34 @@ def _route_streams(model, graph, places, chosen, held, W, H) -> Tuple[List[cp_mo
 
         for active, s, t in legs:
             if s is None or t is None:
+                continue
+            for c in range(W - 1):
+                _implies(model, lambda: crossing((c, 'East')), active, s['colle'][c], t['colge'][c + 1])
+                _implies(model, lambda: crossing((c, 'West')), active, s['colge'][c + 1], t['colle'][c])
+
+        for active, s, t in legs:
+            if s is None or t is None:
                 _route_below(model, link, t if s is None else s, s is None, W, H)
                 continue
             first = model.NewBoolVar('')  # lateral on the source row, then vertical at the target column
             for r in range(H):
+                if _never(s['roweq'][r]) and _never(t['roweq'][r]):
+                    continue  # no route runs on the row
                 on_row = model.NewBoolVar('')
-                model.Add(on_row >= first + s['roweq'][r] - 1)
-                model.Add(on_row >= t['roweq'][r] - first)
+                _implies(model, lambda: on_row, first, s['roweq'][r])
+                _implies(model, lambda: on_row, first.Not(), t['roweq'][r])
                 for c in range(W - 1):
-                    model.Add(link((c, r, 'East')) >= active + s['colle'][c] + t['colge'][c + 1] + on_row - 3)
-                    model.Add(link((c + 1, r, 'West')) >= active + s['colge'][c + 1] + t['colle'][c] + on_row - 3)
+                    _implies(model, lambda: link((c, r, 'East')), active, s['colle'][c], t['colge'][c + 1], on_row)
+                    _implies(model, lambda: link((c + 1, r, 'West')), active, s['colge'][c + 1], t['colle'][c], on_row)
             for c in range(W):
+                if _never(s['coleq'][c]) and _never(t['coleq'][c]):
+                    continue  # no route runs in the column
                 on_col = model.NewBoolVar('')
-                model.Add(on_col >= first + t['coleq'][c] - 1)
-                model.Add(on_col >= s['coleq'][c] - first)
+                _implies(model, lambda: on_col, first, t['coleq'][c])
+                _implies(model, lambda: on_col, first.Not(), s['coleq'][c])
                 for r in range(H - 1):
-                    model.Add(link((c, r, 'North')) >= active + s['rowle'][r] + t['rowge'][r + 1] + on_col - 3)
-                    model.Add(link((c, r + 1, 'South')) >= active + s['rowge'][r + 1] + t['rowle'][r] + on_col - 3)
+                    _implies(model, lambda: link((c, r, 'North')), active, s['rowle'][r], t['rowge'][r + 1], on_col)
+                    _implies(model, lambda: link((c, r + 1, 'South')), active, s['rowge'][r + 1], t['rowle'][r], on_col)
     for (_, side), literals in cuts.items():
         model.Add(sum(literals) <= stream_ports[side] * H)
     overflow, bound = [], 0
@@ -471,15 +476,35 @@ def _route_below(model, link, end, up: bool, W: int, H: int) -> None:
     tile's column or a neighbour's within the array, through row -1, and the one hop across on the tile's row."""
     column = {d: model.NewBoolVar('') for d in (-1, 0, 1)}  # the column it runs in: west of the tile, its, east
     model.AddExactlyOne(column.values())
-    model.AddImplication(column[-1], end['colge'][1])
-    model.AddImplication(column[1], end['colle'][W - 2])
+    model.Add(column[-1] <= end['colge'][1])
+    model.Add(column[1] <= end['colle'][W - 2])
     for d, taken in column.items():
         for c in range(max(0, d), min(W, W + d)):
             at = end['coleq'][c - d]
+            if _never(at):
+                continue
             for r in range(H):
                 vertical = (c, r - 1, 'North') if up else (c, r, 'South')
-                model.Add(link(vertical) >= taken + at + end['rowge'][r] - 2)
+                _implies(model, lambda: link(vertical), taken, at, end['rowge'][r])
             if d:
                 across = (c, 'East' if d < 0 else 'West') if up else (c - d, 'West' if d < 0 else 'East')
                 for r in range(H):
-                    model.Add(link((across[0], r, across[1])) >= taken + at + end['roweq'][r] - 2)
+                    _implies(model, lambda: link((across[0], r, across[1])), taken, at, end['roweq'][r])
+
+
+def _never(flag) -> bool:
+    """Whether `flag`, a literal or a constant (`_route_streams`), is the constant 0."""
+    return isinstance(flag, int) and not flag
+
+
+def _not(flag):
+    return 1 - flag if isinstance(flag, int) else flag.Not()
+
+
+def _implies(model, target, *flags) -> None:
+    """The literal `target()` holds where all `flags` do: each a literal, 1 less one, or a constant. A constant 0
+    among them implies nothing: then nothing is added, and `target` is not called."""
+    if any(_never(flag) for flag in flags):
+        return
+    terms = [flag for flag in flags if not isinstance(flag, int)]
+    model.Add(target() >= sum(terms) - len(terms) + 1)
