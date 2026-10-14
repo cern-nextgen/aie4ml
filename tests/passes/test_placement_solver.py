@@ -25,14 +25,14 @@ LATENCY = RANKING['latency']
 def test_the_solver_makes_every_required_share(case):
     build, W = case
     graph = build()
-    _, shares, _ = solve_placement(graph, W, 8, 5, LATENCY)
+    _, shares, _ = solve_placement(graph, W, 8, 5, LATENCY, 0)
     required = {(e.dst, e.dst_group, dp) for e in graph.edges if e.shared for _, dp in e.port_pairs}
     assert required and required <= shares
 
 
 def test_the_solver_refuses_where_nothing_fits():
     with pytest.raises(PlacementInfeasibleError):
-        solve_placement(_tail_graph(tail_shared=False), 8, 8, 5, LATENCY)
+        solve_placement(_tail_graph(tail_shared=False), 8, 8, 5, LATENCY, 0)
 
 
 def _two_into_one(**edge):
@@ -57,22 +57,23 @@ def _two_into_one(**edge):
 
 def test_the_solver_refuses_required_shares_no_placement_makes_at_once():
     with pytest.raises(PlacementInfeasibleError):
-        solve_placement(_two_into_one(shared=True), 8, 4, 5, LATENCY)
+        solve_placement(_two_into_one(shared=True), 8, 4, 5, LATENCY, 0)
 
 
-def test_the_solver_shares_the_hand_over_that_shortens_the_critical_path():
+@pytest.mark.parametrize('W', [8, 30], ids=['array', 'window'])
+def test_the_solver_shares_the_hand_over_that_shortens_the_critical_path(W):
     """Of the two hand-overs only one can be one buffer: sharing k's leaves q's 40-cycle copy, 190 cycles in all;
-    sharing q's would leave k's 80, 230."""
+    sharing q's would leave k's 80, 230. On the wide array, ranked within the window of 9 columns from column 2."""
     graph = _two_into_one(shareable=True)
-    placed, shares, estimate = solve_placement(graph, 8, 4, 5, LATENCY)
+    placed, shares, estimate = solve_placement(graph, W, 4, 5, LATENCY, 2)
     assert shares == {('s', 'inB', 0)}
     assert estimate == {'latency': 190, 'interval': 100, 'copies': 1, 'proven': True}
     assert (placed['s'].x, placed['s'].y) == (placed['k'].x + 1, 3)  # k's top tile is west of s
-    _, *laid = tidy_placement(graph, 8, 4, 1.0, 0.05, 0, 5, placed, estimate)
+    _, *laid = tidy_placement(graph, W, 4, 1.0, 0.05, 2, 5, placed, estimate)
     assert laid == [shares, estimate]  # the layout keeps what the placement ranked
 
 
 def test_the_solver_keeps_every_stream_within_the_switch_ports():
     with pytest.raises(PlacementInfeasibleError, match='streams within the switches'):
-        solve_placement(_crossing_graph(5, PORTS), 10, 1, 5, LATENCY)
-    solve_placement(_crossing_graph(5, {**PORTS, 'East': 5}), 10, 1, 5, LATENCY)
+        solve_placement(_crossing_graph(5, PORTS), 10, 1, 5, LATENCY, 0)
+    solve_placement(_crossing_graph(5, {**PORTS, 'East': 5}), 10, 1, 5, LATENCY, 0)

@@ -25,7 +25,7 @@ PORTS = {'North': 6, 'South': 4, 'East': 4, 'West': 4}
 
 def _place(graph: GraphSpec, W: int, H: int):
     """`solve_placement` of `graph` by the latency ranking: (places, shares, estimate)."""
-    return solve_placement(graph, W, H, 5, RANKING['latency'])
+    return solve_placement(graph, W, H, 5, RANKING['latency'], 0)
 
 
 def _one_tile(name, locations, anchor=None, outputs=frozenset()):

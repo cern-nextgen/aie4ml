@@ -623,15 +623,15 @@ class PlaceKernels(AIEPass):
 
         # the design search's hand-off, which placement consumes: the IR keeps the placement it makes alone
         time, searched = placer_time(ctx), ctx.ir.optimizer.pop('placement', None)
+        first = int(device.preferred_column_start) - col_offset  # the layout packs from the PLIOs' columns
         if searched is None:
             floors = ctx.ir.optimizer.pop('bound', None)
-            placed, shares, estimate = solve_placement(graph, W, H, time, RANKING[optimize_mode(ctx)], floors)
+            placed, shares, estimate = solve_placement(graph, W, H, time, RANKING[optimize_mode(ctx)], first, floors)
         else:
             start = {
                 name: Placed(name, int(at['col']) - col_offset, int(at['row']) - row_offset, graph.specs[name].rect)
                 for name, at in searched.items()
             }
-            first = int(device.preferred_column_start) - col_offset  # the layout packs from the PLIOs' columns
             estimate = ctx.ir.optimizer.pop('estimate')
             placed, shares, estimate = tidy_placement(graph, W, H, self._lam, self._mu, first, time, start, estimate)
         buffers = _buffers(graph, placed, shares)

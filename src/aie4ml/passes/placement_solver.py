@@ -7,7 +7,9 @@ two ports' places line up and the placement takes it so, and copied by a DMA oth
 the design's ranking (`ranking.RANKING`) of what follows -- the critical path through the kernels' cycles and the
 copied legs', the slowest kernel or copied leg, the hand-overs copied (`solve_placement`) -- then, briefly and for the
 design kept alone, the layout: the edges' lengths and how tightly it packs the array from the PL columns and the
-bottom (`tidy_placement`).
+bottom (`tidy_placement`). Both decide without the routes first, on the columns that hold the best placement
+(`_window`), then check the routes of what they found (`_routes`): only where its streams do not fit do they decide
+again with the routes, on the whole array.
 """
 
 from __future__ import annotations
@@ -35,14 +37,19 @@ def solve_placement(
     H: int,
     time: float,
     order: Sequence[Tuple[str, bool]],
+    first: int,
     floors: Optional[Dict[str, int]] = None,
 ) -> Tuple[Dict[str, Placed], FrozenSet[Tuple[str, str, int]], Dict[str, Any]]:
     """The placement ranked best by `order` (`ranking.RANKING`) whose streams fit the switches, the input ports
     (op, group, port) it has read their producer's buffer, and its estimate (`PhysicalIR.estimate`): proven where each
     stage was, or reached `floors`, the design search's bound, below which no placement goes. A legal placement comes
-    first, as on a tight array neither the ranking nor the routes lead a search from scratch to one."""
-    legal = _Model(graph, W, H)
-    found, proven = legal.solve(time, (), {}, None)
+    first, as on a tight array neither the ranking nor the routes lead a search from scratch to one.
+
+    It is ranked without the streams' routes, within `_window` from column `first`: a relaxation, so where its best
+    placement's streams fit (`_routes`), that is the best. Only where they do not is it ranked again with the routes, on
+    the whole array, from that placement."""
+    relaxed = _Model(graph, W, H, _window(graph, W, H, first))
+    found, proven = relaxed.solve(time, (), {}, None)
     if found is None:
         if proven:
             conflict = _conflict(graph, W, H, time)
@@ -50,15 +57,23 @@ def solve_placement(
         raise PlacementInfeasibleError(
             f'the placement solver found no placement within AIEConfig PlacerTime={time:g}.', proven=False
         )
+    ranking = tuple(criterion for criterion in order if criterion[0] in PLACED)
+    best, proven = relaxed.solve(time, ranking, relaxed.estimate(), found.decisions, floors)
+    if best is None:  # the hint the solve starts from places, so only time stops it finding a placement
+        raise PlacementInfeasibleError(
+            f'the placement solver ranked no placement within AIEConfig PlacerTime={time:g}.', proven=False
+        )
+    placed, shares = relaxed.placed(best), relaxed.shares(best)
+    if _routes(graph, W, H, time, placed, shares):
+        return placed, shares, {**{name: best.criteria[name] for name in PLACED}, 'proven': proven}
 
     ranked = _Model(graph, W, H)
     criteria = {'overflow': ranked.route(), **ranked.estimate()}
     # the streams within the switches' ports first: what the search cannot drive out refuses the placement
-    found, proven = ranked.solve(time, (('overflow', False),), criteria, ranked.hint(legal.placed(found)))
+    found, proven = ranked.solve(time, (('overflow', False),), criteria, ranked.hint(placed))
     if found is None or found.criteria['overflow']:
         what = "keeps its streams within the switches' ports" if proven else 'fits the switches'
         raise PlacementInfeasibleError(f'no placement {what} within AIEConfig PlacerTime={time:g}.', proven=proven)
-    ranking = tuple(criterion for criterion in order if criterion[0] in PLACED)
     best, proven = ranked.solve(time, ranking, criteria, found.decisions, floors)
     if best is None:  # the hint the solve starts from places, so only time stops it finding a placement
         best, proven = found, False
@@ -78,10 +93,34 @@ def tidy_placement(
     estimate: Dict[str, Any],
 ) -> Tuple[Dict[str, Placed], FrozenSet[Tuple[str, str, int]], Dict[str, Any]]:
     """`solve_placement`'s `placed` and `estimate` laid out: of the placements whose streams fit the switches and
-    which rank at least as well, the shortest layout found within _LAYOUT_TIME, packed east from column `first`."""
-    tidy = _Model(graph, W, H)
-    overflow, _ = tidy.route()
-    tidy.model.Add(overflow == 0)
+    which rank at least as well, the shortest layout found within _LAYOUT_TIME, packed east from column `first`. Laid
+    out without the routes within `_window` first, as `solve_placement` ranks, and again with them on the whole array
+    only where that layout's streams do not fit."""
+    laid = _tidy(graph, W, H, _window(graph, W, H, first), lam, mu, first, time, placed, estimate)
+    if _routes(graph, W, H, time, *laid[:2]):
+        return laid
+    return _tidy(graph, W, H, None, lam, mu, first, time, placed, estimate, routed=True)
+
+
+def _tidy(
+    graph: GraphSpec,
+    W: int,
+    H: int,
+    window: Optional[range],
+    lam: float,
+    mu: float,
+    first: int,
+    time: float,
+    placed: Dict[str, Placed],
+    estimate: Dict[str, Any],
+    routed: bool = False,
+) -> Tuple[Dict[str, Placed], FrozenSet[Tuple[str, str, int]], Dict[str, Any]]:
+    """`tidy_placement`'s layout among the placements in `window` ranking at least as well, with their streams within
+    the switches' ports where `routed`."""
+    tidy = _Model(graph, W, H, window)
+    if routed:
+        overflow, _ = tidy.route()
+        tidy.model.Add(overflow == 0)
     criteria = tidy.estimate()
     for name in PLACED:
         tidy.model.Add(criteria[name][0] <= estimate[name])
@@ -99,6 +138,37 @@ def tidy_placement(
     return tidy.placed(best), tidy.shares(best), {**ranked, 'proven': estimate['proven']}
 
 
+def _window(graph: GraphSpec, W: int, H: int, first: int) -> Optional[range]:
+    """Columns, from `first` where they fit, that hold a placement ranking as well as the best on the array without
+    the streams' routes; None for the whole array. Every other rule is local to the columns an op's tiles and buffers
+    take, and the ranking depends only on the buffers shared: so the ops sharing buffers kept together, apart from the
+    rest, any placement packs into the sum of those columns, ranking alike. A pinned place does not move: it takes the
+    whole array."""
+    width = 0
+    for spec in graph.specs.values():
+        columns = [loc.rel_col for row in range(H) for loc in spec.rect.locations_at(row)]
+        width += max([spec.rect.w, *(col + 1 for col in columns)]) - min([0, *columns])
+    if width >= W or any(spec.anchor is not None for spec in graph.specs.values()):
+        return None
+    start = max(0, min(first, W - width))
+    return range(start, start + width)
+
+
+def _routes(
+    graph: GraphSpec, W: int, H: int, time: float, placed: Dict[str, Placed], shares: FrozenSet[Tuple[str, str, int]]
+) -> bool:
+    """Whether `placed`, reading their producer's buffer at the input ports `shares`, has routes for its streams
+    within the switches' ports (`_route_streams`)."""
+    pinned = {name: replace(spec, anchor=(placed[name].x, placed[name].y)) for name, spec in graph.specs.items()}
+    check = _Model(replace(graph, specs=pinned), W, H)
+    for port, pair in check.held.items():
+        check.model.Add(pair == int(port in shares))
+    overflow, _ = check.route()
+    check.model.Add(overflow == 0)
+    found, _ = check.solve(time, (), {}, None)
+    return found is not None
+
+
 def _conflict(graph: GraphSpec, W: int, H: int, time: float) -> str:
     """Of the places pinned and the hand-overs required in one buffer, some no placement holds at once (CP-SAT's
     sufficient assumptions for infeasibility), named; '' where the kernels alone do not fit."""
@@ -114,11 +184,12 @@ def _conflict(graph: GraphSpec, W: int, H: int, time: float) -> str:
 
 
 class _Model:
-    """The placement rules as one constraint program: a place per op, and per port pair of a shareable or shared
-    edge whether it is one buffer (`held`), by (consumer, group, port). `explain` makes each pinned place and each
-    pair a shared edge requires an assumption (`assumptions`, by name) rather than a rule (`_conflict`)."""
+    """The placement rules as one constraint program: a place per op, within the columns `window` where given, and per
+    port pair of a shareable or shared edge whether it is one buffer (`held`), by (consumer, group, port). `explain`
+    makes each pinned place and each pair a shared edge requires an assumption (`assumptions`, by name) rather than a
+    rule (`_conflict`)."""
 
-    def __init__(self, graph: GraphSpec, W: int, H: int, explain: bool = False):
+    def __init__(self, graph: GraphSpec, W: int, H: int, window: Optional[range] = None, explain: bool = False):
         self.graph, self.W, self.H = graph, W, H
         model = self.model = cp_model.CpModel()
         self.assumptions: Dict[str, cp_model.IntVar] = {}
@@ -127,7 +198,11 @@ class _Model:
             if edge.shareable or edge.shared:
                 pairable[edge.dst].update((edge.dst_group, dst_port) for _, dst_port in edge.port_pairs)
         found = {
-            name: _places(replace(spec, anchor=None) if explain else spec, W, H, frozenset(pairable[name]))
+            name: [
+                (p, past)
+                for p, past in _places(replace(spec, anchor=None) if explain else spec, W, H, frozenset(pairable[name]))
+                if window is None or (window.start <= p.x and p.x + p.rect.w <= window.stop)
+            ]
             for name, spec in graph.specs.items()
         }
         places = self.places = {name: [p for p, _ in options] for name, options in found.items()}
