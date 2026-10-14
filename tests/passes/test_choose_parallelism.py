@@ -125,7 +125,7 @@ def test_layout_conversions_count_toward_max_tiles(tmp_path, part):
     kernels = {inst.name for inst in ctx.ir.execution}
     assert len(kernels) == 3  # first, the retiler, second
     assert ctx.ir.optimizer['tiles'] == _placed_tiles(ctx) == 3
-    with pytest.raises(ConfigRefused, match='no design resolves within the tile budget'):
+    with pytest.raises(ConfigRefused, match='no design resolves within the tile budget: every design takes at least 3'):
         lower(_strided_chain_model(), tmp_path / 'tight', part=PART, aie_config={'Optimize': 'resource', 'MaxTiles': 2})
 
 

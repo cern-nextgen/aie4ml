@@ -213,6 +213,11 @@ def _groups(alternatives: Dict[str, List[_Alternative]], keys: Dict[str, tuple],
     return groups
 
 
+def _least(alternatives, cost) -> int:
+    """The least `cost` any design takes: each layer's cheapest alternative, summed."""
+    return sum(min(cost(alt) for alt in options) for options in alternatives.values())
+
+
 def _kernel(option) -> Dict[str, Any]:
     """The fallback kernel a search option resolves its layer with, or {} for the kernel resolution prefers."""
     return {key: value for key, value in (option or {}).items() if key not in ('parallelism', 'microtiling')}
@@ -1032,8 +1037,7 @@ class _Search:
         shared = self.shared
         if shared.unplaced_fill is None:
             return self.room
-        least = sum(min(alt.tiles + alt.reserved for alt in options) for options in alternatives.values())
-        known = max(shared.placed_fill, least)
+        known = max(shared.placed_fill, _least(alternatives, lambda alt: alt.tiles + alt.reserved))
         if known >= shared.unplaced_fill:
             return min(self.room, shared.unplaced_fill - 1)
         return min(self.room, known + (shared.unplaced_fill - known) // 2)
@@ -1128,7 +1132,16 @@ class _Search:
         if beat is not None and picks is not None:
             return None
         if not self.tried:
-            raise ConfigRefused(self._failure('no design resolves within the tile budget', unbuilt))
+            kernels = _least(alternatives, lambda alt: alt.tiles)
+            filled = _least(alternatives, lambda alt: alt.tiles + alt.reserved)
+            raise ConfigRefused(
+                self._failure(
+                    f'no design resolves within the tile budget: every design takes at least {kernels} tiles for its '
+                    f"kernels, and fills at least {filled} of the array's {self.room} with those its input buffers "
+                    'reserve',
+                    unbuilt,
+                )
+            )
         raise ConfigRefused(
             self._failure(f'none of the {self.tried} designs within the tile budget can be built', unbuilt)
         )
