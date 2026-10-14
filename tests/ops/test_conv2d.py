@@ -781,6 +781,14 @@ def test_stream_conv_carries_the_logical_tensor(tmp_path):
     assert ('ifm[0]', 'b_aie.in1[0]') in {(e['source'], e['target']) for e in plan['direct_edges']}
 
 
+def test_stream_conv_reads_the_whole_image_on_one_tile(tmp_path):
+    """A streamed conv implements no partition, not even one row band ('outer'): its kernel reads the image's rows off
+    the wire, not a band's padded rows, which it would wait for forever."""
+    row_band = {'b': {**STREAM_DIRECTIVES['b'], 'parallelism': {'contract': 'outer', 'cas_num': 1}}}
+    with pytest.raises(ConfigRefused, match='nor one row band'):
+        lower(_stream_model(), tmp_path, row_band, part=AIE1_PART)
+
+
 def test_conv_refuses_dilation(tmp_path):
     nodes: list = []
     inits: list = []

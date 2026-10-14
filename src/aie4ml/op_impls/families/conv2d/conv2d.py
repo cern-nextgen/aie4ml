@@ -972,8 +972,12 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
                 f'{node.name}: {self.variant_id} does not implement strides {config.spatial.strides}; the '
                 'band it keeps and the columns it places are both written for a dense window.'
             )
-        if config.parallelism.cas_num != 1 or config.parallelism.cas_length != 1:
-            raise ConfigRefused(f'{node.name}: {self.variant_id} does not implement partitioning yet.')
+        parallelism = config.parallelism
+        if (parallelism.contract, parallelism.cas_num, parallelism.cas_length) != ('inner', 1, 1):
+            raise ConfigRefused(
+                f'{node.name}: {self.variant_id} does not implement partitioning yet, nor one row band: it reads the '
+                'whole image on one tile.'
+            )
         if config.flags.emit_flattened:
             raise NotImplementedError(f'{node.name}: {self.variant_id} writes a frame, not a flattened row.')
         if config.pool is not None:
