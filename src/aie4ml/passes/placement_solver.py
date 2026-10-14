@@ -124,7 +124,7 @@ class _Model:
         self.assumptions: Dict[str, cp_model.IntVar] = {}
         pairable = defaultdict(set)  # op -> its input ports a pair may hand over one buffer on
         for edge in graph.edges:
-            if edge.direct and edge.one_to_one and (edge.shareable or edge.shared):
+            if edge.shareable or edge.shared:
                 pairable[edge.dst].update((edge.dst_group, dst_port) for _, dst_port in edge.port_pairs)
         found = {
             name: _places(replace(spec, anchor=None) if explain else spec, W, H, frozenset(pairable[name]))
@@ -145,7 +145,7 @@ class _Model:
         # port's own location holds nothing then. A shared edge's pairs must be.
         held = self.held = {}
         for edge in graph.edges:
-            if not (edge.direct and edge.one_to_one and (edge.shareable or edge.shared)):
+            if not (edge.shareable or edge.shared):
                 continue
             src, dst = graph.specs[edge.src].rect, graph.specs[edge.dst].rect
             at = {(p.x, p.y): literal for p, literal in zip(places[edge.dst], chosen[edge.dst])}

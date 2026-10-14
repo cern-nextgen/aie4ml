@@ -46,7 +46,7 @@ from .legalize_layouts import convert_inputs
 from .placement import PlacementInfeasibleError, instance_rect, pair_offsets, share_offsets
 from .ranking import PLACED, RANKING, optimize_mode, rank, solve_ranked
 from .resolve import logical_values, output_contracts, resolve_instance
-from .shared_buffer import pair_problem
+from .shared_buffer import static_problem
 from .transport.classify import classify_connection, direct_unit
 from .transport.collect import TransportCollector
 from .transport.memtile import check_memtile_leg
@@ -87,7 +87,7 @@ class _LegFacts(NamedTuple):
     ports: Optional[Tuple[Tuple[str, int], ...]]  # its consumer's ports some placement has read the producer's buffer
     own: Tuple[str, int, int]  # (source tensor, latency, interval) through a buffer of its own
     shared: Optional[Tuple[str, int, int]]  # the same through the producer's buffer, or None where none can
-    edge: Optional[Tuple[bool, Tuple[Tuple[int, int], ...]]]  # a direct kernel leg's (one to one, port pairs)
+    edge: Optional[Tuple[bool, Tuple[Tuple[int, int], ...]]]  # a direct kernel leg's (shareable, port pairs)
     unshared: int  # its direct port pairs no placement shares, each alone: those a DMA copies at best
 
 
@@ -317,7 +317,7 @@ class ChooseParallelism(AIEPass):
             'proven': not doubts,
             'doubts': doubts,
             **search.choices(design),
-            # The trial ranked the design's placement already: the placer only lays it out (`PlaceKernels`).
+            # The trial ranked the design's placement already: the placer, which consumes these, only lays it out.
             'placement': {
                 name: {key: placed[key] for key in ('col', 'row')}
                 for name, placed in built.ir.physical.placements.items()
@@ -424,12 +424,13 @@ class _Search:
         for tensors in self.reads.values():
             for tensor in tensors:
                 self.readers[tensor] += 1
-        # what each read of a tensor reads it as: the tensor itself, or a view over it, once per input reading it
-        self.read_as: Dict[str, List[str]] = defaultdict(list)
+        # each read of a tensor: what it reads it as -- the tensor itself, or a view over it -- and the layer reading
+        # it, once per input reading it
+        self.read_as: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         for node in self.layers:
             for t in node.inputs:
                 for source in () if t.is_parameter else self._sources(t.name):
-                    self.read_as[source].append(t.name)
+                    self.read_as[source].append((t.name, node.name))
         self.refusals = shared.refusals
         self.unplaced = shared.unplaced
         self.doubts: List[str] = []  # why the design found may not be the best there is
@@ -594,23 +595,23 @@ class _Search:
                 for port in leg.producer.selected_ports(binding.count):
                     (tile,) = self._port_tiles(source, 'outputs', binding.group, port)
                     streams.append((source.name, (binding.group, port), (tile, (BELOW,))))
-            # placement's edge (`placement._transport_edges`): a direct leg's port pairs, one buffer per pair only
-            # where no port is broadcast, gathered or read by another leg
+            # placement's edge (`placement._transport_edges`): a direct leg's port pairs, and whether each may be
+            # one buffer (`shared_buffer.static_problem`)
             edge = None
+            src_group, dst_group = leg.producer.group, None if leg.consumer is None else leg.consumer.group
             if realization == 'direct' and source is not None and sink is not None:
                 unit = direct_unit(execution, leg, merge=merge)
-                exclusive = self._exclusive(leg, execution)
-                edge = (exclusive and unit.one_to_one(), tuple(zip(unit.producer_ports, unit.consumer_ports)))
+                pairs = tuple(zip(unit.producer_ports, unit.consumer_ports))
+                problems = (
+                    static_problem(unit, source, src_group, w, sink, dst_group, r, self._readers(leg, w, execution))
+                    for w, r in pairs
+                )
+                edge = (not any(problems), pairs)
             # the consumer's ports it may read in the producer's buffer: where some placement lines them all up; and
             # its pairs no placement lines up even alone, which placement decides pair by pair
             ports, unshared = None, 0 if edge is None else len(edge[1])
             pairs = () if edge is None else edge[1]
-            src_group, dst_group = leg.producer.group, None if leg.consumer is None else leg.consumer.group
-            if (
-                edge is not None
-                and edge[0]
-                and not any(pair_problem(source, src_group, w, sink, dst_group, r) for w, r in pairs)
-            ):
+            if edge is not None and edge[0]:
                 read = tuple(r for _, r in pairs)
                 device = self.ctx.device
                 rows, mirrored = int(device.rows - device.row_start), device.alternating_horizontal
@@ -639,20 +640,16 @@ class _Search:
         self._leg_cache[key] = facts
         return facts
 
-    def _exclusive(self, leg, execution) -> bool:
-        """Whether every producer port the leg reads is read by it alone: by no other read of the tensor, whole or
-        through a view over that port (`TransportCollector.ports_read`), and not as a graph output. A value only the
-        execution graph has is a converter's, which the op that asked for it alone reads."""
+    def _readers(self, leg, port: int, execution) -> List[str]:
+        """Who reads port `port` of the leg's producer, as `TransportCollector.port_readers` lists them over the whole
+        graph, which the search's execution graph of one layer does not hold: each layer once per input reading it,
+        whole or through a view over that port, and the graph boundary. A value only the execution graph has is a
+        converter's, which the op that asked for it alone reads."""
         tensor = leg.producer.tensor
-        if tensor in self.graph_outputs:
-            return False
         collector = TransportCollector(execution)
-        count = execution.get(leg.producer.node.name).ports.outputs[tensor].count
-        reads = self.read_as.get(tensor) or [tensor]
-        return all(
-            sum(port in collector.ports_read(value, tensor) for value in reads) == 1
-            for port in leg.producer.selected_ports(count)
-        )
+        reads = self.read_as.get(tensor) or [(tensor, leg.consumer.node.name)]
+        readers = [layer for value, layer in reads if port in collector.ports_read(value, tensor)]
+        return readers + (['the graph boundary'] if tensor in self.graph_outputs else [])
 
     def _rect(self, inst):
         """`instance_rect` of an instance, cached by it."""

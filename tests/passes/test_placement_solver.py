@@ -49,7 +49,7 @@ def _two_into_one(**edge):
     reads = (BufferLocation('inA', 0, 0, 0, (0, 3), reader=(0, 0)), BufferLocation('inB', 0, 0, 0, (1, 2), (0, 0)))
     specs = {'q': op('q', 4, top, 100), 'k': op('k', 4, top, 100), 's': op('s', 1, reads, 50)}
     edges = [
-        EdgeSpec(src, 's', src, True, True, 'out1', group, ((0, 0),), dst_tensor=src, cycles=(cc, cc), **edge)
+        EdgeSpec(src, 's', src, True, 'out1', group, ((0, 0),), dst_tensor=src, cycles=(cc, cc), **edge)
         for src, group, cc in (('q', 'inA', 40), ('k', 'inB', 80))
     ]
     return GraphSpec(specs, edges, stream_ports=PORTS)

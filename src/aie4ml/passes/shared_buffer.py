@@ -6,16 +6,17 @@ realises it as one buffer both kernels reach exactly where the producer's and th
 coincide, and as a DMA copy between two pinned buffers anywhere else. An edge the execution graph marks
 `shared_memory` must be the former, which is known before the compiler runs:
 
-- each port is a buffer port bound to exactly one kernel port, and nothing else reads the producer's port, so
-  nothing asks for a copy (fanout, multicast, a graph output, another view over it): a view reading a port alone,
-  as a Split along the producer's ports does, leaves it one-to-one;
+- each port is a buffer port bound to exactly one kernel port, joins no other pair of its leg, and nothing else
+  reads the producer's port, so nothing asks for a copy (fanout, multicast, a gather, a graph output, another view
+  over it): a view reading a port alone, as a Split along the producer's ports does, leaves it one-to-one;
 - once both ops are placed, the producer's port pins the buffer where the consumer's does, or in a memory the one
   core reading the consumer's port reaches (`BufferLocation.reader`, `memory_reach`): its own, west, north or south
   (east on AIE odd rows). Placement records where each port's buffer then sits (`placed_buffers`), and the
   consumer's graph pins its port there too (`pinned_buffers`).
 
-The first does not depend on placement, and the placer refuses it outright; it asks the second while it
-searches. The physical verifier asks both again of the finished plan.
+The first does not depend on placement (`static_problem`, which the design search, the placer, the memory plan and
+the physical verifier all ask), and the placer refuses it outright; it asks the second while it searches. The
+physical verifier asks both again of the finished plan.
 """
 
 from __future__ import annotations
@@ -61,25 +62,32 @@ def pair_problem(producer, p_group: str, p_port: int, consumer, c_group: str, c_
     return None
 
 
-def static_problem(ctx, producer, p_group: str, p_port: int, consumer, c_group: str, c_port: int) -> Optional[str]:
-    """Why no placement could let these ports share one buffer, or None: `pair_problem`, or another reader of the
-    producer's port."""
+def static_problem(
+    unit, producer, p_group: str, p_port: int, consumer, c_group: str, c_port: int, readers: Sequence[str]
+) -> Optional[str]:
+    """Why no placement could let these ports of a direct leg (`unit`) share one buffer, or None: either joins
+    another pair of the leg (a broadcast or a gather), `pair_problem`, or `readers` -- every read of the producer's
+    port, as `TransportCollector.port_readers` lists them -- holds more than this one."""
+    if list(unit.producer_ports).count(p_port) > 1 or list(unit.consumer_ports).count(c_port) > 1:
+        return f'{producer.name}.{p_group}[{p_port}] -> {consumer.name}.{c_group}[{c_port}] is broadcast or gathered'
     problem = pair_problem(producer, p_group, p_port, consumer, c_group, c_port)
     if problem:
         return problem
+    if len(readers) != 1:
+        return f'{producer.name}.{p_group}[{p_port}] is read by {list(readers)}'
+    return None
+
+
+def hand_over_problem(
+    ctx, unit, producer, p_group: str, p_port: int, consumer, c_group: str, c_port: int
+) -> Optional[str]:
+    """Why two placed kernel ports of a direct leg (`unit`) do not hand over one buffer -- `static_problem` with the
+    graph's readers, else where placement put their buffers -- or None."""
     from .transport.collect import TransportCollector  # the transport package imports this module
 
     tensor = next(name for name, binding in producer.ports.outputs.items() if binding.group == p_group)
     readers = TransportCollector(ctx.ir.execution).port_readers(tensor, int(p_port))
-    if readers != [consumer.name]:
-        return f'{producer.name}.{p_group}[{p_port}] is read by {readers}'
-    return None
-
-
-def hand_over_problem(ctx, producer, p_group: str, p_port: int, consumer, c_group: str, c_port: int) -> Optional[str]:
-    """Why two placed kernel ports do not hand over one buffer -- `static_problem`, else where placement put their
-    buffers -- or None."""
-    problem = static_problem(ctx, producer, p_group, p_port, consumer, c_group, c_port)
+    problem = static_problem(unit, producer, p_group, p_port, consumer, c_group, c_port, readers)
     written = placed_locations(ctx, producer, p_group, p_port)
     return problem or location_problem(written, placed_locations(ctx, consumer, c_group, c_port))
 

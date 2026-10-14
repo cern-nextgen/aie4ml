@@ -183,9 +183,8 @@ class _MemoryPlanMaterializer:
                 # the producer pins it in a memory the consumer's reader reaches and nothing else reads it
                 # (`shared_buffer`), the consumer's graph then pinning its port there too; counted as a DMA
                 # copy anywhere else, which is what it is wherever the locations differ.
-                shared = list(p_ports).count(p_port) == 1 and not hand_over_problem(  # a broadcast copies to each
-                    self.ctx, producer, p.group, p_port, consumer, c.group, c_port
-                )
+                problem = hand_over_problem(self.ctx, entry.unit, producer, p.group, p_port, consumer, c.group, c_port)
+                shared = problem is None
                 edge['realization'] = SHARED_MEMORY if shared else DMA
             self.direct_edges.append(edge)
 

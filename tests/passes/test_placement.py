@@ -127,7 +127,6 @@ def _three_branch_graph():
                     previous,
                     name,
                     direct=True,
-                    one_to_one=not is_broadcast,
                     src_group='out1',
                     dst_group='in1',
                     port_pairs=tuple((port, port) for port in range(3)),
@@ -213,7 +212,7 @@ def _reach_graph(producer_row: int, shareable: bool) -> GraphSpec:
         'c': _one_tile('c', (BufferLocation('in1', 0, -1, 0, (0, 3), reader=(0, 0)),), (4, 2)),
         'z': _one_tile('z', out, (3, 2), frozenset({'out1'})),
     }
-    return GraphSpec(specs, [EdgeSpec('p', 'c', 'x', True, True, 'out1', 'in1', ((0, 0),), shareable=shareable)], PORTS)
+    return GraphSpec(specs, [EdgeSpec('p', 'c', 'x', True, 'out1', 'in1', ((0, 0),), shareable=shareable)], PORTS)
 
 
 @pytest.mark.parametrize('dy', [1, -1], ids=['north', 'south'])

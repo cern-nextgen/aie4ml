@@ -16,6 +16,7 @@ from ..op_impls.base import BufferLocation, StreamLocation
 from .base import AIEPass
 from .estimate import kernel_cycles, leg_cycles
 from .shared_buffer import port_reach, static_problem
+from .transport.collect import TransportCollector
 from .transport.model import Connection
 
 # ---------------------------------------------------------------------------
@@ -90,7 +91,6 @@ class EdgeSpec:
     dst: str
     tensor: Optional[str] = None
     direct: bool = False
-    one_to_one: bool = True  # each port pair its own buffer: no port broadcast or gathered
     src_group: str = ''
     dst_group: str = ''
     port_pairs: Tuple[Tuple[int, int], ...] = ()
@@ -431,14 +431,7 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> Tuple[List[EdgeSpec], 
                 below[connection.consumer.node.name].update(
                     ('inputs', connection.consumer.group, port) for port in consumer_ports(entry, connection.consumer)
                 )
-    producer_port_uses = {}
-    for entry in entries:
-        if entry.producer.node is None:
-            continue
-        for port in producer_ports(entry):
-            key = (entry.producer.node.name, entry.producer.tensor, int(port))
-            producer_port_uses[key] = producer_port_uses.get(key, 0) + 1
-
+    collector = TransportCollector(ctx.ir.execution)
     edges = []
     seen = set()
     for entry in entries:
@@ -446,17 +439,12 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> Tuple[List[EdgeSpec], 
         if src is None:
             continue
         entry_producer_ports = producer_ports(entry)
-        producer_exclusive = all(
-            producer_port_uses[(src.name, entry.producer.tensor, port)] == 1 for port in entry_producer_ports
-        )
         for connection in entry.consumers:
             consumer = connection.consumer
             if consumer is None or src.name not in kernel_set or consumer.node.name not in kernel_set:
                 continue
             entry_consumer_ports = consumer_ports(entry, consumer)
             direct = entry.decision is not None and entry.decision.realization == 'direct'
-            # one buffer per port pair only: no port read by another leg, broadcast or gathered
-            one_to_one = direct and producer_exclusive and entry.unit.one_to_one()
             shared = ctx.ir.execution.get(consumer.node.name).input(consumer.tensor).shared_memory
             if shared and not direct:
                 raise RuntimeError(
@@ -472,13 +460,14 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> Tuple[List[EdgeSpec], 
                     for p_port, c_port in zip(entry_producer_ports, entry_consumer_ports)
                     for problem in (
                         static_problem(
-                            ctx,
+                            entry.unit,
                             producer_inst,
                             entry.producer.group,
                             p_port,
                             consumer_inst,
                             consumer.group,
                             c_port,
+                            collector.port_readers(entry.producer.tensor, p_port),
                         ),
                     )
                     if problem
@@ -508,13 +497,12 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> Tuple[List[EdgeSpec], 
                     dst=consumer.node.name,
                     tensor=entry.producer.tensor,
                     direct=direct,
-                    one_to_one=one_to_one,
                     src_group=entry.producer.group,
                     dst_group=consumer.group,
                     port_pairs=tuple(zip(entry_producer_ports, entry_consumer_ports)) if direct else (),
                     dst_tensor=consumer.tensor,
                     shared=shared,
-                    shareable=one_to_one and not problems,
+                    shareable=direct and not problems,
                     cycles=_copy_cycles(ctx, entry, connection),
                 )
             )
@@ -633,9 +621,10 @@ class PlaceKernels(AIEPass):
         if not graph.specs:
             return False
 
-        time, searched = placer_time(ctx), ctx.ir.optimizer.get('placement')
+        # the design search's hand-off, which placement consumes: the IR keeps the placement it makes alone
+        time, searched = placer_time(ctx), ctx.ir.optimizer.pop('placement', None)
         if searched is None:
-            floors = ctx.ir.optimizer.get('bound')
+            floors = ctx.ir.optimizer.pop('bound', None)
             placed, shares, estimate = solve_placement(graph, W, H, time, RANKING[optimize_mode(ctx)], floors)
         else:
             start = {
@@ -643,7 +632,7 @@ class PlaceKernels(AIEPass):
                 for name, at in searched.items()
             }
             first = int(device.preferred_column_start) - col_offset  # the layout packs from the PLIOs' columns
-            estimate = ctx.ir.optimizer['estimate']
+            estimate = ctx.ir.optimizer.pop('estimate')
             placed, shares, estimate = tidy_placement(graph, W, H, self._lam, self._mu, first, time, start, estimate)
         buffers = _buffers(graph, placed, shares)
         placements = {

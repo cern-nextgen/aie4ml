@@ -59,6 +59,7 @@ def test_a_recorded_design_is_built_again_without_a_search(tmp_path):
     replayed = tmp_path / 'again' / 'aie_pipeline.json'
     first, second = (json.loads(path.read_text())['physical'] for path in (recorded, replayed))
     assert 'second_aie_retile' in first['placements'] and first['placements'] == second['placements']
+    assert not {'placement', 'estimate'} & set(json.loads(recorded.read_text())['optimizer'])  # placement consumed them
     assert first['plan']['direct_edges'] == second['plan']['direct_edges']
     assert again.context.ir.optimizer['designs_tried'] == 1
     with pytest.raises(ValueError, match='contradicts the recorded design'):

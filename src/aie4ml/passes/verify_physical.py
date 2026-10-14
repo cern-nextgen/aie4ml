@@ -20,6 +20,7 @@ from ..op_impls.common_types import PORT_KIND_BUFFER
 from .base import AIEPass
 from .shared_buffer import SHARED_MEMORY, hand_over_problem, placed_buffers, placed_locations, reached
 from .transport.dma_resources import KERNEL_BUFFERS, memtile_port_bds, pool_use, tile_port_bds
+from .transport.model import TransportUnit
 from .transport.routing import BELOW, port_tiles, route_overflow
 from .utils import sanitize_identifier
 
@@ -84,10 +85,10 @@ def verify_physical(ctx) -> None:
                     f'{inst.name}: must read {item.tensor!r} through shared memory on each of its {ports} ports, '
                     f'but the plan hands it over directly on {len(legs)}.'
                 )
-            for leg in legs:
-                producer, p_group, p_port = _port(leg['source'], graphs)
-                _, c_group, c_port = _port(leg['target'], graphs)
-                problem = hand_over_problem(ctx, producer, p_group, p_port, inst, c_group, c_port)
+            ends = [(_port(leg['source'], graphs), _port(leg['target'], graphs)) for leg in legs]
+            unit = TransportUnit(tuple(source[2] for source, _ in ends), tuple(target[2] for _, target in ends))
+            for leg, ((producer, p_group, p_port), (_, c_group, c_port)) in zip(legs, ends):
+                problem = hand_over_problem(ctx, unit, producer, p_group, p_port, inst, c_group, c_port)
                 if not problem and leg.get('realization') != SHARED_MEMORY:
                     problem = f"the plan records it as {leg.get('realization')!r}"
                 kernel_ports = _kernel_ports(producer, p_group, p_port, 'outputs') | _kernel_ports(
