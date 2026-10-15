@@ -88,6 +88,8 @@ void place_graph(int COL_START, int ROW_START)
     }
 
     adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK);
+    // twice the compiler's default: a fully unrolled 16-deep reduction with bias and ReLU spilled 1152 bytes (AIE-MLv2)
+    adf::stack_size(kk[idx]) = 2048;
     adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, AIE4ML_WEIGHT_BANK);
     if (pos == 0) {  // the chain's first kernel seeds its accumulators with the bias
       adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, AIE4ML_STACK_BANK);
