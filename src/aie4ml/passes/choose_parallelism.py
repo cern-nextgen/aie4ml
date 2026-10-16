@@ -47,7 +47,7 @@ from .placement import PlacementInfeasibleError, instance_rect, pair_offsets, sh
 from .ranking import PLACED, RANKING, optimize_mode, rank, solve_ranked
 from .resolve import logical_values, output_contracts, resolve_instance
 from .shared_buffer import static_problem
-from .transport.classify import classify_connection, direct_unit
+from .transport.classify import classify_connection, direct_unit, gathers
 from .transport.collect import TransportCollector
 from .transport.memtile import check_memtile_leg
 from .transport.routing import BELOW, port_tiles, route_overflow
@@ -424,11 +424,6 @@ class _Search:
         self.graph_outputs = tuple(ctx.ir.logical.output_tensor_names)
         self.read = {tensor for tensors in self.reads.values() for tensor in tensors}  # every tensor a layer reads
         self.produced = {t.name for node in self.layers for t in node.outputs}  # every tensor a layer writes
-        # how many layers read each tensor: a tensor more than one reads is copied to each, never shared
-        self.readers: Dict[str, int] = defaultdict(int)
-        for tensors in self.reads.values():
-            for tensor in tensors:
-                self.readers[tensor] += 1
         # each read of a tensor: what it reads it as -- the tensor itself, or a view over it -- and the layer reading
         # it, once per input reading it
         self.read_as: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
@@ -578,17 +573,9 @@ class _Search:
         source, sink = insts
         streams = []
         try:
-            # an ordered merge only where the leg is its tensor's only reader, not through a view over it either
-            # (`classify.gathers`); a value only the execution graph has is a converter's, which the op that asked for
-            # it alone reads
-            tensor = leg.producer.tensor
-            merge = (
-                bool(self.ctx.device.packet_ordered_merge)
-                and sink is not None
-                and self.readers.get(tensor, 1) == 1
-                and all(value == tensor for value, _ in self.read_as.get(tensor, ()))
-                and tensor not in self.graph_outputs
-            )
+            # an ordered merge where transport makes one, over the graph's reads of the tensor
+            tensor, reads = leg.producer.tensor, self._reads(leg)
+            merge = sink is not None and gathers(self.ctx.device, tensor, reads, self.graph_outputs)
             realization = classify_connection(leg, execution, self.ctx.device, merge=merge).realization
             if realization == 'memtile':
                 check_memtile_leg(leg, execution, self.ctx.device)
@@ -609,8 +596,11 @@ class _Search:
             if realization == 'direct' and source is not None and sink is not None:
                 unit = direct_unit(execution, leg, merge=merge)
                 pairs = tuple(zip(unit.producer_ports, unit.consumer_ports))
+                collector = TransportCollector(execution)
                 problems = (
-                    static_problem(unit, source, src_group, w, sink, dst_group, r, self._readers(leg, w, execution))
+                    static_problem(
+                        unit, source, src_group, w, sink, dst_group, r, collector.port_readers(tensor, w, reads)
+                    )
                     for w, r in pairs
                 )
                 edge = (not any(problems), pairs)
@@ -647,16 +637,12 @@ class _Search:
         self._leg_cache[key] = facts
         return facts
 
-    def _readers(self, leg, port: int, execution) -> List[str]:
-        """Who reads port `port` of the leg's producer, as `TransportCollector.port_readers` lists them over the whole
-        graph, which the search's execution graph of one layer does not hold: each layer once per input reading it,
-        whole or through a view over that port, and the graph boundary. A value only the execution graph has is a
-        converter's, which the op that asked for it alone reads."""
+    def _reads(self, leg) -> List[Tuple[str, str]]:
+        """Every read of the leg's tensor over the whole graph, as `TransportCollector.reads` lists them, which the
+        search's execution graph of one layer does not hold: by layer, once per input, whole or through a view. A value
+        only the execution graph has is a converter's, which the op that asked for it alone reads."""
         tensor = leg.producer.tensor
-        collector = TransportCollector(execution)
-        reads = self.read_as.get(tensor) or [(tensor, leg.consumer.node.name)]
-        readers = [layer for value, layer in reads if port in collector.ports_read(value, tensor)]
-        return readers + (['the graph boundary'] if tensor in self.graph_outputs else [])
+        return self.read_as.get(tensor) or ([] if leg.consumer is None else [(tensor, leg.consumer.node.name)])
 
     def _rect(self, inst):
         """`instance_rect` of an instance, cached by it."""

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ...errors import ConfigRefused
 from ...ir import ExecutionView, OpNode
@@ -56,12 +56,22 @@ class TransportCollector:
         part = view.parts[0]
         return self._slice_producer_ports(inst.node, source, view.axis, part.start, part.extent)[0]
 
-    def port_readers(self, tensor: str, port: int) -> List[str]:
-        """Who reads port `port` of `tensor`'s producer: each instance once per input reading it, whole or through a
-        view covering it, and the graph boundary where `tensor` is a graph output."""
-        readers = [
-            inst.name for inst in self.execution for item in inst.inputs if port in self.ports_read(item.tensor, tensor)
+    def reads(self, tensor: str) -> List[Tuple[str, str]]:
+        """Every read of `tensor`: (the value read -- `tensor` itself or a view over it -- and the instance reading
+        it), once per input."""
+        return [
+            (item.tensor, inst.name)
+            for inst in self.execution
+            for item in inst.inputs
+            if item.tensor == tensor or tensor in getattr(self.execution.values[item.tensor].view, 'sources', ())
         ]
+
+    def port_readers(self, tensor: str, port: int, reads: Optional[List[Tuple[str, str]]] = None) -> List[str]:
+        """Who reads port `port` of `tensor`'s producer, of `reads` (`reads`, this graph's by default): each reader
+        once per input reading it, whole or through a view covering it, and the graph boundary where `tensor` is a
+        graph output."""
+        reads = self.reads(tensor) if reads is None else reads
+        readers = [reader for value, reader in reads if port in self.ports_read(value, tensor)]
         return readers + (['the graph boundary'] if tensor in self.execution.graph_outputs else [])
 
     def output_connections(self, inst, read) -> List[Connection]:

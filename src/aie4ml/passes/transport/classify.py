@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Sequence, Tuple
 
 from ...errors import ConfigRefused
 from ...ir import get_backend_context
@@ -8,6 +8,7 @@ from ...ir.graph import ROUTE_MODES
 from ...op_impls.utils.tensor_view import staging_tile_shape
 from ..base import AIEPass
 from .boundary import direct_boundary_access
+from .collect import TransportCollector
 from .descriptors import describes_natural_order, rebase_descriptor_offset
 from .dma_resources import KERNEL_BUFFERS, tile_port_bds
 from .legality import direct_pairing, direct_transport_failure, memtile_staging_failure, uses_stream
@@ -23,11 +24,16 @@ class ClassifyTransportEntries(AIEPass):
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         entries = ctx.ir.physical.plan['_memory_plan_state']['entries']
+        execution = ctx.ir.execution
+        collector = TransportCollector(execution)
         changed = False
         for entry in entries:
             self._validate_entry(entry)
             leg = entry.consumers[0] if entry.consumers else Connection(entry.logical_tensor, entry.producer, None)
-            merge = leg.consumer is not None and gathers(ctx.ir.execution, ctx.device, leg)
+            tensor = leg.producer.tensor
+            merge = leg.consumer is not None and gathers(
+                ctx.device, tensor, collector.reads(tensor), execution.graph_outputs
+            )
             decision = classify_connection(leg, ctx.ir.execution, ctx.device, merge=merge)
             changed = changed or entry.decision != decision
             entry.decision = decision
@@ -50,22 +56,18 @@ class ClassifyTransportEntries(AIEPass):
             raise RuntimeError(f'{entry.logical_tensor}: internal transport entry has no consumer.')
 
 
-def gathers(execution, device, leg: Connection) -> bool:
-    """Whether a kernel-to-kernel leg may gather through an ordered packet merge: where the device has one and the leg
-    is its tensor's only reader. A producer stream into a merge carries packet headers, which ADF also hands to any
-    plain reader of the same port (seen in aiesim: such a reader's buffer shifted by a header word)."""
-    return bool(device.packet_ordered_merge) and not other_readers(
-        execution, leg.producer.tensor, leg.consumer.node.name
+def gathers(device, tensor: str, reads: Sequence[Tuple[str, str]], graph_outputs) -> bool:
+    """Whether a kernel-to-kernel leg of `tensor` may gather through an ordered packet merge: where the device has one
+    and nothing else reads the tensor -- one reader, reading it whole, not through a view -- nor the graph boundary.
+    A producer stream into a merge carries packet headers, which ADF also hands to any plain reader of the same port
+    (seen in aiesim: such a reader's buffer shifted by a header word). `reads`: every read of `tensor`, (value read,
+    reader) (`TransportCollector.reads`)."""
+    return (
+        bool(device.packet_ordered_merge)
+        and tensor not in graph_outputs
+        and len({reader for _, reader in reads}) == 1
+        and all(value == tensor for value, _ in reads)
     )
-
-
-def other_readers(execution, tensor: str, consumer: str) -> List[str]:
-    """What reads `tensor` besides the kernel graph `consumer`: other kernels, views over it, the graph boundary."""
-    readers = sorted(
-        {inst.name for inst in execution if any(item.tensor == tensor for item in inst.inputs)} - {consumer}
-    )
-    views = [v.name for v in execution.values.values() if v.view is not None and tensor in v.view.sources]
-    return readers + views + (['the graph boundary'] if tensor in execution.graph_outputs else [])
 
 
 def direct_unit(execution, leg: Connection, *, merge: bool) -> TransportUnit:
