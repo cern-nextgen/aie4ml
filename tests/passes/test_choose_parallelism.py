@@ -31,6 +31,7 @@ from helpers import (
     qdq,
     qparams,
 )
+from ops.test_attention import _dense as _sized_dense
 from ops.test_conv2d import AIE1_PART, MLV2_PART, H, W, _conv, _start, _strided_chain_model
 
 PARTS = {'aie1': AIE1_PART, 'aie-ml': PART, 'aie-mlv2': MLV2_PART}
@@ -69,6 +70,23 @@ def _branch_model():
         nodes=nodes,
         inputs=[('x_q', TensorProto.INT8, [1, H, W, 8])],
         outputs=[(f'y{i}', TensorProto.FLOAT, [1, H, W, 8]) for i in (1, 2)],
+        initializers=inits,
+    )
+
+
+def _feature_concat_model(tokens=16):
+    """Two Dense layers of one input, concatenated along the features into a Dense reading 32."""
+    nodes: list = []
+    inits: list = [*qparams('x')]
+    dq(nodes, 'x_q', 'x', 'x')
+    a, b = (_sized_dense(nodes, inits, 'x', name, 16, 16, seed, 4) for name, seed in (('a', 1), ('b', 2)))
+    nodes.append(helper.make_node('Concat', [a, b], ['joined'], name='concat', axis=1))
+    tail = _sized_dense(nodes, inits, 'joined', 'tail', 32, 16, 3, 4)
+    return make_model(
+        'feature_concat',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [tokens, 16])],
+        outputs=[(tail, TensorProto.FLOAT, [tokens, 16])],
         initializers=inits,
     )
 
@@ -130,10 +148,17 @@ def test_layout_conversions_count_toward_max_tiles(tmp_path, part):
 
 
 def test_every_leg_is_decided_as_transport_decides_it(tmp_path):
-    """Boundary and kernel legs through a memory tile are counted as the built plan routes them, and a split view
-    steers its producer to ports whose slices it can read without a directive."""
+    """Boundary and kernel legs through a memory tile are counted as the built plan routes them -- row chains read
+    through a concat too, which no ordered merge may gather -- and a split view steers its producer to ports whose
+    slices it can read without a directive."""
     ctx = lower(_normalization_chain_model(), tmp_path / 'norm', part=MLV2_PART)
     assert ctx.ir.optimizer['memtile_legs'] == len(memtiles(ctx)) == 1  # the sum re-staged between two kernels
+    directives = {
+        'a': {'parallelism': {'cas_num': 2, 'cas_length': 1, 'contract': 'outer'}},
+        'tail': {'parallelism': {'cas_num': 1, 'cas_length': 2, 'contract': 'inner'}},
+    }
+    ctx = lower(_feature_concat_model(), tmp_path / 'concat', directives, part=MLV2_PART)
+    assert ctx.ir.optimizer['memtile_legs'] == len(memtiles(ctx)) == 1 and not ctx.ir.physical.plan['merges']
     ctx = lower(_split_model(), tmp_path / 'split', part=AIE1_PART, aie_config={'Optimize': 'resource'})
     assert _splits(ctx)['root_aie'].contract == 'outer' and _splits(ctx)['root_aie'].cas_num == 2
 

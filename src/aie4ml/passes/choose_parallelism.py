@@ -578,14 +578,16 @@ class _Search:
         source, sink = insts
         streams = []
         try:
-            # an ordered merge only where the leg is its tensor's only reader (`classify.gathers`); a value only the
-            # execution graph has is a converter's, which the op that asked for it alone reads
-            readers = self.readers.get(leg.producer.tensor, 1)
+            # an ordered merge only where the leg is its tensor's only reader, not through a view over it either
+            # (`classify.gathers`); a value only the execution graph has is a converter's, which the op that asked for
+            # it alone reads
+            tensor = leg.producer.tensor
             merge = (
                 bool(self.ctx.device.packet_ordered_merge)
                 and sink is not None
-                and readers == 1
-                and leg.producer.tensor not in self.graph_outputs
+                and self.readers.get(tensor, 1) == 1
+                and all(value == tensor for value, _ in self.read_as.get(tensor, ()))
+                and tensor not in self.graph_outputs
             )
             realization = classify_connection(leg, execution, self.ctx.device, merge=merge).realization
             if realization == 'memtile':
