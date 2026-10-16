@@ -144,18 +144,18 @@ def solve_ranked(
 ) -> Tuple[Optional[Solution], bool]:
     """The best solution of `model` by `order`, criterion by criterion, and whether every solve proved its stage
     optimal; with no `order`, any solution. `criteria` maps each name to its expression and an upper bound; the
-    solution holds the value of each of `decisions`, which also hint each solve from the last (the first from `hint`,
-    by variable index, which may name some of them), and of each criterion. A stepped criterion is solved alone, then
-    bounded to the end of its best value's step; the others several at once, weighted so they still rank in turn, as
-    many as MAX_WEIGHT keeps apart. The bounds stay in `model`, so a later call ranks among its best solutions.
-    `floors` holds a value no solution goes below for some criteria: a stage whose criteria all have one ends, proven,
-    at the first solution reaching them, which spares the solver proving it, and takes no solve where the solution
-    before reaches them.
+    solution holds the value of each of `decisions` and of each criterion. `hint` (by variable index, which may name
+    some of the decisions) hints the first solve, the whole solution before each later one, which its bounds keep. A
+    stepped criterion is solved alone, then bounded to the end of its best value's step; the others several at once,
+    weighted so they still rank in turn, as many as MAX_WEIGHT keeps apart. The bounds stay in `model`, so a later
+    call ranks among its best solutions. `floors` holds a value no solution goes below for some criteria: a stage
+    whose criteria all have one ends, proven, at the first solution reaching them, which spares the solver proving
+    it, and takes no solve where the solution before reaches them.
 
     None where no solution was found: the model is infeasible where the second is True, else the first solve ran out
     of time. A later solve that runs out of time without a solution leaves the one before it, not proven."""
     criteria, floors = dict(criteria), floors or {}
-    solution, proven = None, True
+    solution, assignment, proven = None, [], True  # assignment: every variable's value in the solution
     for stage, stepped in _stages(order, criteria) if order else [((), False)]:
         objective, weight, floor, value = 0, 1, 0, 0
         for name in reversed(stage):
@@ -166,11 +166,14 @@ def solve_ranked(
         # a solution before that reaches the floor is the stage's best: no solve
         if not (stage and solution is not None and floor is not None and value <= floor):
             model.Minimize(objective)
-            start = solution.decisions if solution is not None else hint
             model.ClearHints()
-            for variable in decisions:
-                if start is not None and variable.Index() in start:
-                    model.AddHint(variable, start[variable.Index()])
+            if solution is None:
+                for variable in decisions:
+                    if hint is not None and variable.Index() in hint:
+                        model.AddHint(variable, hint[variable.Index()])
+            else:  # the whole solution before, which the bounds since keep: a complete hint, the solve's first solution
+                model.Proto().solution_hint.vars.extend(range(len(assignment)))
+                model.Proto().solution_hint.values.extend(assignment)
             reached = _Reached(floor) if stage and floor is not None else None
             status = solver.Solve(model, reached)
             if status == cp_model.INFEASIBLE:
@@ -180,6 +183,7 @@ def solve_ranked(
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 return solution, False
             proven = proven and (status == cp_model.OPTIMAL or (reached is not None and reached.reached))
+            assignment = list(solver.ResponseProto().solution)
             solution = Solution(
                 {variable.Index(): solver.Value(variable) for variable in decisions},
                 {name: solver.Value(expression) for name, (expression, _) in criteria.items()},
