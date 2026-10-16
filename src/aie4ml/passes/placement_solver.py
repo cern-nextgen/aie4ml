@@ -20,8 +20,16 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from ..op_impls.base import KERNEL_BANKS
 from .cpsat import cp_model
-from .placement import GraphSpec, Placed, PlacementInfeasibleError, _face_abs_box, _places, pair_offsets
-from .ranking import PLACED, Solution, solve_ranked
+from .placement import (
+    GraphSpec,
+    Placed,
+    PlacementInfeasibleError,
+    PlacementOutranked,
+    _face_abs_box,
+    _places,
+    pair_offsets,
+)
+from .ranking import PLACED, Solution, require, solve_ranked
 
 _SCALE = 100  # costs to integers
 _WORKERS = 8
@@ -38,26 +46,34 @@ def solve_placement(
     order: Sequence[Tuple[str, bool]],
     first: int,
     floors: Optional[Dict[str, int]] = None,
+    beat: Optional[Tuple[tuple, bool]] = None,
 ) -> Tuple[Dict[str, Placed], FrozenSet[Tuple[str, str, int]], Dict[str, Any]]:
     """The placement ranked best by `order` (`ranking.RANKING`) whose streams fit the switches, the input ports
     (op, group, port) it has read their producer's buffer, and its estimate (`PhysicalIR.estimate`): proven where each
     stage was, or reached `floors`, the design search's bound, below which no placement goes. A legal placement comes
-    first, as on a tight array neither the ranking nor the routes lead a search from scratch to one.
+    first, as on a tight array neither the ranking nor the routes lead a search from scratch to one. With `beat`
+    (`ranking.to_beat`), only a placement ranking the design better than the best built counts: where none does, it
+    raises `PlacementOutranked`, which spares ranking a design that cannot be kept.
 
     It is ranked without the streams' routes, within `_window` from column `first`: a relaxation, so where its best
     placement's streams fit (`_routes`), that is the best. Only where they do not is it ranked again with the routes, on
     the whole array, from that placement."""
+    ranking = tuple(criterion for criterion in order if criterion[0] in PLACED)
     relaxed = _Model(graph, W, H, _window(graph, W, H, first))
+    criteria = relaxed.estimate()
+    if beat is not None:
+        require(relaxed.model, criteria, ranking, beat)
     found, proven = relaxed.solve(time, (), {}, None)
     if found is None:
+        if beat is not None:
+            raise _outranked(time, proven)
         if proven:
             conflict = _conflict(graph, W, H, time)
             raise PlacementInfeasibleError(f'no placement exists{conflict and ": " + conflict + " cannot all hold"}.')
         raise PlacementInfeasibleError(
             f'the placement solver found no placement within AIEConfig PlacerTime={time:g}.', proven=False
         )
-    ranking = tuple(criterion for criterion in order if criterion[0] in PLACED)
-    best, proven = relaxed.solve(time, ranking, relaxed.estimate(), found.decisions, floors)
+    best, proven = relaxed.solve(time, ranking, criteria, found.decisions, floors)
     if best is None:  # the hint the solve starts from places, so only time stops it finding a placement
         raise PlacementInfeasibleError(
             f'the placement solver ranked no placement within AIEConfig PlacerTime={time:g}.', proven=False
@@ -68,9 +84,13 @@ def solve_placement(
 
     ranked = _Model(graph, W, H)
     criteria = {'overflow': ranked.route(), **ranked.estimate()}
+    if beat is not None:
+        require(ranked.model, criteria, ranking, beat)
     # the streams within the switches' ports first: what the search cannot drive out refuses the placement
     found, proven = ranked.solve(time, (('overflow', False),), criteria, ranked.hint(placed))
     if found is None or found.criteria['overflow']:
+        if beat is not None:
+            raise _outranked(time, proven)
         what = "keeps its streams within the switches' ports" if proven else 'fits the switches'
         raise PlacementInfeasibleError(f'no placement {what} within AIEConfig PlacerTime={time:g}.', proven=proven)
     best, proven = ranked.solve(time, ranking, criteria, found.decisions, floors)
@@ -78,6 +98,11 @@ def solve_placement(
         best, proven = found, False
     estimate = {name: best.criteria[name] for name in PLACED}
     return ranked.placed(best), ranked.shares(best), {**estimate, 'proven': proven}
+
+
+def _outranked(time: float, proven: bool) -> PlacementOutranked:
+    within = '' if proven else f' within AIEConfig PlacerTime={time:g}'
+    return PlacementOutranked(f'no placement ranks the design better than the best built{within}.', proven=proven)
 
 
 def tidy_placement(

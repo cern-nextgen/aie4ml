@@ -42,8 +42,8 @@ from .base import AIEPass, run_aie_passes
 from .cpsat import cp_model
 from .estimate import kernel_cycles, leg_cycles
 from .legalize_layouts import convert_inputs
-from .placement import PlacementInfeasibleError, instance_rect, pair_offsets, share_offsets
-from .ranking import PLACED, RANKING, optimize_mode, rank, solve_ranked
+from .placement import PlacementInfeasibleError, PlacementOutranked, instance_rect, pair_offsets, share_offsets
+from .ranking import PLACED, RANKING, optimize_mode, rank, solve_ranked, to_beat
 from .resolve import logical_values, output_contracts, resolve_instance
 from .shared_buffer import static_problem
 from .transport.classify import classify_connection, direct_unit, gathers
@@ -1071,10 +1071,11 @@ class _Search:
         """The best-ranked design the rest of the pipeline builds, as placed (`_as_placed`), and the context it was
         built in; None where no design ranks better than `beat`. Designs are built in the order of their bounds
         until the next ranks no better than the best built, which no design left can then beat. A design built is
-        cut with every design alike (`_Alternative.alike`); a design placement proves it cannot place with every design
-        placement sees alike (`_Placed`), in this search and the others (`_Shared.unplaced`); one it finds no
-        placement for in its time halves the fills tried (`_fill`), which leaves the design found not proven the best;
-        any other refusal, it alone. `tried` counts the designs built."""
+        cut with every design alike (`_Alternative.alike`), as is one whose placement cannot rank it better than the
+        best built (`PlacementOutranked`), which placement then spares ranking; a design placement proves it cannot
+        place with every design placement sees alike (`_Placed`), in this search and the others (`_Shared.unplaced`);
+        one it finds no placement for in its time halves the fills tried (`_fill`), which leaves the design found not
+        proven the best; any other refusal, it alone. `tried` counts the designs built."""
         alternatives = self._alternatives()
         cuts, unbuilt, best = [], defaultdict(int), None
         while True:
@@ -1092,9 +1093,14 @@ class _Search:
                     raise SearchLimit(failure)
                 self.doubts.append(failure.splitlines()[0])
                 break
-            built = self._build(bound)
+            built = self._build(bound, target)
             self.tried += 1
             self.shared.built += 1
+            if isinstance(built, PlacementOutranked):  # ranks no better than the best, as every design alike does
+                cuts.append(_groups(alternatives, _keys(alternatives, picks, _alike), _alike))
+                if not built.proven:
+                    self.doubts.append('a design was not shown to beat the best within AIEConfig PlacerTime')
+                continue
             if isinstance(built, PlacementInfeasibleError):
                 unbuilt[str(built)] += 1
                 if built.proven:
@@ -1161,13 +1167,17 @@ class _Search:
                 made['kernel'][name] = _kernel(option)
         return made
 
-    def _build(self, design: _Design):
-        """The rest of the pipeline run on a copy of the context with this design: the built copy, or the refusal."""
+    def _build(self, design: _Design, best: Optional[tuple] = None):
+        """The rest of the pipeline run on a copy of the context with this design: the built copy, or the refusal --
+        `PlacementOutranked` where no placement ranks it better than `best`, the rank of the best design so far."""
         from ..pipeline import DEFAULT_PIPELINE
 
         trial = copy.deepcopy(self.ctx)
         # the design's bound on what placement decides, which a placement reaching it is proven the best by
         trial.ir.optimizer = {**self.choices(design), 'bound': {name: getattr(design, name) for name in PLACED}}
+        if best is not None:  # what its placement must rank to beat the best, which spares ranking one that cannot
+            order = RANKING[self.mode]
+            trial.ir.optimizer['beat'] = to_beat({name: getattr(design, name) for name, _ in order}, order, best)
         rest = DEFAULT_PIPELINE[DEFAULT_PIPELINE.index(ChooseParallelism) + 1 :]
         try:
             run_aie_passes(trial, [cls() for cls in rest])

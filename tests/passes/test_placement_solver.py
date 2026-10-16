@@ -10,11 +10,12 @@ from aie4ml.passes.placement import (  # noqa: E402
     GraphSpec,
     NodeSpec,
     PlacementInfeasibleError,
+    PlacementOutranked,
     PortFace,
     Rect,
 )
 from aie4ml.passes.placement_solver import solve_placement, tidy_placement  # noqa: E402
-from aie4ml.passes.ranking import RANKING  # noqa: E402
+from aie4ml.passes.ranking import RANKING, step, to_beat  # noqa: E402
 from passes.test_placement import _crossing_graph, _tail_graph, _three_branch_graph  # noqa: E402
 
 PORTS = {'North': 6, 'South': 4, 'East': 4, 'West': 4}
@@ -77,3 +78,25 @@ def test_the_solver_keeps_every_stream_within_the_switch_ports():
     with pytest.raises(PlacementInfeasibleError, match='streams within the switches'):
         solve_placement(_crossing_graph(5, PORTS), 10, 1, 5, LATENCY, 0)
     solve_placement(_crossing_graph(5, {**PORTS, 'East': 5}), 10, 1, 5, LATENCY, 0)
+
+
+def test_a_design_to_beat_reduces_to_what_its_placement_decides():
+    """`latency` ranks latency and interval (stepped), memory-tile legs, copies, tiles, then latency and interval:
+    memtile and tiles are the design's own, so they decide whether its placement must rank below the best or may tie."""
+    best = (90, 68, 0, 44, 87, 5625, 692)
+    assert to_beat({'memtile': 1, 'tiles': 80}, LATENCY, best) == ((90, 68), True)  # a leg more: strictly below
+    assert to_beat({'memtile': 0, 'tiles': 86}, LATENCY, best) == ((90, 68, 44), False)  # a tile fewer: a tie wins
+    assert to_beat({'memtile': 0, 'tiles': 87}, LATENCY, best) == ((90, 68, 44, 5625, 692), True)
+
+
+def test_the_solver_ranks_only_a_placement_that_beats_the_best():
+    """The best placement of `_two_into_one` takes 190 cycles: one beating a design a step slower ranks as without
+    it; one that must beat 190's own step does not exist; equalling it suffices where the design's other criteria
+    rank better."""
+    graph = _two_into_one(shareable=True)
+    best = solve_placement(graph, 8, 4, 5, LATENCY, 2)[1:]
+    assert solve_placement(graph, 8, 4, 5, LATENCY, 2, beat=((step(190) + 1,), True))[1:] == best
+    with pytest.raises(PlacementOutranked):
+        solve_placement(graph, 8, 4, 5, LATENCY, 2, beat=((step(190),), True))
+    tie = ((step(190), step(100), 1), False)
+    assert solve_placement(graph, 8, 4, 5, LATENCY, 2, beat=tie)[1:] == best

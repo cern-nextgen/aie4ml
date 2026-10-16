@@ -170,6 +170,15 @@ class PlacementInfeasibleError(ConfigRefused):
         self.proven = proven
 
 
+class PlacementOutranked(ConfigRefused):
+    """Raised when no placement ranks the design better than the one the search asks it to beat
+    (`ctx.ir.optimizer['beat']`, `ranking.to_beat`); `proven` False where the placer only found none in its time."""
+
+    def __init__(self, message: str, proven: bool = True):
+        super().__init__(message)
+        self.proven = proven
+
+
 # ---------------------------------------------------------------------------
 # Footprint parsing and geometry
 # ---------------------------------------------------------------------------
@@ -625,8 +634,9 @@ class PlaceKernels(AIEPass):
         time, searched = placer_time(ctx), ctx.ir.optimizer.pop('placement', None)
         first = int(device.preferred_column_start) - col_offset  # the layout packs from the PLIOs' columns
         if searched is None:
-            floors = ctx.ir.optimizer.pop('bound', None)
-            placed, shares, estimate = solve_placement(graph, W, H, time, RANKING[optimize_mode(ctx)], first, floors)
+            floors, beat = ctx.ir.optimizer.pop('bound', None), ctx.ir.optimizer.pop('beat', None)
+            order = RANKING[optimize_mode(ctx)]
+            placed, shares, estimate = solve_placement(graph, W, H, time, order, first, floors, beat)
         else:
             start = {
                 name: Placed(name, int(at['col']) - col_offset, int(at['row']) - row_offset, graph.specs[name].rect)

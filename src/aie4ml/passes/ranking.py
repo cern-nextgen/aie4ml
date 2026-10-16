@@ -74,6 +74,60 @@ def rank(values: Mapping[str, int], order: Sequence[Tuple[str, bool]]) -> tuple:
     return tuple(step(values[name]) if stepped else values[name] for name, stepped in order)
 
 
+def to_beat(values: Mapping[str, int], order: Sequence[Tuple[str, bool]], best: tuple) -> Tuple[tuple, bool]:
+    """What the placed criteria (`PLACED`) of a design whose other criteria are `values` must rank, by the placed
+    part of `order`, for the design to rank better than `best`: the leading placed values of `best`, below which the
+    design ranks better, and whether equalling them is not enough (`strict`) -- as at the first criterion placement
+    does not decide where the design differs from `best`: worse there, it must rank strictly below; better, equal
+    suffices; equal everywhere, strictly below again."""
+    placed = []
+    for (name, stepped), value in zip(order, best):
+        if name in PLACED:
+            placed.append(value)
+            continue
+        own = step(values[name]) if stepped else values[name]
+        if own != value:
+            return tuple(placed), own > value
+    return tuple(placed), True
+
+
+def require(
+    model: cp_model.CpModel,
+    criteria: Mapping[str, Tuple[Any, int]],
+    order: Sequence[Tuple[str, bool]],
+    beat: Tuple[tuple, bool],
+) -> None:
+    """Keep in `model` the solutions whose `criteria`, ranked by `order`, rank below `beat` (`to_beat`): its values on
+    the first criteria of `order`, which a solution betters at the first it differs in, or, unless `strict`, equals."""
+    values, strict = beat
+    ties, wins = [], []
+    for (name, stepped), value in zip(order, values):
+        expression = criteria[name][0]
+        low, high = (_least(value), _least(value + 1) - 1) if stepped else (value, value)
+        below, tie, win = model.NewBoolVar(''), model.NewBoolVar(''), model.NewBoolVar('')
+        model.Add(expression <= low - 1).OnlyEnforceIf(below)
+        model.Add(expression >= low).OnlyEnforceIf(tie)
+        model.Add(expression <= high).OnlyEnforceIf(tie)
+        model.AddBoolAnd([*ties, below]).OnlyEnforceIf(win)  # equal before it, below at it
+        wins.append(win)
+        ties.append(tie)
+    if not strict:
+        equal = model.NewBoolVar('')
+        model.AddBoolAnd(ties).OnlyEnforceIf(equal)
+        wins.append(equal)
+    model.AddBoolOr(wins)
+
+
+def _least(index: int) -> int:
+    """The least cycles whose `step` is `index` or more."""
+    cycles = max(0, math.ceil(math.expm1(index * math.log1p(INTERVAL_TOLERANCE))))
+    while cycles > 0 and step(cycles - 1) >= index:
+        cycles -= 1
+    while step(cycles) < index:
+        cycles += 1
+    return cycles
+
+
 class Solution(NamedTuple):
     decisions: Dict[int, int]  # each decision's value, by its variable's index
     criteria: Dict[str, int]  # each criterion's value
