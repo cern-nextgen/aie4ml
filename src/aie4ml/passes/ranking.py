@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from ortools.sat.python import cp_model
+from .cpsat import cp_model
 
 # What each mode ranks designs by, most significant first: a stepped criterion ranks the values on one
 # INTERVAL_TOLERANCE step alike (`step`), which the estimate cannot tell apart. 'copies' are the hand-overs a tile DMA

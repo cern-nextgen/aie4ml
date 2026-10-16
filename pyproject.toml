@@ -34,7 +34,7 @@ classifiers = [
 dependencies = [
   "jinja2>=3.0",
   "numpy",
-  "ortools>=9.9,<10",
+  "ortools>=9.15,<10",
 ]
 
 [project.optional-dependencies]
@@ -46,7 +46,7 @@ testing = [
   "pytest-cov",
   "onnx<1.18",
   "onnxruntime",
-  "tensorflow~=2.16.0",
+  "tensorflow~=2.21.0",
   "qkeras-v3",
 ]
 

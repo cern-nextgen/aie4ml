@@ -18,9 +18,8 @@ from collections import defaultdict
 from dataclasses import replace
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
-from ortools.sat.python import cp_model
-
 from ..op_impls.base import KERNEL_BANKS
+from .cpsat import cp_model
 from .placement import GraphSpec, Placed, PlacementInfeasibleError, _face_abs_box, _places, pair_offsets
 from .ranking import PLACED, Solution, solve_ranked
 
