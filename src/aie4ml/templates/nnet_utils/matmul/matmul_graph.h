@@ -57,8 +57,8 @@ public:
   using Kernels = matmul_kernels<ConfigT, ConfigT::ROW_BLOCKS>;
 
   static constexpr std::uint32_t BANK_BYTES        = 16 * 1024;
-  static constexpr std::uint32_t STACK_BYTES       = 1024; // reserve 1 KiB for compiler stack
-  static constexpr std::uint32_t STACK_BYTES_ALIGN = 1024; // keep B tile starts simple and bank-aligned enough
+  // B's bank also holds the 1 KiB stack and ADF's system data beside it (1216-1280 bytes in all measured)
+  static constexpr std::uint32_t STACK_BANK_RESERVED = 1536;
 
   static constexpr std::uint32_t A_TILE_BYTES = padded_M * K_SLICE * sizeof(a_t);
   static constexpr std::uint32_t B_TILE_BYTES = K_SLICE * N_SLICE * sizeof(b_t);
@@ -66,8 +66,8 @@ public:
 
   static_assert(A_TILE_BYTES <= BANK_BYTES,
                 "One A ping/pong tile must fit in one 16 KiB bank");
-  static_assert(B_TILE_BYTES + STACK_BYTES_ALIGN <= BANK_BYTES,
-                "B tile plus reserved stack slack must fit in one 16 KiB bank");
+  static_assert(B_TILE_BYTES + STACK_BANK_RESERVED <= BANK_BYTES,
+                "B tile plus the stack and ADF's system data must fit in one 16 KiB bank");
   static_assert(C_TILE_BYTES <= BANK_BYTES,
                 "One C ping/pong tile must fit in one 16 KiB bank");
 

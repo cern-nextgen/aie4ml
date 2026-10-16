@@ -45,7 +45,9 @@ def _bank_capacity_bytes(device: Any) -> int:
     return max(1, int(getattr(device, 'bank_mem_bytes', 0) or 1))
 
 
-_MATMUL_RHS_STACK_BYTES = 1024
+# B shares its bank with the 1 KB stack and ADF's system data (sync buffer, statics, alignment, reserved words):
+# 1216-1280 bytes in all (AIE-MLv2, Vitis 2026.1.1), so a B of 15360 bytes failed placement.
+_MATMUL_RHS_STACK_BYTES = 1536
 
 
 def _tile_bank_usage(
