@@ -525,7 +525,8 @@ def _placement_hint(ctx, node) -> Dict[str, Any]:
 
 def placer_time(ctx) -> float:
     """The CP-SAT placer's deterministic time per solve (AIEConfig PlacerTime), in the solver's units -- about a second
-    of one worker's search each, the same however loaded the machine."""
+    of one worker's search each, the same however loaded the machine -- and its seconds at most
+    (`placement_solver._solver`)."""
     if 'PlacerSeconds' in ctx.aie_config:
         raise ValueError(
             "AIEConfig PlacerSeconds is replaced by PlacerTime, the placer's deterministic time per solve "

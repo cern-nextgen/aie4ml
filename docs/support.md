@@ -25,9 +25,9 @@ plus each hand-over's bytes (none where two kernels share a buffer, twice throug
 Placement keeps a hand-over in one shared buffer where the consumer's core reaches the producer's memory (west, north
 or south; east on AIE odd rows), and decides which hand-overs to share: it solves the whole placement at once
 (OR-Tools CP-SAT), every stream within the switches' ports, ranked like the designs (`Optimize`): latency, interval
-and the hand-overs a DMA copies, then the layout. Each solve takes up to `PlacerTime` (default 400), in the
-solver's deterministic time units (about a second of one worker's search each), so a loaded machine finds the same; a
-rerun may return another placement ranking alike.
+and the hand-overs a DMA copies, then the layout. Each solve takes up to `PlacerTime` (default 400) of the solver's
+deterministic time units (about a second of one worker's search each), and as many seconds at most; a rerun may return
+another placement ranking alike.
 
 The search builds designs in the order of their best case -- every hand-over some placement can share taken as shared
 -- until none left can beat the best placed one, which then is the best there is (`proven`). Whether hand-overs some

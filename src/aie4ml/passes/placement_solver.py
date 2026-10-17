@@ -199,12 +199,22 @@ def _conflict(graph: GraphSpec, W: int, H: int, time: float) -> str:
     explained = _Model(graph, W, H, explain=True)
     names = {literal.Index(): name for name, literal in explained.assumptions.items()}
     explained.model.AddAssumptions(list(explained.assumptions.values()))
-    solver = cp_model.CpSolver()
-    solver.parameters.max_deterministic_time = float(time)
-    solver.parameters.num_workers = _WORKERS
+    solver = _solver(time)
     if solver.Solve(explained.model) != cp_model.INFEASIBLE:
         return ''
     return ', '.join(sorted(names[index] for index in solver.SufficientAssumptionsForInfeasibility()))
+
+
+def _solver(time: float) -> cp_model.CpSolver:
+    """A parallel solver, which finds a tight array's placements where the deterministic interleaved one does not, so
+    a rerun may return another placement ranking alike; each solve within `time` units of deterministic time, which
+    keeps the limit independent of load, and as many seconds, the solver's scale for its unit: on a large placement its
+    full-problem workers count deterministic time slower than they run (a 400-unit solve took 757 s)."""
+    solver = cp_model.CpSolver()
+    solver.parameters.max_deterministic_time = float(time)
+    solver.parameters.max_time_in_seconds = float(time)
+    solver.parameters.num_workers = _WORKERS
+    return solver
 
 
 class _Model:
@@ -420,13 +430,8 @@ class _Model:
         return [*(literal for literals in self.chosen.values() for literal in literals), *self.held.values()]
 
     def solve(self, time: float, order, criteria, hint, floors=None) -> Tuple[Optional[Solution], bool]:
-        """`solve_ranked` of this model by `order`, each solve within the deterministic `time`."""
-        solver = cp_model.CpSolver()
-        # Parallel search, which finds a tight array's placements where the deterministic interleaved one does not, so
-        # a rerun may return another placement ranking alike. Deterministic time keeps the limit independent of load.
-        solver.parameters.max_deterministic_time = float(time)
-        solver.parameters.num_workers = _WORKERS
-        return solve_ranked(self.model, solver, criteria, order, self.decisions, hint, floors)
+        """`solve_ranked` of this model by `order`, each solve within `time` (`_solver`)."""
+        return solve_ranked(self.model, _solver(time), criteria, order, self.decisions, hint, floors)
 
     def hint(self, placed: Dict[str, Placed]) -> Dict[int, int]:
         """`placed` as this model's places, by variable index."""
