@@ -19,9 +19,9 @@ placement alone can tell, so where placement shares fewer than the bound the bui
 A design placement refuses is excluded, with every design placement sees alike.
 
 A hand-off is direct only where producer and consumer write and read the same blocks, so the block height is chosen
-for the graph, not per layer: one search with every layer's own microtile, then one per height the layers offer
-(`_block_heights`), each layer offering it taking it, which builds a design only where it ranks better than the best
-so far.
+for the graph, not per layer: one search with every layer's own microtile, and one per height the layers offer
+(`_block_heights`), each layer offering it taking it -- none repeating another's constraint program. Their designs are
+built in one order, of their bounds (`_best_buildable`).
 """
 
 from __future__ import annotations
@@ -282,33 +282,32 @@ class ChooseParallelism(AIEPass):
             f"[aie4ml] Searching for a '{mode}' design within {max_tiles} AIE tiles; this can take a minute...",
             flush=True,
         )
-        found, refusal, trials, doubts = None, None, 0, []
         shared = _Shared(logical_values(ctx.ir.logical))
+        searches, programs, refusal = [], [], None
         for height in (None, *_block_heights(ctx)):
             search = _Search(ctx, mode, max_tiles, shared, height)
             if height is not None and search.microtiling == {}:
                 continue  # no layer offers this height: the pass would repeat the first
             try:
-                better = search.best_buildable(None if found is None else search.rank(found[1]))
-            except (ConfigRefused, SearchLimit) as failure:
+                search.alternatives = search._alternatives()
+            except ConfigRefused as failure:
                 refusal = refusal or failure
-                if isinstance(failure, SearchLimit):  # a better design of this height may exist
-                    doubts.append(str(failure).splitlines()[0])
-                better = None
-            trials += search.tried
-            doubts += search.doubts
-            if better is not None:
-                found = (search, *better)
+                continue
+            program = _program(search.alternatives)
+            if program not in programs:  # else the layers offering the height take it already
+                searches.append(search)
+                programs.append(program)
+        if not searches:
+            raise refusal
+        search, design, built = _best_buildable(searches)
+        doubts = shared.doubts
         if shared.unplaced_fill is not None:  # the fills the searches halved (`_Search._fill`)
             doubts.append(
                 f'designs filling more than {shared.placed_fill} tiles were not all tried: one filling '
                 f'{shared.unplaced_fill} found no placement within AIEConfig PlacerTime'
             )
-        if found is None:
-            raise refusal
-        search, design, built = found
         print(
-            f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {trials} built'
+            f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {shared.built} built'
             f'{"" if not doubts else ", not proven the best: " + doubts[0]}.',
             flush=True,
         )
@@ -317,7 +316,7 @@ class ChooseParallelism(AIEPass):
             'max_tiles': max_tiles,
             'tiles': design.tiles,
             'memtile_legs': design.memtile,
-            'designs_tried': trials,
+            'designs_tried': shared.built,
             'proven': not doubts,
             'doubts': doubts,
             **search.choices(design),
@@ -334,9 +333,9 @@ class ChooseParallelism(AIEPass):
 
 @dataclass
 class _Shared:
-    """What a layer, its legs and its refusals resolve to, and the designs placement refused, which no microtile
-    height changes: the searches of one pass share it, so each resolves an option it meets again only once, and none
-    builds a design placement sees alike to one it refused."""
+    """What a layer, its legs and its refusals resolve to, and the designs built and refused, which no microtile height
+    changes: the searches of one pass share it, so each resolves an option it meets again only once, and none builds a
+    design alike to one built, or that placement sees alike to one it refused."""
 
     values: Dict[str, Any]
     resolved: Dict[Any, Any] = field(default_factory=dict)
@@ -347,9 +346,13 @@ class _Shared:
     contracts: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     signatures: Dict[Tuple[int, str], str] = field(default_factory=dict)
     refusals: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(int)))
-    # what placement sees of the designs it refused (`_keys` of `_Placed`): no design alike in all of it is built,
-    # whichever microtile height its search is of
+    # what the designs built or outranked are alike in (`_keys` of `_Alternative.alike`), and what placement sees of
+    # those it refused (`_keys` of `_Placed`): no design alike in all of either is built, whichever microtile height its
+    # search is of
+    cut: List[Dict[str, tuple]] = field(default_factory=list)
     unplaced: List[Dict[str, tuple]] = field(default_factory=list)
+    unbuilt: Dict[str, int] = field(default_factory=lambda: defaultdict(int))  # the designs not built, by why
+    doubts: List[str] = field(default_factory=list)  # why the design found may not be the best there is
     # Near a full array placement cannot tell a design it places in no time from one with no placement: the fill
     # (tiles a design's kernels and reserved buffers take) of the fullest design placed and of the emptiest that found
     # no placement in its time, the fills between which the searches halve (`_Search._fill`).
@@ -431,9 +434,8 @@ class _Search:
                 for source in () if t.is_parameter else self._sources(t.name):
                     self.read_as[source].append((t.name, node.name))
         self.refusals = shared.refusals
-        self.unplaced = shared.unplaced
-        self.doubts: List[str] = []  # why the design found may not be the best there is
-        self.tried = 0  # designs built (`best_buildable`)
+        self.alternatives: Dict[str, List[_Alternative]] = {}  # `_alternatives`, which the pass resolves
+        self.cuts: List[List[tuple]] = []  # the designs resolution refused, each alone (`_solve`)
         self._resolved = shared.resolved
         self._own_cache = shared.own
         self._leg_cache = shared.leg
@@ -745,9 +747,7 @@ class _Search:
                         layouts.setdefault(t, {}).setdefault(sig, alt.kernels[-1])
                     alternatives.append(alt)
             if not alternatives:
-                raise ConfigRefused(
-                    self._failure(f'{node.name} resolves in no design: every option of it is refused', {})
-                )
+                raise ConfigRefused(self._failure(f'{node.name} resolves in no design: every option of it is refused'))
         return found
 
     def _alternative(self, node: OpNode, option, arriving: Dict[str, Dict[str, Any]]) -> Optional[_Alternative]:
@@ -1006,7 +1006,9 @@ class _Search:
                 f'choose_parallelism: the solver found no design within AIEConfig SearchTime={self.search_time:g}.'
             )
         if not proven:
-            self.doubts.append(f'a solve was not proven optimal within AIEConfig SearchTime={self.search_time:g}')
+            self.shared.doubts.append(
+                f'a solve was not proven optimal within AIEConfig SearchTime={self.search_time:g}'
+            )
         picks = {}
         for name, literals in x.items():
             i = next(i for i, literal in enumerate(literals) if found.decisions[literal.Index()])
@@ -1067,76 +1069,79 @@ class _Search:
         order = RANKING[self.mode]
         return rank({name: getattr(design, name) for name, _ in order}, order)
 
-    def best_buildable(self, beat: Optional[tuple] = None) -> Optional[Tuple[_Design, Any]]:
-        """The best-ranked design the rest of the pipeline builds, as placed (`_as_placed`), and the context it was
-        built in; None where no design ranks better than `beat`. Designs are built in the order of their bounds
-        until the next ranks no better than the best built, which no design left can then beat. A design built is
-        cut with every design alike (`_Alternative.alike`), as is one whose placement cannot rank it better than the
-        best built (`PlacementOutranked`), which placement then spares ranking; a design placement proves it cannot
-        place with every design placement sees alike (`_Placed`), in this search and the others (`_Shared.unplaced`);
-        one it finds no placement for in its time halves the fills tried (`_fill`), which leaves the design found not
-        proven the best; any other refusal, it alone. `tried` counts the designs built."""
-        alternatives = self._alternatives()
-        cuts, unbuilt, best = [], defaultdict(int), None
-        while True:
-            unplaced = [_groups(alternatives, keys, _placed) for keys in self.unplaced]
-            picks = self._solve(alternatives, unplaced + cuts)
-            if picks is None:
-                break
-            bound = self._design(alternatives, picks)
-            target = beat if best is None else self.rank(best[0])
-            if target is not None and self.rank(bound) >= target:
-                break  # no design left ranks better
-            if self.shared.built == self.builds:
-                failure = self._failure(f'search limit: {self.builds} designs built (AIEConfig SearchBuilds)', unbuilt)
-                if best is None:
-                    raise SearchLimit(failure)
-                self.doubts.append(failure.splitlines()[0])
-                break
-            built = self._build(bound, target)
-            self.tried += 1
-            self.shared.built += 1
-            if isinstance(built, PlacementOutranked):  # ranks no better than the best, as every design alike does
-                cuts.append(_groups(alternatives, _keys(alternatives, picks, _alike), _alike))
-                if not built.proven:
-                    self.doubts.append('a design was not shown to beat the best within AIEConfig PlacerTime')
-                continue
-            if isinstance(built, PlacementInfeasibleError):
-                unbuilt[str(built)] += 1
-                if built.proven:
-                    self.unplaced.append(_keys(alternatives, picks, _placed))
-                    continue
-                full = bound.tiles + bound.reserved  # the fills tried halve (`_fill`)
-                unplaced = self.shared.unplaced_fill
-                self.shared.unplaced_fill = full if unplaced is None else min(unplaced, full)
-                continue
-            if isinstance(built, ConfigRefused):
-                cuts.append(_groups(alternatives, _keys(alternatives, picks, id), id))
-                unbuilt[str(built)] += 1
-                continue
-            # every design alike in each layer places as this one: of them, the search took the best ranked first
-            cuts.append(_groups(alternatives, _keys(alternatives, picks, _alike), _alike))
-            self.shared.placed_fill = max(self.shared.placed_fill, bound.tiles + bound.reserved)
-            design = self._as_placed(bound, built)
-            if target is None or self.rank(design) < target:
-                best = (design, built)
-        if best is not None:
-            return best
-        if beat is not None and picks is not None:
+    def bound(self) -> Optional[Tuple[_Design, Dict[str, tuple]]]:
+        """The best design left by its bound (`_design`) and the picks making it (`_solve`), every design built or
+        refused cut; None where every design is."""
+        alternatives, shared = self.alternatives, self.shared
+        cuts = [
+            *self.cuts,
+            *(_groups(alternatives, keys, _alike) for keys in shared.cut),
+            *(_groups(alternatives, keys, _placed) for keys in shared.unplaced),
+        ]
+        picks = self._solve(alternatives, cuts)
+        return None if picks is None else (self._design(alternatives, picks), picks)
+
+    def fresh(self, found: Optional[Tuple[_Design, Dict[str, tuple]]], fill: int) -> bool:
+        """Whether `found` (`bound`), solved with designs filling at most `fill` tiles (`_fill`), is still the best
+        design left: the designs cut since cut none alike to it, and the fills tried grew none and shrank none below
+        it -- a constraint program's best solution stays its best under constraints it meets."""
+        now = self._fill(self.alternatives)
+        if now > fill:
+            return False
+        if found is None:
+            return True
+        design, picks = found
+        return (
+            design.tiles + design.reserved <= now
+            and _keys(self.alternatives, picks, _alike) not in self.shared.cut
+            and _keys(self.alternatives, picks, _placed) not in self.shared.unplaced
+        )
+
+    def build(self, bound: _Design, picks: Dict[str, tuple], best: Optional[tuple]) -> Optional[Tuple[_Design, Any]]:
+        """The design `picks` make, whose bound is `bound`, built (`_build`): as placed (`_as_placed`) and the
+        context it was built in, or None where it is not. It is cut with every design alike (`_Alternative.alike`),
+        as is one whose placement cannot rank it better than `best` (`PlacementOutranked`), which placement then
+        spares ranking; a design placement proves it cannot place with every design placement sees alike (`_Placed`);
+        both in every search (`_Shared`). One placement finds no placement for in its time halves the fills tried
+        (`_fill`), which leaves the design found not proven the best; any other refusal is cut alone."""
+        alternatives, shared = self.alternatives, self.shared
+        built = self._build(bound, best)
+        shared.built += 1
+        if isinstance(built, PlacementOutranked):  # ranks no better than the best, as every design alike does
+            shared.cut.append(_keys(alternatives, picks, _alike))
+            if not built.proven:
+                shared.doubts.append('a design was not shown to beat the best within AIEConfig PlacerTime')
             return None
-        if not self.tried:
-            kernels = _least(alternatives, lambda alt: alt.tiles)
-            filled = _least(alternatives, lambda alt: alt.tiles + alt.reserved)
-            raise ConfigRefused(
-                self._failure(
-                    f'no design resolves within the tile budget: every design takes at least {kernels} tiles for its '
-                    f"kernels, and fills at least {filled} of the array's {self.room} with those its input buffers "
-                    'reserve',
-                    unbuilt,
-                )
+        if isinstance(built, PlacementInfeasibleError):
+            shared.unbuilt[str(built)] += 1
+            if built.proven:
+                shared.unplaced.append(_keys(alternatives, picks, _placed))
+            else:  # the fills tried halve (`_fill`)
+                full = bound.tiles + bound.reserved
+                shared.unplaced_fill = full if shared.unplaced_fill is None else min(shared.unplaced_fill, full)
+            return None
+        if isinstance(built, ConfigRefused):
+            self.cuts.append(_groups(alternatives, _keys(alternatives, picks, id), id))
+            shared.unbuilt[str(built)] += 1
+            return None
+        # every design alike in each layer places as this one: of them, the search took the best ranked first
+        shared.cut.append(_keys(alternatives, picks, _alike))
+        shared.placed_fill = max(shared.placed_fill, bound.tiles + bound.reserved)
+        return self._as_placed(bound, built), built
+
+    def refused(self) -> ConfigRefused:
+        """Why no design was built, where no search of the pass built one."""
+        if self.shared.built:
+            return ConfigRefused(
+                self._failure(f'none of the {self.shared.built} designs within the tile budget can be built')
             )
-        raise ConfigRefused(
-            self._failure(f'none of the {self.tried} designs within the tile budget can be built', unbuilt)
+        kernels = _least(self.alternatives, lambda alt: alt.tiles)
+        filled = _least(self.alternatives, lambda alt: alt.tiles + alt.reserved)
+        return ConfigRefused(
+            self._failure(
+                f'no design resolves within the tile budget: every design takes at least {kernels} tiles for its '
+                f"kernels, and fills at least {filled} of the array's {self.room} with those its input buffers reserve"
+            )
         )
 
     def _as_placed(self, bound: _Design, built) -> _Design:
@@ -1151,7 +1156,7 @@ class _Search:
                     f'{getattr(bound, name)}: the two estimate the design apart.'
                 )
         if not estimate['proven']:
-            self.doubts.append('a placement was not proven the best within AIEConfig PlacerTime')
+            self.shared.doubts.append('a placement was not proven the best within AIEConfig PlacerTime')
         return placed
 
     def choices(self, design: _Design) -> Dict[str, Dict[str, Any]]:
@@ -1185,7 +1190,7 @@ class _Search:
             return refusal
         return trial
 
-    def _failure(self, what: str, unbuilt: Dict[str, int]) -> str:
+    def _failure(self, what: str) -> str:
         lines = [f'choose_parallelism ({self.mode}, MaxTiles={self.max_tiles}): {what}.']
         if what.startswith('search limit'):
             lines.append(
@@ -1195,5 +1200,63 @@ class _Search:
         for name, messages in self.refusals.items():
             for message, count in sorted(messages.items(), key=lambda item: -item[1])[:3]:
                 lines.append(f'  {name}: {count} option(s) refused: {message}')
-        lines += [f'  {count} design(s) not built: {message}' for message, count in unbuilt.items()]
+        lines += [f'  {count} design(s) not built: {message}' for message, count in self.shared.unbuilt.items()]
         return '\n'.join(lines)
+
+
+def _best_buildable(searches: List[_Search]) -> Tuple[_Search, _Design, Any]:
+    """The best-ranked design the rest of the pipeline builds, of any of `searches`: its search, the design as placed
+    (`_Search._as_placed`) and the context it was built in. Designs are built in the order of their bounds, whichever
+    search they are of, until the next ranks no better than the best built, which no design left can then beat; a
+    search solves for its best design left again only where the designs built may have changed it (`_Search.fresh`)."""
+    searches = list(searches)
+    shared, builds = searches[0].shared, searches[0].builds
+    left: Dict[_Search, tuple] = {}  # by search: its best design left (`_Search.bound`) and the fill it was solved at
+    best, limit = None, None
+    while True:
+        for search in [search for search in searches if search not in left or not search.fresh(*left[search])]:
+            fill = search._fill(search.alternatives)
+            try:
+                left[search] = (search.bound(), fill)
+            except SearchLimit as failure:  # a better design of its may exist
+                shared.doubts.append(str(failure).splitlines()[0])
+                limit = limit or failure
+                searches.remove(search)
+                left.pop(search, None)
+        ranked = [(search.rank(left[search][0][0]), i) for i, search in enumerate(searches) if left[search][0]]
+        if not ranked:
+            break
+        nearest, i = min(ranked)
+        search = searches[i]
+        if best is not None and nearest >= search.rank(best[1]):
+            break  # no design left ranks better
+        if shared.built == builds:
+            failure = search._failure(f'search limit: {builds} designs built (AIEConfig SearchBuilds)')
+            if best is None:
+                raise SearchLimit(failure)
+            shared.doubts.append(failure.splitlines()[0])
+            break
+        design, picks = left.pop(search)[0]
+        found = search.build(design, picks, None if best is None else search.rank(best[1]))
+        if found is not None and (best is None or search.rank(found[0]) < search.rank(best[1])):
+            best = (search, *found)
+    if best is not None:
+        return best
+    raise limit if limit is not None else searches[0].refused()
+
+
+def _program(alternatives: Dict[str, List[_Alternative]]) -> Dict[str, list]:
+    """What the constraint program (`_Search._solve`) and its cuts read of each layer's alternatives: searches alike
+    in it are one search, whatever options their layers resolved."""
+    return {
+        name: [
+            (
+                alt.alike,
+                alt.published,
+                bool(_kernel(alt.option)),
+                [(tensor, [(arrival.layouts, arrival.alike) for arrival in found]) for tensor, found in alt.arrivals],
+            )
+            for alt in alts
+        ]
+        for name, alts in alternatives.items()
+    }
