@@ -176,6 +176,16 @@ def solve_ranked(
                 model.Proto().solution_hint.values.extend(assignment)
             reached = _Reached(floor) if stage and floor is not None else None
             status = solver.Solve(model, reached)
+            if solution is not None and (
+                status not in (cp_model.OPTIMAL, cp_model.FEASIBLE) or solver.ObjectiveValue() > value
+            ):
+                # Presolve drops solutions some other one dominates -- the hint, where it takes an alternative another
+                # beats on this stage's objective -- and the stage then found none as good in its time. Solved again
+                # keeping every feasible solution, a weaker presolve the hint survives as its first solution.
+                solver.parameters.keep_all_feasible_solutions_in_presolve = True
+                reached = _Reached(floor) if stage and floor is not None else None
+                status = solver.Solve(model, reached)
+                solver.parameters.keep_all_feasible_solutions_in_presolve = False
             if status == cp_model.INFEASIBLE:
                 if solution is not None:  # each stage keeps the solution before it: a solver fault, not the model's
                     raise RuntimeError('solve_ranked: a later stage refused the solution of the stage before it.')
