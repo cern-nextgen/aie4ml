@@ -210,7 +210,14 @@ def test_boundary_layernorm_honors_explicit_linear_layout(tmp_path):
     assert ctx.ir.execution.get('ln_aie').variant.variant_id == 'layer_norm.i8.v1'
 
 
-def test_layernorm_rejects_unrepresentable_beta(tmp_path):
+def test_linear_layernorm_rejects_beta_beyond_q15(tmp_path):
     beta = np.full((COLS,), 1.25, dtype=np.float32)
     with pytest.raises(ValueError, match="LayerNorm parameter 'beta' cannot be represented"):
-        lower(_boundary_model(beta=beta), tmp_path, {'ln': parallelism(1)})
+        lower(_boundary_model(beta=beta), tmp_path, {'ln': {**parallelism(1), 'layout': 'linear'}})
+
+
+def test_tiled_layernorm_fixed_point_follows_parameter_range(tmp_path):
+    """gamma = 1 and eps = 2^-8 at frac 4 (EPS_Q0 = 1): gamma Q14 and gamma / sigma Q14, beta at what 1.25 fits."""
+    beta = np.full((COLS,), 1.25, dtype=np.float32)
+    cfg = config_of(lower(_boundary_model(beta=beta), tmp_path, {'ln': parallelism(1)}), 'ln_aie')
+    assert (cfg.gamma_shift, cfg.scale_frac, cfg.precision['beta'].frac) == (14, 14, 14)

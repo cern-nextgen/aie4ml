@@ -7,17 +7,39 @@ from ...utils.precision import storage_bytes_for_spec
 __all__ = [
     'GAMMA_FRAC_BITS',
     'BETA_FRAC_BITS',
+    'TILED_MEAN_FRAC',
     'layernorm_vec_size',
     'pack_layernorm_param',
+    'tiled_fixed_point',
 ]
 
-# Fixed-point conventions baked into the integer LayerNorm kernel.
+# Fixed-point conventions baked into the linear LayerNorm kernel.
 # gamma is multiplied by inv_std (Q15) and right-shifted by GAMMA_SHIFT, so
 # gamma must be stored at frac=GAMMA_SHIFT for fscale to land in Q15.
 # beta is added to the Q15 accumulator before the final right-shift, so beta
 # is stored at frac=NORM_SHIFT (Q15).
 GAMMA_FRAC_BITS = 7
 BETA_FRAC_BITS = 15
+
+# Fraction bits of the mean the tiled kernel centres x with.
+TILED_MEAN_FRAC = 6
+
+
+def _int16_frac(peak: float, cap: int) -> int:
+    """The most fraction bits, up to `cap`, at which an int16 holds `peak`."""
+    frac = cap
+    while frac > 0 and round(peak * 2.0**frac) > 32767:
+        frac -= 1
+    return frac
+
+
+def tiled_fixed_point(gamma, beta, eps_q0: int):
+    """(gamma_frac, beta_frac, scale_frac): the most fraction bits at which int16 holds gamma, beta and gamma / sigma,
+    whose peak is max|gamma| / sqrt(eps_q0). beta joins at the scale's fixed point, so it has no more bits."""
+    g = float(np.max(np.abs(np.asarray(gamma, dtype=np.float64)), initial=0.0))
+    b = float(np.max(np.abs(np.asarray(beta, dtype=np.float64)), initial=0.0))
+    scale_frac = _int16_frac(g / float(np.sqrt(eps_q0)), 15)
+    return _int16_frac(g, 15), _int16_frac(b, scale_frac), scale_frac
 
 
 def layernorm_vec_size(precision, device) -> int:

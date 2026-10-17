@@ -93,15 +93,11 @@ public:
 };
 
 
-// layernorm_i8_tiled -- the same normalisation over microtiles.
+// layernorm_i8_tiled -- the same normalisation over microtiles, in three passes over the row bands, each pipelined
+// across bands: each row's sum and sum of squares; the statistics of all rows in vectors, one record [-mu | scale]
+// per band; then y = (x - mu) * (gamma / sigma) + beta.
 //
-// A block holds one lane group per row, so accumulating across the feature axis keeps the rows
-// separate and the totals need only a segmented reduce -- log2(inner) rounds once per row
-// band, against a full cross-lane reduce per row in the linear kernel.
-//
-// The per-row statistics are widened to lane groups with a concat of broadcasts, once per row
-// band. gamma/beta do not vary along rows at all, so they are widened once in ROM by the packer
-// and the innermost loop just loads a block.
+// gamma/beta arrive widened in ROM: NB blocks of BLK, each the microtile's feature slice repeated once per row.
 template <typename ConfigT>
 class layernorm_i8_tiled : public layernorm_base<ConfigT> {
 public:
@@ -109,47 +105,52 @@ public:
     using in_t  = typename ConfigT::input_t;
     using out_t = typename ConfigT::output_t;
 
-    static constexpr int MT_OUTER = ConfigT::MICROTILE_OUTER;   // rows per microtile
-    static constexpr int MT_INNER = ConfigT::MICROTILE_INNER;   // features per microtile
-    static constexpr int BLK      = MT_OUTER * MT_INNER;        // elements in one microtile
+    static constexpr int MT_OUTER = ConfigT::MICROTILE_OUTER;
+    static constexpr int MT_INNER = ConfigT::MICROTILE_INNER;
+    static constexpr int BLK      = MT_OUTER * MT_INNER;
 
-    static constexpr int ROWS        = base::ROWS;
-    static constexpr int COLS        = base::COLS;
-    static constexpr int GAMMA_SHIFT = base::GAMMA_SHIFT;
-    static constexpr int OUT_SHIFT   = base::OUT_SHIFT;
-    static constexpr int NORM_SHIFT  = base::NORM_SHIFT;
-    static constexpr int LOG2_COLS   = base::LOG2_COLS;
+    static constexpr int ROWS      = base::ROWS;
+    static constexpr int COLS      = base::COLS;
+    static constexpr int LOG2_COLS = base::LOG2_COLS;
+    static constexpr int NB        = COLS / MT_INNER;
+    static constexpr int BANDS     = ROWS / MT_OUTER;
 
-    static constexpr int NB = COLS / MT_INNER;                  // microtiles across the features
+    // Fraction bits: x - mu has MEAN_FRAC, the variance VAR_FRAC, 1/sigma 15 and gamma/sigma SCALE_FRAC.
+    static constexpr int MEAN_FRAC  = ConfigT::MEAN_FRAC;
+    static constexpr int VAR_FRAC   = 10;
+    static constexpr int SCALE_FRAC = ConfigT::SCALE_FRAC;
+    static constexpr int F_SHIFT    = ConfigT::GAMMA_SHIFT + 15 - SCALE_FRAC;
+    static constexpr int B_SHIFT    = SCALE_FRAC + MEAN_FRAC - ConfigT::BETA_FRAC;
+    static constexpr int O_SHIFT    = SCALE_FRAC + MEAN_FRAC - ConfigT::OUT_SHIFT;
 
-    // Row bands one statistics call covers, and the lanes it carries; the surplus lanes read zero variance,
-    // which the epsilon floor makes safe to invert, and are never stored. AIE-ML and AIE-MLv2 emulate the
-    // float inverse square root as one latency-bound chain, which takes up to 16 rows for the time of one;
-    // AIE1 has a float unit, where a call per band costs least.
-    static constexpr int BANDS = ROWS / MT_OUTER;
-    static constexpr int GROUP = []() constexpr {
-        int group = 1;
-        for (int g = 1; __AIE_ARCH__ != 10 && g * MT_OUTER <= 16; ++g)
-            if (BANDS % g == 0) group = g;
-        return group;
-    }();
-    static constexpr int STAT_LANES = (GROUP * MT_OUTER <= 4) ? 4 : (GROUP * MT_OUTER <= 8) ? 8 : 16;
+    // 32 bytes on AIE-ML: chess miscompiles the last vector of a 64-byte int8 band loop there.
+    static constexpr int VEC_BYTES = __AIE_ARCH__ == 10 ? 16 : __AIE_ARCH__ == 20 ? 32 : 64;
+    static constexpr int P  = (BLK * 4 <= VEC_BYTES && NB % 4 == 0) ? 4 : (BLK * 2 <= VEC_BYTES && NB % 2 == 0) ? 2 : 1;
+    static constexpr int VB = P * BLK;
+    static constexpr int NV = NB / P;
+
+    // Pass 1 stores [sums | squares] of each SUB-lane piece's PIECE_ROWS rows, or with ROW_TOTALS [sum, squares] of
+    // each row: on AIE1, whose 32-bit shuffles are compare-and-select, and where a piece holds one row.
+    static constexpr int LOG2_MT_INNER = MT_INNER == 8 ? 3 : MT_INNER == 16 ? 4 : 5;
+    static constexpr int SUB           = BLK < 32 ? BLK : 32;
+    static constexpr bool ROW_TOTALS   = __AIE_ARCH__ == 10 || SUB / MT_INNER < 2;
+    static constexpr int PIECE_ROWS    = ROW_TOTALS ? 1 : SUB / MT_INNER;
+    // Rows per statistics vector, each vector one latency-bound chain; AIE-MLv2 overflows its stack at 32.
+    static constexpr int NS     = (__AIE_ARCH__ == 10 || ROWS <= 8) ? 8 : (ROWS < 32 || __AIE_ARCH__ != 20) ? 16 : 32;
+    static constexpr int SROWS  = (ROWS + NS - 1) / NS * NS;
+    static constexpr int SBANDS = SROWS / MT_OUTER;
+    // A band's record: -mu and the scale of each row, padded to a 16-byte load.
+    static constexpr int REC = 2 * MT_OUTER < 8 ? 8 : 2 * MT_OUTER;
 
     static_assert(ROWS % MT_OUTER == 0, "ROWS must be a whole number of microtile row bands");
     static_assert(COLS % MT_INNER == 0, "COLS must be a whole number of microtiles");
-    static_assert(BLK * sizeof(in_t) >= 16, "a microtile must fill at least the 128b minimum vector");
-
-    static_assert(MT_INNER >= 8, "tiled LayerNorm needs MT_INNER >= 8 (int16 lane group must reach 128b)");
-    static_assert(MT_OUTER >= 2, "tiled LayerNorm needs at least 2 rows per microtile");
-    static_assert(MT_OUTER <= 8, "tiled LayerNorm supports at most 8 rows per microtile");
-    static_assert(BLK <= 64, "tiled LayerNorm needs BLK <= 64 (widened int16 vector must fit 1024b)");
-    static_assert((MT_INNER & (MT_INNER - 1)) == 0, "MT_INNER must be a power of two (segmented reduce halves it)");
+    static_assert((MT_INNER == 8 || MT_INNER == 16 || MT_INNER == 32) && (MT_OUTER == 2 || MT_OUTER == 4 ||
+                  MT_OUTER == 8) && BLK <= 64, "2, 4 or 8 rows of 8, 16 or 32 features, 64 elements at most");
+    static_assert(2 * LOG2_COLS >= VAR_FRAC, "at least 32 features");
+    static_assert(F_SHIFT >= 0 && B_SHIFT >= 0 && O_SHIFT >= 0, "right shifts only");
 
     layernorm_i8_tiled() : base() {}
 
-    // gamma/beta arrive pre-widened: NB blocks of BLK, each the microtile's feature slice
-    // repeated once per row. The packer builds this (pack_layernorm_param microtile=), so the
-    // innermost loop is a single block load with no broadcast or concat.
     void run(input_buffer<in_t>&           in,
              const int16_t (&gamma)[COLS * MT_OUTER],
              const int16_t (&beta)[COLS * MT_OUTER],
@@ -158,4 +159,8 @@ public:
     static void registerKernelClass() {
         REGISTER_FUNCTION(layernorm_i8_tiled::run);
     }
+
+private:
+    alignas(aie::vector_decl_align) int32_t sums_[2 * SROWS];
+    alignas(aie::vector_decl_align) int16_t records_[SBANDS * REC];
 };

@@ -10,6 +10,9 @@ struct {{L.struct_name}} {
   static constexpr int COLS = {{P.cols}};
   static constexpr int VEC  = {{P.vec_size}};
   static constexpr int GAMMA_SHIFT = {{P.gamma_shift}};
+  static constexpr int BETA_FRAC   = {{P.precision.beta.frac}};
+  static constexpr int SCALE_FRAC  = {{P.scale_frac}};
+  static constexpr int MEAN_FRAC   = {{P.mean_frac}};
   static constexpr int OUT_SHIFT   = {{P.out_shift}};
   static constexpr int EPS_Q0      = {{P.eps_q0}};
   static constexpr bool LAYOUT_TILED = {{ 'true' if P.layout == 'tiled' else 'false' }};

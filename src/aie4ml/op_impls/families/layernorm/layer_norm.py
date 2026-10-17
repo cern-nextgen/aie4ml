@@ -33,8 +33,10 @@ from ...utils.precision import (
 from .common import (
     BETA_FRAC_BITS,
     GAMMA_FRAC_BITS,
+    TILED_MEAN_FRAC,
     layernorm_vec_size,
     pack_layernorm_param,
+    tiled_fixed_point,
 )
 from .config import LayerNormConfig
 
@@ -78,14 +80,6 @@ class _LayerNormVariantBase(OpImplVariant):
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'layout', 'parallelism'})
 
-    def work(self, node: OpNode, config) -> int:
-        """Multiply-accumulates' time one tile takes per call: int8 LayerNorm on an AIE-ML tile took about 300 cc per
-        statistics call, one per 16 rows, beside 34 cc a row and 0.22 cc an element (4x64: 468 cc, 16x64: 1062,
-        16x128: 1285), counted at its 256 int8 multiply-accumulates a cycle."""
-        *rows, cols = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
-        rows = math.prod(rows)
-        return round((300 * math.ceil(rows / 16) + rows * (34 + 0.22 * cols)) * 256)
-
     def matches(self, node: OpNode, device, _directives) -> bool:
         if not layout_variant_matches(node, self.layout_name):
             return False
@@ -102,17 +96,24 @@ class _LayerNormVariantBase(OpImplVariant):
         """The microtile this variant normalises in, or None when it works on whole rows."""
         return None
 
+    def fixed_point(self, _node: OpNode, _eps_q0: int):
+        """Fraction bits the kernel computes gamma, beta, gamma / sigma and x - mu in."""
+        return GAMMA_FRAC_BITS, BETA_FRAC_BITS, 15, 0
+
     def resolve(self, node: OpNode, device, directives, input_contracts) -> LayerNormConfig:
         io_route, parallel_cfg = parse_directives(directives)
 
         in_tensor = input_tensor_for_role(node, 'lhs')
         out_tensor = node.outputs[0]
 
+        lhs_precision = resolve_exact_storage_dtype(in_tensor.precision, namespace='lhs', layer_name=node.name)
+        eps_q0 = _resolve_eps_q0(node.name, node.metadata, int(lhs_precision.frac))
+        gamma_frac, beta_frac, scale_frac, mean_frac = self.fixed_point(node, eps_q0)
         precision = {
-            'lhs': resolve_exact_storage_dtype(in_tensor.precision, namespace='lhs', layer_name=node.name),
+            'lhs': lhs_precision,
             'output': resolve_exact_storage_dtype(out_tensor.precision, namespace='output', layer_name=node.name),
-            'gamma': AIEDataType(format='int16', frac=GAMMA_FRAC_BITS),
-            'beta': AIEDataType(format='int16', frac=BETA_FRAC_BITS),
+            'gamma': AIEDataType(format='int16', frac=gamma_frac),
+            'beta': AIEDataType(format='int16', frac=beta_frac),
         }
 
         in_shape = tuple(int(x) for x in view_shape(node, in_tensor, 'inputs'))
@@ -168,9 +169,11 @@ class _LayerNormVariantBase(OpImplVariant):
             cols=int(full_inner),
             vec_size=int(vec_size),
             accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
-            gamma_shift=int(GAMMA_FRAC_BITS),
+            gamma_shift=int(gamma_frac),
+            scale_frac=int(scale_frac),
+            mean_frac=int(mean_frac),
             out_shift=int(to_quant_intent(out_tensor.precision).frac),
-            eps_q0=_resolve_eps_q0(node.name, node.metadata, int(precision['lhs'].frac)),
+            eps_q0=eps_q0,
             rounding_mode=aie_rounding_token(precision['output']),
             alternating_horizontal=device.alternating_horizontal,
             io_views=io_views,
@@ -182,10 +185,11 @@ class _LayerNormVariantBase(OpImplVariant):
 
     def validate_config(self, node: OpNode, config: LayerNormConfig, _device) -> None:
         require_power_of_two(f'{node.name}: cols', config.cols)
-        if not (0 <= config.out_shift <= 15):
+        top = config.scale_frac + config.mean_frac
+        if not 0 <= config.out_shift <= top:
             raise ValueError(
-                f'{node.name}: out_shift={config.out_shift} must be in [0, 15]; '
-                'integer LayerNorm cannot left-shift or exceed NORM_SHIFT=15.'
+                f'{node.name}: out_shift={config.out_shift} must be in [0, {top}], the fraction bits of '
+                '(x - mu) * gamma / sigma; integer LayerNorm cannot left-shift its result.'
             )
 
     def kernel_params(self, node: OpNode, config: LayerNormConfig):
@@ -286,6 +290,13 @@ class LayerNormLinearOpImplVariant(_LayerNormVariantBase):
     variant_id = 'layer_norm.i8.v1'
     layout_name = 'linear'
 
+    def work(self, node: OpNode, config) -> int:
+        """Multiply-accumulates' time one tile takes per call: a cost per call, per row and per element, fitted to this
+        kernel on an AIE-ML tile and counted at its 256 int8 multiply-accumulates a cycle."""
+        *rows, cols = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
+        rows = math.prod(rows)
+        return round((172 + 58.5 * rows + 0.39 * rows * cols) * 256)
+
 
 @register_variant
 class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
@@ -304,6 +315,18 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
     def resolve_microtile(self, node: OpNode, directives, input_contracts):
         """Match the producer's microtile so the edge is direct; else choose our own."""
         return inherited_microtile(node, input_contracts) or self.preferred_microtile(node, directives)
+
+    def work(self, node: OpNode, config) -> int:
+        """Multiply-accumulates' time one tile takes per call: a cost per call, per row and per element, fitted to this
+        kernel on an AIE-ML tile and counted at its 256 int8 multiply-accumulates a cycle."""
+        *rows, cols = config.io_views[input_tensor_for_role(node, 'lhs').name].tile
+        rows = math.prod(rows)
+        return round((187 + 9.5 * rows + 0.142 * rows * cols) * 256)
+
+    def fixed_point(self, node: OpNode, eps_q0: int):
+        gamma = input_tensor_for_role(node, 'gamma').data
+        beta = input_tensor_for_role(node, 'beta').data
+        return (*tiled_fixed_point(gamma, beta, eps_q0), TILED_MEAN_FRAC)
 
     def preferred_microtile(self, node: OpNode, directives) -> MicrotileShape:
         """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary).
@@ -335,10 +358,9 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
                 f'{config.precision["lhs"].c_type} is {block_bytes} bytes, under the 16-byte minimum '
                 f'vector width. This layout needs a wider microtile or a wider dtype.'
             )
-        if mt.inner < 8 or mt.outer < 2 or mt.outer > 8 or mt.outer * mt.inner > 64:
+        if mt.inner not in (8, 16, 32) or mt.outer not in (2, 4, 8) or mt.outer * mt.inner > 64:
             raise ValueError(
                 f'{node.name}: the tiled LayerNorm cannot normalise a {mt.outer}x{mt.inner} microtile. '
-                f'It needs 2 <= outer <= 8, inner >= 8, and outer*inner <= 64, because the gamma/beta '
-                f'lane group and the widened block each have to be a legal vector width. The producer '
+                f'It needs 2, 4 or 8 rows of 8, 16 or 32 features, 64 elements at most. The producer '
                 f"chose this tiling; retile it, or run this LayerNorm as layout='linear'."
             )

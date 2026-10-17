@@ -122,7 +122,8 @@ features (`cas_num`); there is no cascade.
 ## LayerNorm
 
 int8 in and out, over the last axis, whose length must be a power of two, with constant gamma and beta and a
-positive epsilon. `cas_num` splits the rows.
+positive epsilon. `cas_num` splits the rows. The tiled layout (the default) is within one code of float LayerNorm;
+the linear layout rounds the mean to a whole code and needs |beta| < 1.
 
 ## Softmax
 

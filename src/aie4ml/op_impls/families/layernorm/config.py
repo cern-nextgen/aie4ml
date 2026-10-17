@@ -21,6 +21,9 @@ class LayerNormConfig:
     vec_size: int
     accumulator_tag: Optional[str]
     gamma_shift: int
+    #: Fraction bits of gamma / sigma and of x - mu.
+    scale_frac: int
+    mean_frac: int
     out_shift: int
     eps_q0: int
     rounding_mode: Optional[str]
