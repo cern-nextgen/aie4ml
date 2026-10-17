@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from ...op_impls.common_types import PORT_KIND_BUFFER
+from ..cpsat import cp_model
 from ..shared_buffer import pinned_locations
 
 BELOW = None  # a memory tile or PLIO end
@@ -57,12 +58,16 @@ def _vertical(col: int, r1: int, r2: int):
     return [(col, r, 'North') for r in range(r1, r2)] + [(col, r, 'South') for r in range(r1, r2, -1)]
 
 
+def _candidates(source, target, columns: Optional[int]) -> List[List[Link]]:
+    """A branch's candidate routes (`_routes`) within `columns`."""
+    return [r for r in _routes(source, target) if columns is None or all(0 <= c < columns for c, *_ in r)]
+
+
 def route(demand: Dict[Link, frozenset], stream, source, target, ports, columns: Optional[int] = None) -> List[Link]:
     """Route one branch of `stream` into `demand` (each link's streams): of its candidate routes within `columns`, the
     one whose fullest link stays emptiest. A stream's branches share the links they cross."""
-    options = [r for r in _routes(source, target) if columns is None or all(0 <= c < columns for c, *_ in r)]
     chosen = min(
-        options,
+        _candidates(source, target, columns),
         key=lambda r: max((len(demand.get(link, frozenset()) | {stream}) / ports[link[2]] for link in r), default=0.0),
     )
     for link in chosen:
@@ -73,15 +78,17 @@ def route(demand: Dict[Link, frozenset], stream, source, target, ports, columns:
 def route_overflow(
     streams: Dict[object, Tuple[Optional[Tile], Iterable[Optional[Tile]]]], ports, columns: Optional[int] = None
 ) -> Optional[str]:
-    """Why `streams` ({stream: (source, targets)}) need more ports on some link than it has, or None. Each branch
-    takes the route within `columns` whose fullest link stays emptiest; a stream's branches share links. Whatever
-    fits routes, given memory tiles beside their readers."""
+    """Why `streams` ({stream: (source, targets)}) need more ports on some link than it has, or None: each branch takes
+    one of its candidate routes within `columns`, a stream's branches sharing the links they cross. Each branch first
+    takes the route whose fullest link stays emptiest (`route`), which fits most designs; where a link still overflows,
+    CP-SAT decides whether any choice of routes fits, as the order of that greedy choice must not. Whatever fits
+    routes, given memory tiles beside their readers."""
     demand: Dict[Link, frozenset] = {}
     for stream, (source, targets) in streams.items():
         for target in sorted(targets, key=str):
             route(demand, stream, source, target, ports, columns)
     over = sorted(((len(held), link) for link, held in demand.items() if len(held) > ports[link[2]]), reverse=True)
-    if not over:
+    if not over or _fits(streams, ports, columns):
         return None
     count, (col, row, side) = over[0]
     where = f'the switch under column {col}' if row < 0 else f'the switch of tile ({col}, {row})'
@@ -89,3 +96,29 @@ def route_overflow(
         f'{where} needs {count} streams {side.lower()}, beyond its {ports[side]} ports '
         f'({len(over)} switch links over their ports)'
     )
+
+
+def _fits(streams, ports, columns: Optional[int]) -> bool:
+    """Whether some choice of one candidate route per branch keeps every link within its ports, a stream's branches
+    sharing the links they cross."""
+    model = cp_model.CpModel()
+    used: Dict[Tuple[object, Link], cp_model.IntVar] = {}  # (stream, link): the stream crosses the link
+    load: Dict[Link, list] = {}
+    for stream, (source, targets) in streams.items():
+        for target in targets:
+            picks = []
+            for candidate in _candidates(source, target, columns):
+                pick = model.NewBoolVar('')
+                picks.append(pick)
+                for link in candidate:
+                    if (stream, link) not in used:
+                        used[stream, link] = model.NewBoolVar('')
+                        load.setdefault(link, []).append(used[stream, link])
+                    model.AddImplication(pick, used[stream, link])
+            model.AddExactlyOne(picks)
+    for link, crossing in load.items():
+        if len(crossing) > ports[link[2]]:
+            model.Add(sum(crossing) <= ports[link[2]])
+    solver = cp_model.CpSolver()
+    solver.parameters.num_workers = 1  # a small model, decided the same way every run
+    return solver.Solve(model) in (cp_model.OPTIMAL, cp_model.FEASIBLE)

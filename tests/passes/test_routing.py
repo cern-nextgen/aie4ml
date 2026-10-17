@@ -33,3 +33,12 @@ def test_a_broadcast_holds_one_port_per_link():
     assert route_overflow(streams, PORTS, 1) is None
     streams[5] = (BELOW, [(0, 7)])
     assert 'needs 7 streams north' in route_overflow(streams, PORTS, 1)
+
+
+def test_routes_are_chosen_together_not_one_by_one():
+    """Two streams from tile (0, 0), one link port each way: taking A's first route east leaves B, east on the same
+    row, none; north then east leaves it free. Whether streams fit does not depend on the order they are listed in."""
+    ports = dict.fromkeys(PORTS, 1)
+    assert route_overflow({'A': ((0, 0), [(1, 1)]), 'B': ((0, 0), [(1, 0)])}, ports, COLUMNS) is None
+    assert route_overflow({'B': ((0, 0), [(1, 0)]), 'A': ((0, 0), [(1, 1)])}, ports, COLUMNS) is None
+    assert 'east' in route_overflow({'A': ((0, 0), [(1, 0)]), 'B': ((0, 0), [(1, 0)])}, ports, COLUMNS)
