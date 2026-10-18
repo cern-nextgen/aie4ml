@@ -252,7 +252,7 @@ inline __attribute__((always_inline)) aie::vector<int16, N> inv_sqrt_q20(const a
     normalize_step<8>(m, p);
     normalize_step<4>(m, p);
     normalize_step<2>(m, p);
-    const aie::vector<int16, N> v = acc_t(aie::downshift(m, 15)).template to_vector<int16>(0);   // Q13
+    const aie::vector<int16, N> v = acc_t(m).template to_vector<int16>(15);   // Q13
     const auto hi = aie::ge(v, A[2]);
     const auto q  = aie::ge(v, aie::select(aie::broadcast<int16, N>(A[1]), aie::broadcast<int16, N>(A[3]), hi));
     const aie::vector<int16, N> u = aie::sub(v, pick<N>(A, hi, q));
