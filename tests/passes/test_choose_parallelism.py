@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -218,6 +219,47 @@ def test_designs_placement_finds_nothing_for_in_its_time_halve_the_fills_tried(t
     ctx = lower(_wide_model(), tmp_path, part=PART, aie_config={'Optimize': 'throughput', 'MaxTiles': 8})
     assert ctx.ir.optimizer['tiles'] <= 3 and not ctx.ir.optimizer['proven']
     assert any('were not all tried' in doubt for doubt in ctx.ir.optimizer['doubts'])
+
+
+class _Listed:
+    """A search (`choose_parallelism._Search`) over `designs`, (rank, fill) pairs best first, whose builds take the
+    next of the shared `outcomes`: the rank placed (None: no placement in time) and the fill tried from then on."""
+
+    builds = 10
+
+    def __init__(self, shared, designs):
+        self.shared, self.alternatives, self.designs, self.solves = shared, {}, list(designs), 0
+
+    def _fill(self, alternatives):
+        return self.shared.fill
+
+    def bound(self):
+        self.solves += 1
+        return next(((design, {}) for design in self.designs if design[1] <= self.shared.fill), None)
+
+    def fresh(self, found, fill):
+        now = self.shared.fill
+        return now <= fill and (found is None or found[0] in self.designs and found[0][1] <= now)
+
+    def rank(self, design):
+        return design[0]
+
+    def build(self, design, picks, best):
+        self.designs.remove(design)
+        self.shared.built += 1
+        placed, self.shared.fill = self.shared.outcomes.pop(0)
+        return None if placed is None else ((placed, design[1]), 'built')
+
+
+def test_a_search_solves_again_only_where_its_floor_ranks_it_nearest():
+    """A search's design found at a fill no smaller than now bounds its designs left: as the builds shrink the fills
+    and widen them again, the search behind is not solved again, and the design found is the one solving every
+    search after each build finds."""
+    shared = SimpleNamespace(built=0, doubts=[], fill=10, outcomes=[(None, 5), ((2,), 7)])
+    near = _Listed(shared, [((1,), 9), ((2,), 4), ((3,), 6)])
+    behind = _Listed(shared, [((4,), 8)])
+    search, design, _ = choose_parallelism._best_buildable([near, behind])
+    assert (search, design) == (near, ((2,), 4)) and (near.solves, behind.solves) == (3, 1)
 
 
 def test_a_search_that_builds_nothing_says_whether_it_hit_a_limit(tmp_path, monkeypatch):

@@ -30,6 +30,7 @@ import copy
 import itertools
 import json
 import logging
+import math
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -1207,39 +1208,48 @@ class _Search:
 def _best_buildable(searches: List[_Search]) -> Tuple[_Search, _Design, Any]:
     """The best-ranked design the rest of the pipeline builds, of any of `searches`: its search, the design as placed
     (`_Search._as_placed`) and the context it was built in. Designs are built in the order of their bounds, whichever
-    search they are of, until the next ranks no better than the best built, which no design left can then beat; a
-    search solves for its best design left again only where the designs built may have changed it (`_Search.fresh`)."""
+    search they are of, until the next ranks no better than the best built, which no design left can then beat.
+    The designs cut since a search solved only tighten its constraint program, so its best design left ranks no better
+    than any it found at a fill no smaller than now (`_Search._fill`), the floor it is ranked by: a search solves again
+    only where its floor ranks it nearest and the designs built may have changed its best (`_Search.fresh`)."""
     searches = list(searches)
     shared, builds = searches[0].shared, searches[0].builds
     left: Dict[_Search, tuple] = {}  # by search: its best design left (`_Search.bound`) and the fill it was solved at
+    solved: Dict[_Search, List[tuple]] = defaultdict(list)  # by search: each solve's fill and its design's rank
+    nothing = (math.inf,)  # the rank of no design, past every design's
     best, limit = None, None
-    while True:
-        for search in [search for search in searches if search not in left or not search.fresh(*left[search])]:
+    while searches:
+        floors = {}
+        for search in searches:
             fill = search._fill(search.alternatives)
-            try:
-                left[search] = (search.bound(), fill)
-            except SearchLimit as failure:  # a better design of its may exist
-                shared.doubts.append(str(failure).splitlines()[0])
-                limit = limit or failure
-                searches.remove(search)
-                left.pop(search, None)
-        ranked = [(search.rank(left[search][0][0]), i) for i, search in enumerate(searches) if left[search][0]]
-        if not ranked:
-            break
-        nearest, i = min(ranked)
-        search = searches[i]
-        if best is not None and nearest >= search.rank(best[1]):
-            break  # no design left ranks better
-        if shared.built == builds:
-            failure = search._failure(f'search limit: {builds} designs built (AIEConfig SearchBuilds)')
-            if best is None:
-                raise SearchLimit(failure)
-            shared.doubts.append(failure.splitlines()[0])
-            break
-        design, picks = left.pop(search)[0]
-        found = search.build(design, picks, None if best is None else search.rank(best[1]))
-        if found is not None and (best is None or search.rank(found[0]) < search.rank(best[1])):
-            best = (search, *found)
+            floors[search] = max((rank for at, rank in solved[search] if at >= fill), default=None)
+        search = next((search for search in searches if floors[search] is None), None)  # bounded by no solve yet
+        if search is None:
+            search = min(searches, key=floors.get)
+            if floors[search] == nothing or (best is not None and floors[search] >= search.rank(best[1])):
+                break  # no design left ranks better
+            if search in left and search.fresh(*left[search]):
+                if shared.built == builds:
+                    failure = search._failure(f'search limit: {builds} designs built (AIEConfig SearchBuilds)')
+                    if best is None:
+                        raise SearchLimit(failure)
+                    shared.doubts.append(failure.splitlines()[0])
+                    break
+                design, picks = left.pop(search)[0]
+                found = search.build(design, picks, None if best is None else search.rank(best[1]))
+                if found is not None and (best is None or search.rank(found[0]) < search.rank(best[1])):
+                    best = (search, *found)
+                continue
+        fill = search._fill(search.alternatives)
+        try:
+            found = search.bound()
+        except SearchLimit as failure:  # a better design of its may exist
+            shared.doubts.append(str(failure).splitlines()[0])
+            limit = limit or failure
+            searches.remove(search)
+            continue
+        left[search] = (found, fill)
+        solved[search].append((fill, nothing if found is None else search.rank(found[0])))
     if best is not None:
         return best
     raise limit if limit is not None else searches[0].refused()
