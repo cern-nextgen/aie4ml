@@ -301,7 +301,7 @@ class ChooseParallelism(AIEPass):
         if not searches:
             raise refusal
         search, design, built = _best_buildable(searches)
-        doubts = shared.doubts
+        doubts = list(dict.fromkeys(shared.doubts))  # each reason once
         if shared.unplaced_fill is not None:  # the fills the searches halved (`_Search._fill`)
             doubts.append(
                 f'designs filling more than {shared.placed_fill} tiles were not all tried: one filling '
