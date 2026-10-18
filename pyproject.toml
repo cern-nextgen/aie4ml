@@ -47,7 +47,6 @@ testing = [
   "onnx<1.18",
   "onnxruntime",
   "tensorflow~=2.21.0",
-  "qkeras-v3",
 ]
 
 [project.urls]

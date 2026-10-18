@@ -21,6 +21,8 @@ jobs:
           cache-dependency-path: pyproject.toml
       # hls4ml supports Keras 3 / QKeras v3 from 1.4; until its release, the upstream commit the tutorials pin.
       - run: pip install -e '.[testing]' "hls4ml @ git+https://github.com/fastmachinelearning/hls4ml.git@a2abb4d22e7762a870cd46ccf3e07ff6a5622ed5"
+      # apart: qkeras-v3's unused tensorflow-model-optimization pins absl-py below OR-Tools' 2.0 (qkerasV3#5)
+      - run: pip install qkeras-v3
       - name: pre-commit
         uses: pre-commit/action@v3.0.1
         with:
