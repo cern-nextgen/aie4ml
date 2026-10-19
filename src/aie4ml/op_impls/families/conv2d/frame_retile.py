@@ -10,7 +10,7 @@ from dataclasses import asdict
 
 import numpy as np
 
-from ...base import PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
+from ...base import PING_PONG_BANKS, BufferLocation, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PortBinding, PortMap
 from .common import describe_frame_staging, describe_logical_staging
 from .config import FrameRetileConfig
@@ -81,9 +81,6 @@ class FrameRetileOpImplVariant(OpImplVariant):
             },
         )
 
-    def footprint(self, _node, config: FrameRetileConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
-
     def describe_input_staging(self, _node, config: FrameRetileConfig, _tensor_name, port):
         window = config.windows[int(port)]
         if config.from_boundary:
@@ -115,9 +112,3 @@ class FrameRetileOpImplVariant(OpImplVariant):
 
     def output_staging_contract(self, _node, config: FrameRetileConfig, _tensor_name):
         return config.parallelism.contract
-
-    def output_port_count(self, _node, config: FrameRetileConfig):
-        return int(config.parallelism.cas_num)
-
-    def pack(self, _inst):
-        return {}

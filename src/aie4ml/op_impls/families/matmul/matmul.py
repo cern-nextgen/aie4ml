@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from ....aie_types import FloatIntent
-from ....ir.graph import ExecutionInstance, OpNode, input_role, input_tensor_for_role
-from ...base import KERNEL_BANKS, PING_PONG_BANKS, BufferLocation, OpImplFootprint, row_flow
+from ....ir.graph import OpNode, input_role, input_tensor_for_role
+from ...base import KERNEL_BANKS, PING_PONG_BANKS, BufferLocation, row_flow
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, parse_directives
@@ -106,18 +106,6 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
         rhs_is_float = isinstance(rhs_tensor.precision, FloatIntent)
         if not rhs_is_float and not bool(config.precision['rhs'].signed):
             raise ValueError(f'{node.name}: matmul RHS must use a signed integer precision.')
-
-    def pack(self, _inst: ExecutionInstance):
-        return {}
-
-    def get_artifacts(self, _inst: ExecutionInstance):
-        return []
-
-    def footprint(self, _node, config) -> OpImplFootprint:
-        return OpImplFootprint(
-            width=int(config.parallelism.cas_length),
-            height=int(config.parallelism.cas_num),
-        )
 
     def buffer_locations(self, _node, config, anchor_row):
         locations = []

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from ..errors import ConfigRefused
 from ..ir.graph import OpNode, input_tensor_for_role
-from .base import PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
+from .base import PING_PONG_BANKS, BufferLocation, OpImplVariant, row_flow
 from .common_types import PortBinding, PortMap, kernel_endpoints
 from .utils import MicrotileShape, describe_partition_staging, inherited_microtile
 
@@ -21,9 +21,6 @@ class RowWiseOpImplVariant(OpImplVariant):
 
     def output_staging_contract(self, _node, config, _tensor_name: str):
         return str(config.parallelism.contract)
-
-    def footprint(self, _node: OpNode, config) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=int(config.parallelism.cas_num))
 
     def buffer_locations(self, _node: OpNode, config, anchor_row: int):
         locations = []

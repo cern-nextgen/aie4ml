@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import math
-from typing import Any, ClassVar, Dict
+from typing import ClassVar
 
 from ....aie_types import FloatIntent
-from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
+from ....ir.graph import OpNode, input_tensor_for_role
 from ...base import (
     KERNEL_BANKS,
     PING_PONG_BANKS,
     STACK_BANK_RESERVED_BYTES,
     BufferLocation,
-    OpImplFootprint,
     OpImplVariant,
     row_flow,
 )
@@ -245,18 +244,6 @@ class AddOpImplVariant(OpImplVariant):
 
     def output_staging_contract(self, node, config: AddConfig, tensor_name: str):
         return str(config.parallelism.contract)
-
-    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
-        return {}
-
-    def get_artifacts(self, inst: ExecutionInstance):
-        return []
-
-    def footprint(self, node: OpNode, config: AddConfig) -> OpImplFootprint:
-        return OpImplFootprint(
-            width=1,
-            height=int(config.parallelism.cas_num),
-        )
 
     def buffer_locations(self, _node: OpNode, config: AddConfig, anchor_row: int):
         locations = []

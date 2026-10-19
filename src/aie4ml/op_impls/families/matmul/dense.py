@@ -8,7 +8,7 @@ from ....aie_types import FloatIntent
 from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role, shard_major_order
 from ....passes.utils import sanitize_identifier
-from ...base import OpImplFootprint, OpImplVariant, StreamLocation, cascade_locations, cascade_ports
+from ...base import OpImplVariant, StreamLocation, cascade_locations, cascade_ports
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
@@ -252,12 +252,6 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         if shards is not None:
             W = np.take(W, shard_major_order(W.shape[-2], *shards), axis=-2)
         return W, b, int(W.shape[-2]), int(W.shape[-1])
-
-    def footprint(self, _node, config) -> OpImplFootprint:
-        return OpImplFootprint(
-            width=int(config.parallelism.cas_length),
-            height=int(config.parallelism.cas_num),
-        )
 
     def buffer_locations(self, _node, config, anchor_row):
         return cascade_locations(config, anchor_row)

@@ -4,7 +4,7 @@ import math
 from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
-from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
+from ....ir.graph import OpNode, input_tensor_for_role
 from ...registry import register_variant
 from ...row_wise import RowWiseOpImplVariant, TiledRowWiseMixin
 from ...utils import (
@@ -202,9 +202,6 @@ class _SoftmaxVariantBase(RowWiseOpImplVariant):
 
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:
         raise NotImplementedError
-
-    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
-        return {}
 
 class _SoftmaxTiledMixin(TiledRowWiseMixin):
     """The tiled envelope, shared by the HCCS and exp tiled variants."""

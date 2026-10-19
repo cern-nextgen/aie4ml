@@ -217,8 +217,9 @@ class OpImplVariant:
         where it reads the logical order."""
         return None
 
-    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
-        raise NotImplementedError
+    def pack(self, _inst: ExecutionInstance) -> Dict[str, Any]:
+        """Kernel-resident constants (weights, tables) laid out for its kernels; none by default."""
+        return {}
 
     def get_artifacts(self, inst: ExecutionInstance) -> List[Dict[str, Any]]:
         return []
@@ -241,8 +242,9 @@ class OpImplVariant:
     ) -> Any:
         return None
 
-    def footprint(self, node: OpNode, config: Any) -> OpImplFootprint:
-        raise NotImplementedError
+    def footprint(self, _node: OpNode, config: Any) -> OpImplFootprint:
+        """The tiles its kernels span: a cascade of `cas_length` across, `cas_num` chains down."""
+        return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
 
     def work(self, node: OpNode, config: Any) -> Optional[int]:
         """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which designs

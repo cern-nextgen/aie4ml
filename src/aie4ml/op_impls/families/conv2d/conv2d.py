@@ -739,9 +739,6 @@ class Conv2dOpImplVariant(OpImplVariant):
             )
         return params
 
-    def footprint(self, _node, config) -> OpImplFootprint:
-        return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
-
     def work(self, node, config) -> int:
         in_blocks, out_blocks, out_h, _, out_w_computed = self._tile_extent(node, config)
         kh, kw = config.spatial.kernel
@@ -752,9 +749,6 @@ class Conv2dOpImplVariant(OpImplVariant):
 
     def output_staging_contract(self, _node, config, _tensor_name):
         return str(config.parallelism.contract)
-
-    def output_port_count(self, _node, config):
-        return int(config.parallelism.cas_num)
 
     def output_inner_shards(self, node, config, _tensor_name):
         """A chain flattens its own output channels pixel by pixel, so the flattened row holds each pixel's channels

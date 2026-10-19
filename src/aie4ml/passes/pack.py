@@ -4,7 +4,6 @@
 """Pass to pack kernel artifacts into tiled layouts for AIE mmul kernels."""
 
 from ..ir import get_backend_context
-from ..op_impls.base import OpImplVariant
 from .base import AIEPass
 
 
@@ -22,9 +21,6 @@ class PackKernelArtifacts(AIEPass):
         changed = False
 
         for inst in ctx.ir.execution:
-            if type(inst.variant).pack is OpImplVariant.pack:
-                continue
-
             packed = inst.variant.pack(inst)
 
             if packed:
