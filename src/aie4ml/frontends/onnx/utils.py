@@ -176,3 +176,20 @@ def attr(node, name: str, default=None):
             continue
         return helper.get_attribute_value(value)
     return default
+
+
+def window_attributes(node, node_name: str, kernel=()) -> dict:
+    """A Conv's or a pool's window: kernel_shape (by default `kernel`), strides, dilations and pads. auto_pad is
+    refused, as it leaves the padding to shape inference."""
+    auto_pad = attr(node, 'auto_pad', b'NOTSET')
+    auto_pad = auto_pad.decode() if isinstance(auto_pad, bytes) else str(auto_pad)
+    if auto_pad != 'NOTSET':
+        raise NotImplementedError(
+            f'{node_name}: auto_pad={auto_pad} leaves the padding to shape inference; re-export with explicit pads.'
+        )
+    return {
+        'kernel_shape': tuple(int(k) for k in attr(node, 'kernel_shape', list(kernel))),
+        'strides': tuple(int(s) for s in attr(node, 'strides', [1, 1])),
+        'dilations': tuple(int(d) for d in attr(node, 'dilations', [1, 1])),
+        'pads': tuple(int(p) for p in attr(node, 'pads', [0, 0, 0, 0])),
+    }

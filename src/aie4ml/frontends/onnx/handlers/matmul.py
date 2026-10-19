@@ -95,45 +95,17 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
     n_in, n_out = int(rhs_data.shape[0]), int(rhs_data.shape[1])
     rhs_param = ctx.param_tensor(f'{node_name}_weight', rhs_data, rhs_tensor.precision)
 
-    if bias_name is None:
-        ctx.emit(
-            'dense',
-            node_name,
-            inputs=[lhs_tensor, rhs_param],
-            outputs=[(out_name, out_shape, out_precision)],
-            roles=['lhs', 'rhs'],
-            metadata=_dense_meta(op_type, n_in, n_out, node_name),
-            directives=directives,
-        )
-        return
-
-    # Gemm with bias: dense -> add(bias); FoldBias re-fuses the add into the dense.
-    prebias_name = f'{node_name}_prebias'
-    ctx.mirror_precision(prebias_name, out_name)
-    ctx.emit(
+    ctx.emit_with_bias(
         'dense',
         node_name,
         inputs=[lhs_tensor, rhs_param],
-        outputs=[(prebias_name, out_shape, out_precision)],
         roles=['lhs', 'rhs'],
+        output=(out_name, out_shape, out_precision),
         metadata=_dense_meta(op_type, n_in, n_out, node_name),
         directives=directives,
-    )
-    bias_tensor = ctx.parameter_source_for(bias_name, node_name)
-    if not bias_tensor.is_parameter:
-        raise ValueError(f'{node_name}: Gemm bias must be constant.')
-    bias_data = np.asarray(bias_tensor.data, dtype=np.float64).reshape(-1)
-    if int(bias_data.size) != n_out:
-        raise ValueError(f'{node_name}: Gemm bias must contain exactly {n_out} elements.')
-    bias_param = ctx.param_tensor(f'{node_name}_bias', bias_data, bias_tensor.precision)
-    ctx.emit(
-        'add',
-        f'{node_name}_bias',
-        inputs=[ctx.value_tensors[prebias_name], bias_param],
-        outputs=[(out_name, out_shape, out_precision)],
-        roles=['lhs', 'rhs'],
-        metadata={'layer_class': 'Add', 'source_class': 'Gemm', 'source_layer': node_name},
-        directives={},
+        bias_name=bias_name,
+        channels=n_out,
+        source_class='Gemm',
     )
 
 

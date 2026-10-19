@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from ..context import OnnxImportContext
 from ..registry import onnx_handler
-from ..utils import attr
+from ..utils import window_attributes
 from .conv import NCHW_OVER_NHWC
 
 
@@ -21,16 +21,8 @@ def _max_pool(ctx: OnnxImportContext, node, node_name: str, directives: dict) ->
     x = ctx.source_for(x_name, node_name)
     if len(x.shape) != 4:
         raise ValueError(f'{node_name}: MaxPool takes a rank-4 activation, got {x.shape}.')
-    auto_pad = attr(node, 'auto_pad', b'NOTSET')
-    auto_pad = auto_pad.decode() if isinstance(auto_pad, bytes) else str(auto_pad)
-    if auto_pad != 'NOTSET':
-        raise NotImplementedError(
-            f'{node_name}: auto_pad={auto_pad} leaves the padding to shape inference; re-export with explicit pads.'
-        )
-    kernel = tuple(int(k) for k in attr(node, 'kernel_shape', []))
-    strides = tuple(int(s) for s in attr(node, 'strides', [1, 1]))
-    dilations = tuple(int(d) for d in attr(node, 'dilations', [1, 1]))
-    pads = tuple(int(p) for p in attr(node, 'pads', [0, 0, 0, 0]))
+    window = window_attributes(node, node_name)
+    kernel, strides, dilations, pads = (window[k] for k in ('kernel_shape', 'strides', 'dilations', 'pads'))
     out_name = node.output[0]
     batch, channels, out_h, out_w = (int(d) for d in ctx.output_shape(out_name, node_name))
     # pool2d rounds its output extent down; ceil_mode is accepted where it does not change it.
@@ -45,10 +37,7 @@ def _max_pool(ctx: OnnxImportContext, node, node_name: str, directives: dict) ->
         )
     metadata = {
         'kind': 'max',
-        'kernel_shape': kernel,
-        'strides': strides,
-        'dilations': dilations,
-        'pads': pads,
+        **window,
         'layer_class': 'MaxPooling2D',
         'source_class': 'MaxPool',
         'source_layer': node_name,

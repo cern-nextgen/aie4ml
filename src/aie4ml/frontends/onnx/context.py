@@ -236,6 +236,64 @@ class OnnxImportContext:
     def bind(self, name: str, tensor: TensorVar) -> None:
         self.value_tensors[name] = tensor
 
+    def emit_with_bias(
+        self,
+        op_type: str,
+        node_name: str,
+        *,
+        inputs: Sequence[TensorVar],
+        roles: Sequence[str],
+        output: Tuple[str, Sequence[int], Optional[Any]],
+        metadata: Dict[str, Any],
+        directives: Dict[str, Any],
+        bias_name: Optional[str],
+        channels: int,
+        source_class: str,
+        order: Optional[Sequence[int]] = None,
+    ) -> None:
+        """The op, and with a constant `bias_name` an add of it after: the op writes `<node>_prebias`, the add the
+        output, and FoldBias folds the add back into the op, keeping fusion out of the frontend. `order` is how the
+        ONNX values view the output (`set_order`)."""
+        out_name, out_shape, out_precision = output
+        self.set_order(out_name, order, node_name)
+        if bias_name is None:
+            self.emit(
+                op_type,
+                node_name,
+                inputs=inputs,
+                outputs=[output],
+                roles=roles,
+                metadata=metadata,
+                directives=directives,
+            )
+            return
+        prebias_name = f'{node_name}_prebias'
+        self.set_order(prebias_name, order, node_name)
+        self.mirror_precision(prebias_name, out_name)
+        self.emit(
+            op_type,
+            node_name,
+            inputs=inputs,
+            outputs=[(prebias_name, out_shape, out_precision)],
+            roles=roles,
+            metadata=metadata,
+            directives=directives,
+        )
+        bias_tensor = self.parameter_source_for(bias_name, node_name)
+        bias_data = np.asarray(bias_tensor.data, dtype=np.float64).reshape(-1)
+        if int(bias_data.size) != channels:
+            raise ValueError(f'{node_name}: {source_class} bias must contain exactly {channels} elements.')
+        bias_param = self.param_tensor(f'{node_name}_bias', bias_data, bias_tensor.precision)
+        self.emit(
+            'add',
+            f'{node_name}_bias',
+            inputs=[self.value_tensors[prebias_name], bias_param],
+            outputs=[output],
+            roles=['lhs', 'rhs'],
+            metadata={'layer_class': 'Add', 'source_class': source_class, 'source_layer': node_name},
+            directives={},
+        )
+
     def emit(
         self,
         op_type: str,
