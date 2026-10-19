@@ -4,20 +4,15 @@ import math
 from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
-from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
-from ...base import PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
-from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
+from ...row_wise import RowWiseOpImplVariant, TiledRowWiseMixin
 from ...utils import (
-    MicrotileShape,
     ParallelismConfig,
     build_io_views,
-    describe_partition_staging,
     extract_inner_outer,
     find_tile_split,
-    inherited_microtile,
     layout_variant_matches,
     parse_directives,
     require_power_of_two,
@@ -65,7 +60,7 @@ def _resolve_eps_q0(node_name: str, metadata: dict, input_frac: int) -> int:
     return eps_q0
 
 
-class _LayerNormVariantBase(OpImplVariant):
+class _LayerNormVariantBase(RowWiseOpImplVariant):
     """Everything the LayerNorm variants share, independent of the layout they normalise in."""
 
     #: The `layout:` directive name this variant answers to -- the sole selector between the
@@ -194,20 +189,6 @@ class _LayerNormVariantBase(OpImplVariant):
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         return params
 
-    def describe_input_staging(self, _node, config, tensor_name, port):
-        return describe_partition_staging(
-            config.io_views[tensor_name],
-            port,
-            'read',
-            'outer',
-        )
-
-    def describe_output_staging(self, _node, config, tensor_name, port):
-        return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer')
-
-    def output_staging_contract(self, _node, config: LayerNormConfig, _tensor_name: str):
-        return str(config.parallelism.contract)
-
     def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         p = inst.config
         gamma_tensor = input_tensor_for_role(inst.node, 'gamma')
@@ -258,29 +239,6 @@ class _LayerNormVariantBase(OpImplVariant):
             },
         ]
 
-    def footprint(self, node: OpNode, config: LayerNormConfig) -> OpImplFootprint:
-        return OpImplFootprint(
-            width=1,
-            height=int(config.parallelism.cas_num),
-        )
-
-    def buffer_locations(self, _node: OpNode, config: LayerNormConfig, anchor_row: int):
-        locations = []
-        for row in range(int(config.parallelism.cas_num)):
-            flow = row_flow(config.alternating_horizontal, int(anchor_row) + row, 1)
-            locations.append(BufferLocation('in1', row, flow.input_col, row, PING_PONG_BANKS, reader=(0, row)))
-            locations.append(BufferLocation('out1', row, flow.output_col, row, PING_PONG_BANKS))
-        return tuple(locations)
-
-    def build_ports(self, node: OpNode, config: LayerNormConfig):
-        in_tensor = input_tensor_for_role(node, 'lhs')
-        n = int(config.parallelism.cas_num)
-        return PortMap(
-            inputs={in_tensor.name: PortBinding('in1', n, endpoints=kernel_endpoints(n, 'in[0]'))},
-            outputs={node.outputs[0].name: PortBinding('out1', n, endpoints=kernel_endpoints(n, 'out[0]'))},
-        )
-
-
 @register_variant
 class LayerNormLinearOpImplVariant(_LayerNormVariantBase):
     """LayerNorm over row-contiguous data -- the layout every non-matmul op reads and writes."""
@@ -297,7 +255,7 @@ class LayerNormLinearOpImplVariant(_LayerNormVariantBase):
 
 
 @register_variant
-class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
+class LayerNormTiledOpImplVariant(TiledRowWiseMixin, _LayerNormVariantBase):
     """LayerNorm over microtiles, so a matmul on either side needs no memtile to reorder.
 
     A block holds one lane group per row, which also lets the reduction be segmented (once
@@ -307,12 +265,7 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
     variant_id = 'layer_norm.i8.tiled.v1'
     layout_name = 'tiled'
     supported_directives = _LayerNormVariantBase.supported_directives | {'microtiling'}
-    plevel = 11
     kernel_transposes_microtile = True
-
-    def resolve_microtile(self, node: OpNode, directives, input_contracts):
-        """Match the producer's microtile so the edge is direct; else choose our own."""
-        return inherited_microtile(node, input_contracts) or self.preferred_microtile(node, directives)
 
     def work(self, node: OpNode, config) -> int:
         """Multiply-accumulates' time one tile takes per call: a cost per call, per row and per element, fitted to this
@@ -326,29 +279,10 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
         beta = input_tensor_for_role(node, 'beta').data
         return (*tiled_fixed_point(gamma, beta, eps_q0), TILED_MEAN_FRAC)
 
-    def preferred_microtile(self, node: OpNode, directives) -> MicrotileShape:
-        """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary).
-
-        A `microtiling` directive pins it (microtile_m -> row band, microtile_n -> feature block);
-        otherwise 4x8.
-        """
-        mt = directives.get('microtiling')
-        if mt is None:
-            return MicrotileShape(outer=4, inner=8)
-        if set(mt) != {'microtile_m', 'microtile_n'}:
-            raise ValueError(f'{node.name}: microtiling takes microtile_m and microtile_n here, got {sorted(mt)}.')
-        return MicrotileShape(outer=int(mt['microtile_m']), inner=int(mt['microtile_n']))
-
     def validate_config(self, node: OpNode, config: LayerNormConfig, device) -> None:
         super().validate_config(node, config, device)
         mt = config.microtile
-        if config.rows % mt.outer:
-            raise ConfigRefused(
-                f'{node.name}: rows={config.rows} must be a whole number of {mt.outer}-row microtile '
-                f'bands. Partitioning across kernels chose this tile height, so adjust cas_num.'
-            )
-        if config.cols % mt.inner:
-            raise ValueError(f'{node.name}: cols={config.cols} must be a whole number of {mt.inner}-wide microtiles.')
+        self.check_whole_microtiles(node, mt, config.rows, config.cols)
         block_bytes = mt.outer * mt.inner * storage_bytes_for_spec(config.precision['lhs'])
         if block_bytes < 16:
             raise ValueError(

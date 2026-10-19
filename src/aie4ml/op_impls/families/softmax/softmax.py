@@ -4,19 +4,14 @@ import math
 from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
-from ....errors import ConfigRefused
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
-from ...base import PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
-from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
+from ...row_wise import RowWiseOpImplVariant, TiledRowWiseMixin
 from ...utils import (
-    MicrotileShape,
     ParallelismConfig,
     build_io_views,
-    describe_partition_staging,
     extract_inner_outer,
     find_tile_split,
-    inherited_microtile,
     layout_variant_matches,
     parse_directives,
 )
@@ -55,7 +50,7 @@ def _parse_hccs_directives(node_name: str, directives) -> dict:
     return hccs
 
 
-class _SoftmaxVariantBase(OpImplVariant):
+class _SoftmaxVariantBase(RowWiseOpImplVariant):
     """Everything Softmax variants share, independent of approximation and layout.
 
     The kernel is picked on two axes: `approximation` ('hccs' calibrated clipped-linear surrogate,
@@ -208,85 +203,17 @@ class _SoftmaxVariantBase(OpImplVariant):
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def describe_input_staging(self, _node, config, tensor_name, port):
-        return describe_partition_staging(
-            config.io_views[tensor_name],
-            port,
-            'read',
-            'outer',
-        )
-
-    def describe_output_staging(self, _node, config, tensor_name, port):
-        return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer')
-
-    def output_staging_contract(self, _node, config: SoftmaxConfig, _tensor_name: str):
-        return str(config.parallelism.contract)
-
     def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         return {}
 
-    def get_artifacts(self, inst: ExecutionInstance):
-        return []
-
-    def footprint(self, node: OpNode, config: SoftmaxConfig) -> OpImplFootprint:
-        return OpImplFootprint(
-            width=1,
-            height=int(config.parallelism.cas_num),
-        )
-
-    def buffer_locations(self, _node: OpNode, config: SoftmaxConfig, anchor_row: int):
-        locations = []
-        for row in range(int(config.parallelism.cas_num)):
-            flow = row_flow(config.alternating_horizontal, int(anchor_row) + row, 1)
-            locations.append(BufferLocation('in1', row, flow.input_col, row, PING_PONG_BANKS, reader=(0, row)))
-            locations.append(BufferLocation('out1', row, flow.output_col, row, PING_PONG_BANKS))
-        return tuple(locations)
-
-    def build_ports(self, node: OpNode, config: SoftmaxConfig):
-        in_tensor = input_tensor_for_role(node, 'lhs')
-        n = int(config.parallelism.cas_num)
-        return PortMap(
-            inputs={in_tensor.name: PortBinding('in1', n, endpoints=kernel_endpoints(n, 'in[0]'))},
-            outputs={node.outputs[0].name: PortBinding('out1', n, endpoints=kernel_endpoints(n, 'out[0]'))},
-        )
-
-
-class _SoftmaxTiledMixin:
-    """Microtile inheritance and the tiled envelope, shared by the HCCS and exp tiled variants."""
-
-    # Prefer microtiled execution when layout is unconstrained; explicit layout wins in matches().
-    plevel = 11
-
-    def resolve_microtile(self, node: OpNode, directives, input_contracts):
-        """Match the producer's microtile so the edge is direct; else choose our own."""
-        return inherited_microtile(node, input_contracts) or self.preferred_microtile(node, directives)
-
-    def preferred_microtile(self, node: OpNode, directives) -> MicrotileShape:
-        """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary).
-
-        A `microtiling` directive pins it (microtile_m -> row band, microtile_n -> feature block);
-        otherwise 4x8.
-        """
-        mt = directives.get('microtiling')
-        if mt is None:
-            return MicrotileShape(outer=4, inner=8)
-        if set(mt) != {'microtile_m', 'microtile_n'}:
-            raise ValueError(f'{node.name}: microtiling takes microtile_m and microtile_n here, got {sorted(mt)}.')
-        return MicrotileShape(outer=int(mt['microtile_m']), inner=int(mt['microtile_n']))
+class _SoftmaxTiledMixin(TiledRowWiseMixin):
+    """The tiled envelope, shared by the HCCS and exp tiled variants."""
 
     def validate_config(self, node: OpNode, config: SoftmaxConfig, device) -> None:
         super().validate_config(node, config, device)
         mt = config.microtile
         in_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
-        rows = int(in_view.compacted_tile_outer)
-        cols = int(in_view.full_inner)
-        if rows % mt.outer:
-            raise ConfigRefused(
-                f'{node.name}: rows={rows} must be a whole number of {mt.outer}-row microtile bands. '
-                f'Partitioning across kernels chose this tile height, so adjust cas_num.'
-            )
-        if cols % mt.inner:
-            raise ValueError(f'{node.name}: cols={cols} must be a whole number of {mt.inner}-wide microtiles.')
+        self.check_whole_microtiles(node, mt, int(in_view.compacted_tile_outer), int(in_view.full_inner))
         if mt.inner != 8 or mt.outer not in (2, 4, 8):
             raise ValueError(
                 f'{node.name}: the tiled Softmax reads 2x8, 4x8 or 8x8 int8 microtiles, the ones an int8 matmul emits; '
