@@ -217,6 +217,8 @@ class AddOpImplVariant(OpImplVariant):
         lhs_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         params['tile_elements'] = int(math.prod(lhs_view.tile))
+        if not (config.flags.transpose_lhs or config.flags.transpose_rhs):
+            params['microtile'] = None  # the kernel reads it only to transpose an operand
         return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
