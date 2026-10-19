@@ -465,10 +465,8 @@ def microtile_from_staging(desc: Mapping[str, Any]):
     # carries no (outer, inner) microtile a consumer could adopt.
     if storage_layout in (STORAGE_LAYOUT_LINEAR, STORAGE_LAYOUT_INNER_BLOCKED):
         return None
-    if storage_layout not in STORAGE_LAYOUTS:
-        raise ValueError(f'Unknown or missing staging storage_layout {storage_layout!r}.')
     if storage_layout != STORAGE_LAYOUT_MICROTILED:
-        raise NotImplementedError(f'Cannot decode staging storage_layout {storage_layout!r} as a microtile.')
+        raise ValueError(f'Unknown or missing staging storage_layout {storage_layout!r}.')
 
     required = ('tiling_dimension', 'buffer_dimension', 'inner_dimension', 'outer_dimension')
     missing = [field for field in required if field not in desc]

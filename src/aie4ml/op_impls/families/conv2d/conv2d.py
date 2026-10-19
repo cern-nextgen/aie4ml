@@ -1,4 +1,4 @@
-"""Conv2D on the Dense mmul core: one kernel variant and everything it needs to configure it."""
+"""Conv2D on the Dense mmul core: its buffer and stream variants and everything they need to configure them."""
 
 from __future__ import annotations
 
@@ -775,7 +775,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         """Frame rows between the windows of neighbouring row slices: each one's output rows, strided."""
         return self._rows_per_chain(node, config) * int(config.spatial.strides[0])
 
-    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port):
         if self.input_port_kind == PORT_KIND_STREAM:
             return describe_logical_staging(config.io_views[tensor_name], 'read')
         # 'inner': the port is a channel slice every chain reads. 'outer': the port belongs to one

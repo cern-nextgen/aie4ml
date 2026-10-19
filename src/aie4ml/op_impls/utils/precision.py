@@ -6,13 +6,6 @@ from typing import Any, Dict, Optional, Tuple
 from ...aie_types import FLOAT_FORMATS, AIEDataType, FloatIntent, QuantIntent, RoundingMode
 from ...ir import input_role, input_tensor_for_role
 
-ACC_TAG_WIDTHS = {
-    'acc32': 32,
-    'acc48': 48,
-    'acc64': 64,
-    'acc80': 80,
-}
-
 ROUNDING_TOKEN_MAP: Dict[RoundingMode, str] = {
     RoundingMode.TRN: 'floor',
     RoundingMode.RND_MIN_INF: 'floor',
@@ -78,18 +71,7 @@ def infer_accumulator_tag(
     device: Any,
     lhs_dtype: Optional[AIEDataType],
     rhs_dtype: Optional[AIEDataType],
-    acc_precision: Optional[AIEDataType],
 ) -> Optional[str]:
-    if acc_precision is not None:
-        if acc_precision.format == 'accfloat':
-            return 'accfloat'
-        for tag, bits in ACC_TAG_WIDTHS.items():
-            if bits == int(acc_precision.width):
-                return tag
-        raise ValueError(
-            f'Unsupported accumulator precision width {acc_precision.width}; expected one of 32, 48, 64 or 80 bits.'
-        )
-
     if lhs_dtype is None or rhs_dtype is None:
         return None
 
@@ -104,7 +86,7 @@ def infer_accumulator_tag(
     lhs_w = int(getattr(lhs_dtype, 'width', 0) or 0)
     rhs_w = int(getattr(rhs_dtype, 'width', 0) or 0)
     norm_gen = (getattr(device, 'generation', '') or '').upper()
-    is_ml = norm_gen.startswith('AIE-ML') or 'XDNA' in norm_gen
+    is_ml = norm_gen.startswith('AIE-ML')
 
     if not is_ml:
         if lhs_w <= 8 and rhs_w <= 8:
@@ -197,7 +179,7 @@ def resolve_operand_precision(node, device) -> tuple[Dict[str, AIEDataType], str
             'may be negative, which the current kernels do not support.'
         )
 
-    acc_tag = infer_accumulator_tag(device, resolved['lhs'], resolved['rhs'], None)
+    acc_tag = infer_accumulator_tag(device, resolved['lhs'], resolved['rhs'])
     return resolved, acc_tag
 
 

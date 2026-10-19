@@ -426,7 +426,7 @@ def test_aie1_acc80_vocabulary_covers_32_bit_integer_path():
 
     from aie4ml.aie_types import AIEDataType
 
-    assert infer_accumulator_tag(device, AIEDataType('int32'), AIEDataType('int32'), None) == 'acc80'
+    assert infer_accumulator_tag(device, AIEDataType('int32'), AIEDataType('int32')) == 'acc80'
 
 
 def test_aie1_onnx_dense_rejects_emulated_int8_microtile(tmp_path):

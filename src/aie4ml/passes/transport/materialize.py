@@ -26,17 +26,6 @@ from .layout import host_layout, port_layout
 from .model import EdgeEntry
 
 
-class BuildMemoryPlan(AIEPass):
-    def __init__(self):
-        self.name = 'plan_memory'
-
-    def transform(self, model_or_ctx) -> bool:
-        ctx = get_backend_context(model_or_ctx)
-        ctx.ir.physical.reset()
-        ctx.ir.physical.plan = _MemoryPlanMaterializer(ctx).build()
-        return True
-
-
 class CollectMemoryEntries(AIEPass):
     def __init__(self):
         self.name = 'collect_memory_entries'
@@ -77,10 +66,6 @@ class _MemoryPlanMaterializer:
         self._next_graph_output_port = 0
         self._max_graph_input_port = -1
         self._buffer_seq: Dict[str, int] = {}
-
-    def build(self):
-        state = self.collect()
-        return self.materialize(_legalize_collected_entries(self.ctx, state))
 
     def collect(self):
         self.layer_indices = {inst.name: idx for idx, inst in enumerate(self.ctx.ir.execution, start=1)}
@@ -333,9 +318,7 @@ class _MemoryPlanMaterializer:
             consumer = entry.single_consumer()
             inst = self._kernel_inst(consumer.node)
             for port in c_ports:
-                staging = inst.variant.describe_input_staging(
-                    consumer.node, inst.config, consumer.tensor, port, producer.node
-                )
+                staging = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port)
                 # A reader that fills its own border takes its padding as it finds it.
                 layout = port_layout(staging).shifted(consumer.offset_base)
                 readers.append((port, staging, layout, 'boundary_dimension' in staging))
@@ -516,21 +499,6 @@ class _MemoryPlanMaterializer:
 
         stem = f'buffer_{base}{suffix}'
         return stem if idx == 1 else f'{stem}_{idx}'
-
-
-def _legalize_collected_entries(ctx, state):
-    ctx.ir.physical.plan = {'_memory_plan_state': state}
-
-    from ..placement import PlaceKernels
-    from .classify import ClassifyTransportEntries
-    from .fanout import LegalizeFanoutEntries
-    from .memtile import LegalizeMemtilePortLimits
-
-    LegalizeFanoutEntries().transform(ctx)
-    ClassifyTransportEntries().transform(ctx)
-    PlaceKernels().transform(ctx)
-    LegalizeMemtilePortLimits().transform(ctx)
-    return ctx.ir.physical.plan['_memory_plan_state']
 
 
 def _host_visible_output_staging(base: Dict[str, Any], *, stream: bool = False) -> Dict[str, Any]:

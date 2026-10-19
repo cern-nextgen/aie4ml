@@ -57,7 +57,7 @@ class FrameFoldOpImplVariant(FrameRetileOpImplVariant):
         """Frame rows between neighbouring row slices."""
         return int(config.frame_view.tile[1])
 
-    def describe_input_staging(self, _node, config: FrameFoldConfig, _tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config: FrameFoldConfig, _tensor_name, port):
         return describe_frame_staging(
             config.source_view,
             'read',

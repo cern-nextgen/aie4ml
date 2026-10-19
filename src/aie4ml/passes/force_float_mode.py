@@ -3,8 +3,7 @@
 
 """ForceFloatMode: replace all IR tensor precisions with FloatIntent.
 
-Development/testing pass that lets the float path be exercised through
-the hls4ml frontend before a native float frontend exists.
+Testing pass that runs a quantized model through the float kernels.
 Activated by setting AIEConfig.ComputeDtype to 'bfloat16' or 'float32'.
 """
 

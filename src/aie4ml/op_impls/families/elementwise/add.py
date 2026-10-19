@@ -74,8 +74,8 @@ class AddOpImplVariant(OpImplVariant):
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism'})
 
-    def matches(self, _node: OpNode, device, _directives) -> bool:
-        return device.generation in ('AIE', 'AIE-ML', 'AIE-MLV2')
+    def matches(self, _node: OpNode, _device, _directives) -> bool:
+        return True
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> AddConfig:
         io_route, parallel_cfg = parse_directives(directives)
@@ -187,7 +187,7 @@ class AddOpImplVariant(OpImplVariant):
             shift, accumulator_tag, rounding_mode = 0, 'accfloat', 'conv_even'
         else:
             shift = resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision)
-            accumulator_tag = infer_accumulator_tag(device, precision['lhs'], precision['rhs'], precision.get('acc'))
+            accumulator_tag = infer_accumulator_tag(device, precision['lhs'], precision['rhs'])
             rounding_mode = aie_rounding_token(precision['output'])
 
         return AddConfig(
@@ -221,7 +221,7 @@ class AddOpImplVariant(OpImplVariant):
             params['microtile'] = None  # the kernel reads it only to transpose an operand
         return params
 
-    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port):
         if config.adopted_staging is not None:
             staging = config.adopted_staging[int(port)]
             return {**staging, 'access': 'read', 'boundary_dimension': list(staging['io_boundary_dimension'])}

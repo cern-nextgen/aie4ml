@@ -89,8 +89,6 @@ class _SoftmaxVariantBase(OpImplVariant):
             return False
         if _requested_approximation(node) != self.approximation:
             return False
-        if device.generation not in ('AIE', 'AIE-ML', 'AIE-MLV2'):
-            return False
         in_tensor = input_tensor_for_role(node, 'lhs')
         if isinstance(in_tensor.precision, FloatIntent):
             return False
@@ -177,7 +175,7 @@ class _SoftmaxVariantBase(OpImplVariant):
             precision=precision,
             parallelism=ParallelismConfig(cas_num=int(cas_num), contract='outer'),
             vec_size=int(vec_size),
-            accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
+            accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs']),
             alternating_horizontal=device.alternating_horizontal,
             io_views=io_views,
             io_route=io_route,
@@ -209,7 +207,7 @@ class _SoftmaxVariantBase(OpImplVariant):
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port):
         return describe_partition_staging(
             config.io_views[tensor_name],
             port,

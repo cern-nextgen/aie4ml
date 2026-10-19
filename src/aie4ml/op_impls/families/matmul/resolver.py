@@ -43,7 +43,7 @@ class MatmulTiling:
 
 
 def _bank_capacity_bytes(device: Any) -> int:
-    return max(1, int(getattr(device, 'bank_mem_bytes', 0) or 1))
+    return int(device.bank_mem_bytes)
 
 
 def _tile_bank_usage(

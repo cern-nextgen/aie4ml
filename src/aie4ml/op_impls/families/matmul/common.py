@@ -95,9 +95,7 @@ def bitwidths_supported(node, device) -> bool:
     return (lhs_p.width, rhs_p.width) in _SUPPORTED_INT_WIDTH_COMBOS[generation]
 
 
-# Policy, not a law: the contract used when nothing asks for one. A global partition
-# optimizer will write the directive instead, at which point this is only the fallback for
-# graphs it did not run on.
+# The contract when neither a directive nor the design search names one.
 DEFAULT_CONTRACT = 'inner'
 
 

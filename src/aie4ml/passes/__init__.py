@@ -15,7 +15,6 @@ from .pack import PackKernelArtifacts
 from .placement import PlaceKernels
 from .resolve import Resolve
 from .transport import (
-    BuildMemoryPlan,
     ClassifyTransportEntries,
     CollectMemoryEntries,
     LegalizeFanoutEntries,
@@ -46,5 +45,4 @@ __all__ = [
     'CollectMemoryEntries',
     'ClassifyTransportEntries',
     'MaterializeMemoryPlan',
-    'BuildMemoryPlan',
 ]

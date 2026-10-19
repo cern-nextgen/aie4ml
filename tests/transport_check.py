@@ -117,7 +117,7 @@ class _Plan:
 
     def _consumer(self, endpoint, producer, port):
         inst = self.execution.get(endpoint.node.name)
-        staging = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, port, producer.node)
+        staging = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, port)
         return port_layout(staging).shifted(endpoint.offset_base), 'boundary_dimension' in staging
 
     def _tags(self, producer, host_port=None):

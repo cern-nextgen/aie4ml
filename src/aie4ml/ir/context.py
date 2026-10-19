@@ -20,10 +20,6 @@ CONTEXT_ATTR = '_aie_backend_context'
 class BackendPolicies:
     """Policies steering graph lowering and transformation stages."""
 
-    fusion: Dict[str, Any] = field(default_factory=dict)
-    decomposition: Dict[str, Any] = field(default_factory=dict)
-    pack: Dict[str, Any] = field(default_factory=dict)
-    cache: Dict[str, Any] = field(default_factory=dict)
     tensors_have_batch: bool = False
 
 

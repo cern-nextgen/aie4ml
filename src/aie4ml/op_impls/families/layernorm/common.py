@@ -17,7 +17,7 @@ __all__ = [
 # gamma is multiplied by inv_std (Q15) and right-shifted by GAMMA_SHIFT, so
 # gamma must be stored at frac=GAMMA_SHIFT for fscale to land in Q15.
 # beta is added to the Q15 accumulator before the final right-shift, so beta
-# is stored at frac=NORM_SHIFT (Q15).
+# is stored in Q15.
 GAMMA_FRAC_BITS = 7
 BETA_FRAC_BITS = 15
 
@@ -47,7 +47,6 @@ def layernorm_vec_size(precision, device) -> int:
 
     The kernel computes sum/sum-of-squares with the device's integer accumulator over
     int8 inputs, so VEC is its 32-lane int8 vector width.
-    Float variants will override this when added.
     """
     elem_bytes = storage_bytes_for_spec(precision)
     if elem_bytes <= 1:

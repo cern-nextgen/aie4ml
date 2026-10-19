@@ -222,7 +222,7 @@ class TransportCollector:
         view = inst.port_views[concat_tensor]
         axis_dim = self._view_axis_to_buffer_dim(view, axis)
         for port in range(total_ports):
-            desc = inst.variant.describe_input_staging(consumer, inst.config, concat_tensor, port, None)
+            desc = inst.variant.describe_input_staging(consumer, inst.config, concat_tensor, port)
             start, end = self._descriptor_axis_range(desc, axis_dim)
 
             owners = [name for name, lo, hi in slices if start >= lo and end <= hi]

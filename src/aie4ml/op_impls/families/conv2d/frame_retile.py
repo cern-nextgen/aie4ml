@@ -84,7 +84,7 @@ class FrameRetileOpImplVariant(OpImplVariant):
     def footprint(self, _node, config: FrameRetileConfig) -> OpImplFootprint:
         return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
 
-    def describe_input_staging(self, _node, config: FrameRetileConfig, _tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config: FrameRetileConfig, _tensor_name, port):
         window = config.windows[int(port)]
         if config.from_boundary:
             return describe_logical_staging(

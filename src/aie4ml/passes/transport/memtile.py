@@ -122,9 +122,7 @@ def _reader_chunks(entry, execution, writer_chunks, consumer_ports):
     inst = execution.get(consumer.node.name)
     chunks = [[] for _ in writer_chunks]
     for port in consumer_ports:
-        staging = inst.variant.describe_input_staging(
-            consumer.node, inst.config, consumer.tensor, port, entry.producer.node
-        )
+        staging = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port)
         read = port_layout(staging).shifted(consumer.offset_base).data
         unit = next((index for index, windows in enumerate(written) if _covers(windows, read)), None)
         if unit is None:

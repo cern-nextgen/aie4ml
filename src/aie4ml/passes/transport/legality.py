@@ -44,7 +44,7 @@ def memtile_staging_failure(execution, endpoints) -> str | None:
                 for port in ports
             ]
         else:
-            stagings = [inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0, None)]
+            stagings = [inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0)]
         if 'transfer_bytes' in stagings[0]:
             return (
                 f'{endpoint.node.name}.{endpoint.group} frames each inference as a padded transfer, which '
@@ -103,7 +103,7 @@ def direct_pairing(
 
     def read(c_port):
         return consumer_inst.variant.describe_input_staging(
-            consumer.node, consumer_inst.config, consumer.tensor, c_port, producer.node
+            consumer.node, consumer_inst.config, consumer.tensor, c_port
         )
 
     def mismatch(p_port, c_port) -> Optional[str]:

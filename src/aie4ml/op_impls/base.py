@@ -234,7 +234,6 @@ class OpImplVariant:
         _config: Any,
         _tensor_name: str,
         _port: int,
-        _producer: Optional[OpNode] = None,
     ) -> Any:
         return None
 

@@ -90,7 +90,7 @@ def _check_port_frames(node, config, variant, ports) -> None:
     """Transport reads a port's staging as where its buffer sits in the op's frame (`offset`) and which element of
     the tensor that is (`logical_origin`), so all the ports of one tensor place the frame at one origin."""
     for bindings, describe in (
-        (ports.inputs, lambda tensor, port: variant.describe_input_staging(node, config, tensor, port, None)),
+        (ports.inputs, lambda tensor, port: variant.describe_input_staging(node, config, tensor, port)),
         (ports.outputs, lambda tensor, port: variant.describe_output_staging(node, config, tensor, port)),
     ):
         for tensor, binding in bindings.items():

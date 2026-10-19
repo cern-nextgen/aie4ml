@@ -8,7 +8,8 @@ from .base import AIEPass
 class FuseActivationCasts(AIEPass):
     """Fuse relu into a family that lists it (adds fused_activation trait) and contract linear activations out.
 
-    After this pass, no activation nodes remain in the IR and output tensors carry post-activation precision.
+    The fused op's output tensor carries the post-activation precision. A ReLU no producer fuses stays, and is refused
+    before the design search.
     """
 
     def __init__(self):

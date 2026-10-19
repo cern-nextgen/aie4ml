@@ -253,10 +253,6 @@ class LowerToAieIr(ModelOptimizerPass):
 
         device, _ = resolve_device(part_name, aie_cfg)
         policies = BackendPolicies(
-            fusion=config.get_config_value('AIEFusionPolicy', {}) or {},
-            decomposition=config.get_config_value('AIEDecompositionPolicy', {}) or {},
-            pack=config.get_config_value('AIEPackPolicy', {}) or {},
-            cache=config.get_config_value('AIECachePolicy', {}) or {},
             tensors_have_batch=bool(
                 (config.get_config_value('AIEFrontendPolicy', {}) or {}).get('TensorsHaveBatch', False)
             ),

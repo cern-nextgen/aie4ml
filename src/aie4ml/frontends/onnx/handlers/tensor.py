@@ -47,7 +47,7 @@ def _flatten(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> 
     logical = tuple(int(d) for d in src.shape)
     if len(out_shape) != 2 or int(out_shape[0]) != 1 or int(np.prod(logical[1:])) != int(out_shape[1]):
         raise NotImplementedError(f'{node_name}: only a flatten of one sample to [1, K] is supported, got {out_shape}.')
-    # The flattened row is canonical; `source_order` records how the view ravelled the axes, so
+    # The flattened row is canonical; `axis_order` records how the view ravelled the axes, so
     # the fold can hand that order to whoever reduces over the row.
     ctx.set_order(out_name, None, node_name)
 

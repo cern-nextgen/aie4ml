@@ -57,13 +57,7 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
         raise KeyError('ONNX frontend requires Part or AIEConfig.Part in the config dict.')
 
     device, merged = resolve_device(part_name, aie_cfg)
-    policies = BackendPolicies(
-        fusion=dict(config.get('AIEFusionPolicy', {}) or {}),
-        decomposition=dict(config.get('AIEDecompositionPolicy', {}) or {}),
-        pack=dict(config.get('AIEPackPolicy', {}) or {}),
-        cache=dict(config.get('AIECachePolicy', {}) or {}),
-        tensors_have_batch=True,
-    )
+    policies = BackendPolicies(tensors_have_batch=True)
     project_config = ProjectConfig(
         output_dir=Path(output_dir),
         project_name=project_name,

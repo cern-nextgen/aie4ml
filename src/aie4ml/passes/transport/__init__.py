@@ -2,12 +2,11 @@
 
 from .classify import ClassifyTransportEntries
 from .fanout import LegalizeFanoutEntries
-from .materialize import BuildMemoryPlan, CollectMemoryEntries, MaterializeMemoryPlan
+from .materialize import CollectMemoryEntries, MaterializeMemoryPlan
 from .memtile import LegalizeMemtilePortLimits
 from .model import Connection, EdgeEntry, Endpoint, GraphInputSpec, TransportDecision, TransportUnit
 
 __all__ = [
-    'BuildMemoryPlan',
     'ClassifyTransportEntries',
     'CollectMemoryEntries',
     'Connection',

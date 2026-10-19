@@ -15,8 +15,8 @@ class FoldBias(AIEPass):
     """Fold a trailing `add(output, const)` into the producing op's bias.
 
     The ONNX frontend emits bias as a separate `add` (a standalone MatMul+Add, Gemm's C input,
-    Conv's B input); this pass is the single place that fuses it, keeping the frontend free of
-    fusion decisions.
+    Conv's B input), which this pass folds, keeping the frontend free of fusion decisions; the
+    hls4ml frontend gives the bias its role directly.
     """
 
     def __init__(self):

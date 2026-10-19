@@ -83,8 +83,6 @@ class _LayerNormVariantBase(OpImplVariant):
     def matches(self, node: OpNode, device, _directives) -> bool:
         if not layout_variant_matches(node, self.layout_name):
             return False
-        if device.generation not in ('AIE', 'AIE-ML', 'AIE-MLV2'):
-            return False
         in_tensor = input_tensor_for_role(node, 'lhs')
         if isinstance(in_tensor.precision, FloatIntent):
             return False
@@ -168,7 +166,7 @@ class _LayerNormVariantBase(OpImplVariant):
             rows=int(outer_prefix * tile_outer),
             cols=int(full_inner),
             vec_size=int(vec_size),
-            accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
+            accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs']),
             gamma_shift=int(gamma_frac),
             scale_frac=int(scale_frac),
             mean_frac=int(mean_frac),
@@ -196,7 +194,7 @@ class _LayerNormVariantBase(OpImplVariant):
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         return params
 
-    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port):
         return describe_partition_staging(
             config.io_views[tensor_name],
             port,

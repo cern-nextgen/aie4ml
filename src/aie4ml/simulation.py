@@ -91,12 +91,6 @@ class IOLayout:
     inputs: Dict[str, List[IOPortLayout]]
     outputs: Dict[str, List[IOPortLayout]]
 
-    def input_tensors(self) -> List[str]:
-        return list(self.inputs.keys())
-
-    def output_tensors(self) -> List[str]:
-        return list(self.outputs.keys())
-
 
 def build_io_layout(model) -> IOLayout:
     """

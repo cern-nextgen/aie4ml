@@ -131,7 +131,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             if requested_cas_length is not None and int(requested_cas_length) != required_cas_length:
                 raise ConfigRefused(
                     f'{node.name}: cas_length={requested_cas_length} conflicts with the producer port count '
-                    f'{required_cas_length} required for direct AIE1 transport.'
+                    f'{required_cas_length} required for a direct hand-off without a memory tile.'
                 )
             parallel_cfg['cas_length'] = required_cas_length
             required_microtile = inherited_microtile(node, input_contracts)
@@ -330,7 +330,7 @@ class DenseOpImplVariant(_DenseVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_full_outer
 
-    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port):
         return describe_inner_lhs_staging(config.io_views[tensor_name], port)
 
     def describe_output_staging(self, _node, config, tensor_name, port):
@@ -401,7 +401,7 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_tile_outer
 
-    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port):
         return describe_outer_lhs_staging(config.io_views[tensor_name], config.parallelism, port)
 
     def describe_output_staging(self, _node, config, tensor_name, port):
@@ -480,7 +480,7 @@ class _StreamInputDenseMixin:
     def stream_locations(self, node, config, anchor_row):
         return super().stream_locations(node, config, anchor_row) + _stream_locations(config, anchor_row, 'in1')
 
-    def describe_input_staging(self, _node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port):
         return describe_stream_staging(
             config.io_views[tensor_name], port, 'read', self.contract, config.parallelism.cas_length
         )

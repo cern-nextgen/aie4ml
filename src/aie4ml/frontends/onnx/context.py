@@ -99,8 +99,6 @@ class OnnxImportContext:
             raise ValueError(f'{name}: conflicting quantization intent for parameter tensor.')
         return tensor
 
-    # -- source lookup ------------------------------------------------------
-
     # -- value order --------------------------------------------------------
 
     def order_of(self, name: str) -> Optional[Tuple[int, ...]]:
@@ -188,9 +186,11 @@ class OnnxImportContext:
                 f'{tuple(int(x) for x in expected)}.'
             )
 
+    # -- source lookup ------------------------------------------------------
+
     def source_for(self, name: str, node_name: str) -> TensorVar:
         """An activation tensor; never a constant. Axis order is the handler's own contract: state
-        it with `require_identity_order`, `require_order` or `propagate_order`."""
+        it with `require_order` or `propagate_order`."""
         if name in self.value_tensors:
             return self.value_tensors[name]
         if name in self.input_shapes:

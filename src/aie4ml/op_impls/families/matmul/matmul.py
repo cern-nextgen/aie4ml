@@ -172,7 +172,7 @@ class MatmulOpImplVariant(_MatmulVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_full_outer
 
-    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port):
         view = config.io_views[tensor_name]
         if input_role(node, tensor_name) == 'rhs':
             return describe_inner_rhs_staging(view, config.parallelism, port)
@@ -192,7 +192,7 @@ class MatmulRowWiseOpImplVariant(_MatmulVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_tile_outer
 
-    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port):
         view = config.io_views[tensor_name]
         if input_role(node, tensor_name) == 'rhs':
             return describe_outer_rhs_staging(view, config.parallelism, port)

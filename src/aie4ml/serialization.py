@@ -9,7 +9,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
-from .aie_types import QuantIntent
 from .ir.graph import ExecutionInstance, OpNode
 from .op_impls.common_types import to_plain
 
@@ -33,35 +32,14 @@ def dump_pipeline_ir(ctx, destination: Path) -> None:
 
 
 def serialize_logical_node(node: OpNode) -> Dict[str, Any]:
-    metadata = _serialize_metadata(node.metadata)
-
     return {
         'name': node.name,
         'op_type': node.op_type,
         'inputs': [t.name for t in node.inputs],
         'outputs': [t.name for t in node.outputs],
         'traits': {name: trait.data for name, trait in node.traits.items()},
-        'metadata': metadata,
+        'metadata': dict(node.metadata),
     }
-
-
-def _serialize_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
-    metadata = dict(metadata)
-    quant_meta = metadata.get('quant')
-    if isinstance(quant_meta, dict):
-        metadata['quant'] = _serialize_quant_metadata(quant_meta)
-
-    return metadata
-
-
-def _serialize_quant_metadata(quant_meta: Dict[str, Any]) -> Dict[str, Any]:
-    out = {}
-    for key, value in quant_meta.items():
-        if key.endswith('_precision'):
-            out[key] = serialize_precision(value)
-        else:
-            out[key] = value
-    return out
 
 
 def serialize_op_impl_instance(inst: ExecutionInstance) -> Dict[str, Any]:
@@ -78,32 +56,11 @@ def serialize_op_impl_instance(inst: ExecutionInstance) -> Dict[str, Any]:
         'graph_name': inst.graph_name,
         'param_template': inst.param_template,
         'config': to_plain(inst.config),
-        # "input_staging": inst.variant.describe_input_staging(inst),
-        # "output_staging": inst.variant.describe_output_staging(inst),
-        # TODO: serialize implementation artifacts (weights, LUTs, etc.)
     }
 
 
 def serialize_physical_ir(physical_ir) -> Dict[str, Any]:
     return physical_ir.to_dict()
-
-
-def serialize_precision(precision):
-    if precision is None:
-        return None
-    from .aie_types import FloatIntent
-
-    if isinstance(precision, FloatIntent):
-        return {'width': int(precision.width), 'format': precision.format.value}
-    if not isinstance(precision, QuantIntent):
-        raise TypeError(f'Unsupported precision type {type(precision)} when serializing backend IR.')
-    return {
-        'width': int(precision.width),
-        'frac': int(precision.frac),
-        'signed': bool(precision.signed),
-        'rounding': precision.rounding.name,
-        'saturation': precision.saturation.name,
-    }
 
 
 __all__ = ['dump_pipeline_ir']

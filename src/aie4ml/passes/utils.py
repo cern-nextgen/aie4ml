@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 
 def sanitize_identifier(name: str, prefix: str = 'id') -> str:
     """Return a C/C++ friendly identifier derived from ``name``."""
@@ -16,17 +14,6 @@ def sanitize_identifier(name: str, prefix: str = 'id') -> str:
     if filtered[0].isdigit():
         filtered = f'{prefix}_{filtered}'
     return filtered
-
-
-def lookup_layer(model: Any, name: str):
-    """Return the hls4ml layer instance with the given name, or None if missing."""
-    try:
-        return model.get_layer(name)
-    except AttributeError:
-        for layer in model.get_layers():
-            if getattr(layer, 'name', None) == name:
-                return layer
-    return None
 
 
 def assert_true_pointwise(layer) -> None:

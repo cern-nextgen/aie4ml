@@ -259,9 +259,9 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
     def output_inner_shards(self, _node, _config, _tensor_name):
         return None
 
-    def describe_input_staging(self, node, config, tensor_name, port, _producer=None):
+    def describe_input_staging(self, node, config, tensor_name, port):
         if not _reads_halo(node):
-            return super().describe_input_staging(node, config, tensor_name, port, _producer)
+            return super().describe_input_staging(node, config, tensor_name, port)
         rows, halo = self._halo(node, config, 'lhs')
         step = self._halo_rows(node, config, 'lhs')[2]
         return describe_band_staging(config.io_views[tensor_name], 'read', rows, int(port), halo, step)
