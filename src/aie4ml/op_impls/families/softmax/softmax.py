@@ -71,6 +71,7 @@ class _SoftmaxVariantBase(OpImplVariant):
     param_template = 'softmax'
     plevel = 10
     supported_directives: ClassVar[frozenset] = frozenset({'approximation', 'layout', 'parallelism'})
+    supported_fusions: ClassVar[frozenset] = frozenset({'input_scale'})  # HCCS takes only a scale of one
 
     def work(self, node: OpNode, config) -> int:
         """Multiply-accumulates' time one tile takes per call, at 256 int8 multiply-accumulates a cycle. The linear exp

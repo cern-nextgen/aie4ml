@@ -3,11 +3,14 @@
 
 """Fold per-channel scale nodes into their predecessor Dense weight precision."""
 
+from dataclasses import replace
+
 import numpy as np
 
-from ..aie_types import FloatIntent, QuantIntent
+from ..aie_types import FloatIntent
 from ..ir import get_backend_context
-from ..ir.graph import has_input_role
+from ..ir.graph import has_input_role, input_tensor_for_role
+from ..op_impls.family_registry import get_family_resolver_registry
 from .base import AIEPass
 
 
@@ -38,21 +41,21 @@ class FoldApplyAlpha(AIEPass):
             p_min = int(np.round(-np.log2(scale.max())))
 
             dense_node = node.inputs[0].producer
+            family = get_family_resolver_registry().find(dense_node.op_type) if dense_node is not None else None
+            if family is None or 'apply_alpha' not in family.supported_fusions:
+                raise NotImplementedError(
+                    f'{node.name}: a per-channel scale folds into the Dense before it, not into '
+                    f'{dense_node.op_type if dense_node is not None else "the graph input"}.'
+                )
 
-            weight_tv = dense_node.inputs[1]
+            weight_tv = input_tensor_for_role(dense_node, 'rhs')
             old_w = weight_tv.precision
             if isinstance(old_w, FloatIntent):
                 continue
-            weight_tv.precision = QuantIntent(
-                width=old_w.width,
-                frac=old_w.frac + p_min,
-                signed=old_w.signed,
-                rounding=old_w.rounding,
-                saturation=old_w.saturation,
-            )
+            weight_tv.precision = replace(old_w, frac=old_w.frac + p_min)
 
-            if has_input_role(dense_node, 'bias') and len(dense_node.inputs) > 2:
-                bias_tv = dense_node.inputs[2]
+            if has_input_role(dense_node, 'bias'):
+                bias_tv = input_tensor_for_role(dense_node, 'bias')
                 bias_tv.data = np.asarray(bias_tv.data, dtype=np.float64) * scale
 
             graph.remove_node(node, mode='contract')

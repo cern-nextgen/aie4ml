@@ -37,7 +37,6 @@ from ...utils.precision import (
     resolve_bias_dtype,
     resolve_exact_storage_dtype,
     resolve_operand_precision,
-    resolve_output_scale_shift,
 )
 from ..matmul.common import (
     MICROTILE_OPTIONS,
@@ -137,6 +136,8 @@ class Conv2dOpImplVariant(OpImplVariant):
     """
 
     variant_id = 'conv2d.b.r.v1'
+    supported_fusions = frozenset({'bias', 'relu', 'max_pool'})
+    supported_output_views = frozenset({VIEW_FLATTEN_2D})
     op_type = 'conv2d'
     graph_header = 'conv2d_graph.h'
     graph_name = 'conv2d_graph'
@@ -273,7 +274,6 @@ class Conv2dOpImplVariant(OpImplVariant):
             io_views[out.name] = self._output_frame(node, parallelism, column_block=block, column_align=column_align)
 
         shift = resolve_accumulator_output_shift(lhs.precision, out.precision, rhs.precision)
-        shift += resolve_output_scale_shift(node, is_float=False)
         fused_act = node.traits.get('fused_activation')
         use_relu = fused_act is not None and fused_act.data['activation'] == 'relu'
 
@@ -962,6 +962,8 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
 
     variant_id = 'conv2d.s.r.v1'
     input_port_kind = output_port_kind = PORT_KIND_STREAM
+    supported_fusions = frozenset({'bias', 'relu'})  # it writes a frame: no pool, no flattened row
+    supported_output_views = frozenset()
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> Conv2dConfig:
         config = super().resolve(node, device, directives, input_contracts)
@@ -978,10 +980,6 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
                 f'{node.name}: {self.variant_id} does not implement partitioning yet, nor one row band: it reads the '
                 'whole image on one tile.'
             )
-        if config.flags.emit_flattened:
-            raise NotImplementedError(f'{node.name}: {self.variant_id} writes a frame, not a flattened row.')
-        if config.pool is not None:
-            raise NotImplementedError(f'{node.name}: {self.variant_id} does not fuse a pool yet.')
         return config
 
     def validate_config(self, node: OpNode, config: Conv2dConfig, device) -> None:

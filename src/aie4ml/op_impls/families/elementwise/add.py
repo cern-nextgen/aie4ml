@@ -66,6 +66,7 @@ def _adopted_contract(node: OpNode, input_contracts, max_elements: int):
 @register_variant
 class AddOpImplVariant(OpImplVariant):
     variant_id = 'add.v1'
+    supported_fusions = frozenset({'relu'})
     op_type = 'add'
     kernel_transposes_microtile = True
     graph_header = 'elementwise_add_graph.h'

@@ -101,6 +101,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
     """Everything the dense variants share, independent of which contract they implement."""
 
     op_type = 'dense'
+    supported_fusions = frozenset({'bias', 'relu', 'output_scale', 'apply_alpha'})
     kernel_transposes_microtile = True
     graph_header = 'dense_bias_relu_graph.h'
     graph_name = 'dense_bias_relu_graph'

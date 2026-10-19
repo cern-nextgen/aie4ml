@@ -156,6 +156,10 @@ class OpImplVariant:
     output_port_kind: ClassVar[str] = PORT_KIND_BUFFER
     # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
     supported_directives: ClassVar[frozenset] = frozenset()
+    # What its kernels fuse ('bias', 'relu', '<kind>_pool', an absorbed 'output_scale' or 'input_scale',
+    # 'apply_alpha') and the output views they write: a node carrying another resolves to another variant.
+    supported_fusions: ClassVar[frozenset] = frozenset()
+    supported_output_views: ClassVar[frozenset] = frozenset()
 
     def matches(self, _node: OpNode, _device: Any, _directives: Dict[str, Any]) -> bool:
         raise NotImplementedError

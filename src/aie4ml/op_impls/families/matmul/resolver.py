@@ -466,7 +466,6 @@ class _MatmulFamilyBase(FamilyResolver):
 @family_resolver('dense')
 class DenseFamilyResolver(_MatmulFamilyBase):
     op_type = 'dense'
-    supported_fusions = frozenset({'bias', 'relu'})
 
     def validate_structure(self, node, _device) -> None:
         _validate_matmul_family_rank_contract(node)

@@ -32,6 +32,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
     """Everything the matmul variants share, independent of which contract they implement."""
 
     op_type = 'matmul'
+    supported_fusions = frozenset({'output_scale'})
     kernel_transposes_microtile = True
     graph_header = 'matmul_graph.h'
     graph_name = 'matmul_graph'

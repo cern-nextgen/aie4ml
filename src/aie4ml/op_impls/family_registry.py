@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 from ..errors import ConfigRefused
+from ..ir.graph import has_input_role
 from .utils import requested_port_kinds
 
 if TYPE_CHECKING:
@@ -11,13 +12,40 @@ if TYPE_CHECKING:
 COMMON_DIRECTIVES = frozenset({'placement', 'io_route', 'ports'})
 
 
+def fusions_of(node: Any) -> frozenset:
+    """What `node` carries that its kernel must implement, named as variants declare it (`supported_fusions`)."""
+    fused = {scale for scale in ('output_scale', 'input_scale') if node.traits.get(scale) is not None}
+    if has_input_role(node, 'bias'):
+        fused.add('bias')
+    activation = node.traits.get('fused_activation')
+    if activation is not None:
+        fused.add(activation.data['activation'])
+    pool = node.traits.get('fused_pool')
+    if pool is not None:
+        fused.add(f"{pool.data['kind']}_pool")
+    return frozenset(fused)
+
+
 class FamilyResolver:
     """Structural validator, variant dispatcher and capability record for one op type; passes ask
-    capabilities instead of naming op types."""
+    capabilities instead of naming op types. Its capabilities are those some variant declares."""
 
     op_type: ClassVar[str] = ''
-    supported_fusions: ClassVar[frozenset] = frozenset()  # epilogues folded into the kernel
-    supported_output_views: ClassVar[frozenset] = frozenset()  # output views it writes directly (VIEW_FLATTEN_2D)
+
+    @property
+    def supported_fusions(self) -> frozenset:
+        """The epilogues and absorbed scales some variant's kernels fuse."""
+        return frozenset().union(*(variant.supported_fusions for variant in self._variants()))
+
+    @property
+    def supported_output_views(self) -> frozenset:
+        """The output views (VIEW_FLATTEN_2D) some variant writes directly."""
+        return frozenset().union(*(variant.supported_output_views for variant in self._variants()))
+
+    def _variants(self):
+        from .registry import get_op_impl_registry
+
+        return get_op_impl_registry().candidates(self.op_type)
 
     def parallelism_candidates(self, _node: Any, _device: Any) -> Tuple[Dict[str, Any], ...]:
         """The `parallelism` directives a design search may resolve the node under; () leaves it to resolution,
@@ -77,12 +105,21 @@ class FamilyResolver:
         self._check_fused_activation(node)
         self.validate_structure(node, device)
         ports = requested_port_kinds(node)
-        matching = [
+        on_ports = [
             variant
             for variant in get_op_impl_registry().candidates(self.op_type)
             if (variant.input_port_kind, variant.output_port_kind) == ports
-            and variant.matches(node, device, directives)
         ]
+        view = node.traits.get('output_view')
+        needed = fusions_of(node) | ({view.data['kind']} if view is not None else set())
+        capable = [v for v in on_ports if needed <= v.supported_fusions | v.supported_output_views]
+        if on_ports and not capable:
+            offered = frozenset().union(*(v.supported_fusions | v.supported_output_views for v in on_ports))
+            raise ConfigRefused(
+                f'{node.name}: no {self.op_type} variant on {ports[0]} input and {ports[1]} output ports implements '
+                f'{sorted(needed - offered)}.'
+            )
+        matching = [variant for variant in capable if variant.matches(node, device, directives)]
         if not matching:
             raise ConfigRefused(
                 f'{node.name}: no {self.op_type} variant matches (generation={device.generation!r}, ports={ports!r}).'

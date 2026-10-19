@@ -18,8 +18,6 @@ class Conv2dFamilyResolver(FamilyResolver):
     """NHWC activations, compact `[kh, kw, Cin/groups, Cout]` weights; kernel limits live in variants."""
 
     op_type = 'conv2d'
-    supported_fusions = frozenset({'bias', 'relu', 'max_pool'})
-    supported_output_views = frozenset({VIEW_FLATTEN_2D})
 
     def parallelism_candidates(self, node, _device):
         """The partitions the core cuts: divisors of the input and output channel blocks, and of the output rows."""
