@@ -32,6 +32,7 @@ class FoldBias(AIEPass):
                 continue
             producer_out, bias = _match_biasless_producer(add.inputs[0], add.inputs[1])
             if producer_out is None:
+                _refuse_unfused_bias(add)
                 continue
 
             producer = producer_out.producer
@@ -68,6 +69,22 @@ def _is_biasless_producer(tensor) -> bool:
         return False
     resolver = get_family_resolver_registry().find(producer.op_type)
     return resolver is not None and 'bias' in resolver.supported_fusions
+
+
+def _refuse_unfused_bias(add) -> None:
+    """A constant broadcast over the rows is a bias, which no kernel adds on its own: refused by name where the op
+    producing the other operand does not fuse one."""
+    for tensor, const in ((add.inputs[0], add.inputs[1]), (add.inputs[1], add.inputs[0])):
+        producer = tensor.producer
+        if producer is None or not const.is_parameter or tensor.is_parameter:
+            continue
+        resolver = get_family_resolver_registry().find(producer.op_type)
+        fuses = resolver is not None and 'bias' in resolver.supported_fusions
+        if np.asarray(const.data).size < np.prod(tensor.shape) and not fuses:
+            raise NotImplementedError(
+                f'{add.name}: a constant added along the rows is a bias, which runs fused into the op producing '
+                f'{tensor.name!r}, and {producer.name} ({producer.op_type}) does not fuse one.'
+            )
 
 
 def _fold(graph, producer, producer_out, bias, add) -> None:

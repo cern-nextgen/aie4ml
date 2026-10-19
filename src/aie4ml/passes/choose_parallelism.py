@@ -249,6 +249,20 @@ def _reserved_tiles(inst, shared_ports: set) -> int:
     return min(counts)
 
 
+def _refuse_unfused(ctx) -> None:
+    """An op no family implements (an activation its producer does not fuse) runs nowhere: refused by name."""
+    registry = get_family_resolver_registry()
+    for node in ctx.ir.logical:
+        if node.is_folded_view or registry.find(node.op_type) is not None:
+            continue
+        producer = node.inputs[0].producer if node.inputs else None
+        source = f'{producer.name} ({producer.op_type})' if producer is not None else 'the graph input'
+        raise NotImplementedError(
+            f'{node.name}: no kernel runs a {node.metadata.get("activation") or node.op_type} on its own; it runs '
+            f'fused into the op producing its input, and {source} does not fuse it.'
+        )
+
+
 def _block_heights(ctx) -> List[int]:
     """The row heights the layers' microtile candidates offer. A hand-off is direct only where producer and consumer
     share a block, so besides the layers' own microtiles, the search tries each height shared by every layer that
@@ -279,6 +293,7 @@ class ChooseParallelism(AIEPass):
             raise ValueError(f'AIEConfig MaxTiles={max_tiles} must be positive.')
 
         ctx.ir.optimizer = {}  # a previous run's choice must not steer this one
+        _refuse_unfused(ctx)
         print(
             f"[aie4ml] Searching for a '{mode}' design within {max_tiles} AIE tiles; this can take a minute...",
             flush=True,

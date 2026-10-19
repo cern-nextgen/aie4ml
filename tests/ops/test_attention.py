@@ -114,6 +114,41 @@ def test_aie1_refuses_reading_k_transposed(tmp_path):
         lower(_head(16, 8, 16), tmp_path, part=AIE1)
 
 
+def _scores_with(epilogue: str):
+    """x · y of two runtime inputs, then a ReLU or a constant bias."""
+    nodes, inits = [], [*qparams('x'), *qparams('y'), *qparams('so', frac=3)]
+    dq(nodes, 'x_q', 'x', 'x')
+    dq(nodes, 'y_q', 'y', 'y')
+    nodes.append(helper.make_node('MatMul', ['x', 'y'], ['mm'], name='scores'))
+    if epilogue == 'relu':
+        nodes.append(helper.make_node('Relu', ['mm'], ['out'], name='scores_relu'))
+    else:
+        dq(nodes, 'b_q', 'b', 'b')
+        inits += [*qparams('b', frac=8), numpy_helper.from_array(np.arange(16, dtype=np.int8), 'b_q')]
+        nodes.append(helper.make_node('Add', ['mm', 'b'], ['out'], name='scores_bias'))
+    qdq(nodes, 'out', 's', 'so')
+    return make_model(
+        'scores',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [16, 16]), ('y_q', TensorProto.INT8, [16, 16])],
+        outputs=[('s', TensorProto.FLOAT, [16, 16])],
+        initializers=inits,
+    )
+
+
+@pytest.mark.parametrize(
+    'epilogue, message',
+    [
+        ('relu', r'scores_relu_aie: no kernel runs a relu on its own; .* scores_aie \(matmul\) does not fuse it'),
+        ('bias', r'scores_bias_aie: a constant added along the rows is a bias, .* scores_aie \(matmul\) does not'),
+    ],
+)
+def test_a_runtime_matmul_refuses_a_relu_or_bias_after_it(epilogue, message, tmp_path):
+    """The matmul kernels apply no ReLU and no bias, so neither is fused into them, where it would be dropped."""
+    with pytest.raises(NotImplementedError, match=message):
+        lower(_scores_with(epilogue), tmp_path, part=AIE_MLV2)
+
+
 def test_a_long_sequence_crosses_the_boundary_through_memory_tiles(tmp_path):
     """128 tokens re-tiled at the PLIO would need more BDs than a tile has; the core still hands over directly."""
     ctx = lower(_head(128, 16, 16), tmp_path, part=AIE_MLV2)
