@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
-from ....passes.utils import sanitize_identifier
+from ...base import rom_artifact
 from ...registry import register_variant
 from ...row_wise import RowWiseOpImplVariant, TiledRowWiseMixin
 from ...utils import (
@@ -214,30 +214,12 @@ class _LayerNormVariantBase(RowWiseOpImplVariant):
         }
 
     def get_artifacts(self, inst: ExecutionInstance):
-        inst_name = sanitize_identifier(inst.name)
-        p = inst.config
+        precision = inst.config.precision
         return [
-            {
-                'name': 'gamma',
-                'kind': '1d',
-                'storage': 'rom',
-                'array': inst.artifacts['packed_gamma'],
-                'dtype': p.precision['gamma'].c_type,
-                'storage_dtype': p.precision['gamma'].storage_dtype,
-                'filename': f'gamma_{inst_name}.h',
-                'port': 'gamma',
-            },
-            {
-                'name': 'beta',
-                'kind': '1d',
-                'storage': 'rom',
-                'array': inst.artifacts['packed_beta'],
-                'dtype': p.precision['beta'].c_type,
-                'storage_dtype': p.precision['beta'].storage_dtype,
-                'filename': f'beta_{inst_name}.h',
-                'port': 'beta',
-            },
+            rom_artifact(inst, 'gamma', '1d', inst.artifacts['packed_gamma'], precision['gamma'], 'gamma'),
+            rom_artifact(inst, 'beta', '1d', inst.artifacts['packed_beta'], precision['beta'], 'beta'),
         ]
+
 
 @register_variant
 class LayerNormLinearOpImplVariant(_LayerNormVariantBase):

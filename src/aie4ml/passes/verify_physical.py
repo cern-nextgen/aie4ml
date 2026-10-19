@@ -15,6 +15,7 @@ from itertools import zip_longest
 
 from ..errors import ConfigRefused
 from ..ir import get_backend_context
+from ..ir.graph import sanitize_identifier
 from ..op_impls.base import KERNEL_BANKS
 from ..op_impls.common_types import PORT_KIND_BUFFER
 from .base import AIEPass
@@ -22,7 +23,6 @@ from .shared_buffer import SHARED_MEMORY, hand_over_problem, placed_buffers, pla
 from .transport.dma_resources import KERNEL_BUFFERS, memtile_port_bds, pool_use, tile_port_bds
 from .transport.model import TransportUnit
 from .transport.routing import BELOW, port_tiles, route_overflow
-from .utils import sanitize_identifier
 
 _PORT = re.compile(r'^(?P<graph>\w+)\.(?P<group>\w+)\[(?P<port>\d+)\]$')
 _PLIO = re.compile(r'^(ifm|ofm)\[\d+\]$')

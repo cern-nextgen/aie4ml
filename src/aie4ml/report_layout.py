@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .device_catalog import lookup_device
-from .passes.utils import sanitize_identifier
+from .ir.graph import sanitize_identifier
 
 _COLORS = (
     '#8ecae6',

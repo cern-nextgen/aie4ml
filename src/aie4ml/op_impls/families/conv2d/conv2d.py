@@ -17,8 +17,15 @@ from ....ir.graph import (
     input_role,
     input_tensor_for_role,
 )
-from ....passes.utils import sanitize_identifier
-from ...base import LayoutConversion, OpImplFootprint, OpImplVariant, StreamLocation, cascade_locations, cascade_ports
+from ...base import (
+    LayoutConversion,
+    OpImplFootprint,
+    OpImplVariant,
+    StreamLocation,
+    cascade_locations,
+    cascade_ports,
+    rom_artifact,
+)
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -919,29 +926,10 @@ class Conv2dOpImplVariant(OpImplVariant):
         return {'packed_weights': packed_weights, 'packed_bias': packed_bias}
 
     def get_artifacts(self, inst: ExecutionInstance):
-        inst_name = sanitize_identifier(inst.name)
-        p = inst.config
+        precision = inst.config.precision
         return [
-            {
-                'name': 'weights',
-                'kind': '2d',
-                'storage': 'rom',
-                'array': inst.artifacts['packed_weights'],
-                'dtype': p.precision['rhs'].c_type,
-                'storage_dtype': p.precision['rhs'].storage_dtype,
-                'filename': f'weights_{inst_name}.h',
-                'port': 'wts',
-            },
-            {
-                'name': 'bias',
-                'kind': '1d',
-                'storage': 'rom',
-                'array': inst.artifacts['packed_bias'],
-                'dtype': p.precision['bias'].c_type,
-                'storage_dtype': p.precision['bias'].storage_dtype,
-                'filename': f'bias_{inst_name}.h',
-                'port': 'bias',
-            },
+            rom_artifact(inst, 'weights', '2d', inst.artifacts['packed_weights'], precision['rhs'], 'wts'),
+            rom_artifact(inst, 'bias', '1d', inst.artifacts['packed_bias'], precision['bias'], 'bias'),
         ]
 
 

@@ -6,9 +6,14 @@ import numpy as np
 
 from ....aie_types import FloatIntent
 from ....errors import ConfigRefused
-from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role, shard_major_order
-from ....passes.utils import sanitize_identifier
-from ...base import OpImplVariant, StreamLocation, cascade_locations, cascade_ports
+from ....ir.graph import (
+    ExecutionInstance,
+    OpNode,
+    has_input_role,
+    input_tensor_for_role,
+    shard_major_order,
+)
+from ...base import OpImplVariant, StreamLocation, cascade_locations, cascade_ports, rom_artifact
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
@@ -257,21 +262,8 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         return cascade_locations(config, anchor_row)
 
     def get_artifacts(self, inst: ExecutionInstance):
-        inst_name = sanitize_identifier(inst.name)
         p = inst.config
         output_view = p.io_views[inst.node.outputs[0].name]
-        artifacts = [
-            {
-                'name': 'weights',
-                'kind': '2d',
-                'storage': 'rom',
-                'array': inst.artifacts['packed_weights'],
-                'dtype': p.precision['rhs'].c_type,
-                'storage_dtype': p.precision['rhs'].storage_dtype,
-                'filename': f'weights_{inst_name}.h',
-                'port': 'wts',
-            }
-        ]
         packed_bias = inst.artifacts.get('packed_bias')
         if packed_bias is None:
             # Dense graph always exposes a bias RTP port; feed explicit zeros for biasless layers.
@@ -279,19 +271,10 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
                 (int(p.parallelism.cas_num), output_view.tile_inner),
                 dtype=np_bias_dtype_for_spec(p.precision['bias']),
             )
-        artifacts.append(
-            {
-                'name': 'bias',
-                'kind': '1d',
-                'storage': 'rom',
-                'array': packed_bias,
-                'dtype': p.precision['bias'].c_type,
-                'storage_dtype': p.precision['bias'].storage_dtype,
-                'filename': f'bias_{inst_name}.h',
-                'port': 'bias',
-            }
-        )
-        return artifacts
+        return [
+            rom_artifact(inst, 'weights', '2d', inst.artifacts['packed_weights'], p.precision['rhs'], 'wts'),
+            rom_artifact(inst, 'bias', '1d', packed_bias, p.precision['bias'], 'bias'),
+        ]
 
     def validate_config(self, node: OpNode, config: DenseConfig, _device) -> None:
         if config.shift < 0:

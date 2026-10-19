@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from ..ir.graph import ExecutionInstance, ExecutionValue, OpNode
+from ..ir.graph import ExecutionInstance, ExecutionValue, OpNode, sanitize_identifier
 from .common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortMap
 
 
@@ -135,6 +135,23 @@ class OpImplFootprint:
     def __post_init__(self) -> None:
         if self.width <= 0 or self.height <= 0:
             raise ValueError(f'Footprint dimensions must be positive, got {self.width}x{self.height}.')
+
+
+def rom_artifact(
+    inst: ExecutionInstance, name: str, kind: str, array: Any, precision: Any, port: str
+) -> Dict[str, Any]:
+    """A constant array the instance's kernels read on `port`, as a ROM header <name>_<instance>.h: '2d' one slice per
+    kernel (weights), '1d' one per chain (a bias, gamma or beta)."""
+    return {
+        'name': name,
+        'kind': kind,
+        'storage': 'rom',
+        'array': array,
+        'dtype': precision.c_type,
+        'storage_dtype': precision.storage_dtype,
+        'filename': f'{name}_{sanitize_identifier(inst.name)}.h',
+        'port': port,
+    }
 
 
 class OpImplVariant:

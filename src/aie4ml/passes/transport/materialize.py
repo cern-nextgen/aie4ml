@@ -9,11 +9,11 @@ from typing import Any, Dict, List
 
 from ...aie_types import AIEDataType
 from ...ir import get_backend_context
+from ...ir.graph import sanitize_identifier
 from ...op_impls.common_types import PORT_KIND_STREAM
 from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, staging_tile_shape
 from ..base import AIEPass
 from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, hand_over_problem
-from ..utils import sanitize_identifier
 from .boundary import (
     direct_boundary_access,
     graph_input_port_descriptor,

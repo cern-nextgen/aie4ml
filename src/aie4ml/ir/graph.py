@@ -13,6 +13,19 @@ if TYPE_CHECKING:  # pragma: no cover - runtime circular import guard
     from ..op_impls import OpImplVariant
 
 
+
+def sanitize_identifier(name: str, prefix: str = 'id') -> str:
+    """Return a C/C++ friendly identifier derived from ``name``."""
+
+    if not name:
+        return prefix
+
+    filtered = ''.join(ch if (ch.isalnum() or ch == '_') else '_' for ch in str(name))
+    filtered = filtered.lstrip('_') or '_'
+    if filtered[0].isdigit():
+        filtered = f'{prefix}_{filtered}'
+    return filtered
+
 @dataclass
 class TensorVar:
     """Logical tensor value with producer/consumer connectivity.

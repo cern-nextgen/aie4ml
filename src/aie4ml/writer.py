@@ -7,9 +7,9 @@ from shutil import copyfile
 
 from jinja2 import Environment, FileSystemLoader
 
+from .ir.graph import sanitize_identifier
 from .op_impls.base import STACK_BANK, WEIGHT_BANK
 from .passes.shared_buffer import pinned_buffers
-from .passes.utils import sanitize_identifier
 from .serialization import dump_pipeline_ir
 
 TEMPLATE_ROOT = Path(__file__).resolve().parent / 'templates'

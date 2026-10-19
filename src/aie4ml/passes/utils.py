@@ -3,19 +3,6 @@
 from __future__ import annotations
 
 
-def sanitize_identifier(name: str, prefix: str = 'id') -> str:
-    """Return a C/C++ friendly identifier derived from ``name``."""
-
-    if not name:
-        return prefix
-
-    filtered = ''.join(ch if (ch.isalnum() or ch == '_') else '_' for ch in str(name))
-    filtered = filtered.lstrip('_') or '_'
-    if filtered[0].isdigit():
-        filtered = f'{prefix}_{filtered}'
-    return filtered
-
-
 def assert_true_pointwise(layer) -> None:
     """A Conv1D that stands in for a Dense must really be pointwise; hls4ml's multi-dense
     replacement only ever produces that shape."""
