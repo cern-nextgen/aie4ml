@@ -1,7 +1,7 @@
 """Activation fusion pass on aie4ml logical IR."""
 
 from ..ir import TraitInstance, get_backend_context
-from ..op_impls.family_registry import get_family_resolver_registry
+from ..op_impls.family_registry import fuses
 from .base import AIEPass
 
 
@@ -31,8 +31,7 @@ class FuseActivationCasts(AIEPass):
                 producer = in_tensor.producer
                 if producer is None or len(producer.outputs) != 1:
                     continue
-                resolver = get_family_resolver_registry().find(producer.op_type)
-                if resolver is None or 'relu' not in resolver.supported_fusions:
+                if not fuses(producer, 'relu'):
                     continue
                 producer.add_trait(TraitInstance('fused_activation', {'activation': 'relu'}))
                 graph.remove_node(act_node, mode='contract')

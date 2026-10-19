@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..ir import TraitInstance, get_backend_context
-from ..op_impls.family_registry import get_family_resolver_registry
+from ..op_impls.family_registry import fuses, get_family_resolver_registry
 from .base import AIEPass
 from .utils import keeps_values
 
@@ -111,9 +111,7 @@ class FoldViewOps(AIEPass):
         source, out_tv = node.inputs[0], node.outputs[0]
         producer = source.producer
         kind = node.metadata['view']
-        registry = get_family_resolver_registry()
-        resolver = registry.find(producer.op_type) if producer is not None else None
-        if resolver is None or kind not in resolver.supported_output_views:
+        if not fuses(producer, kind):
             raise NotImplementedError(
                 f'{node.name}: {kind} must be written by its producer, but '
                 f'{producer.op_type if producer else "the graph input"} does not emit that view.'
@@ -134,7 +132,7 @@ class FoldViewOps(AIEPass):
         order = _row_permutation(source.shape, node.metadata['axis_order'])
         if order is not None:
             for consumer in list(out_tv.consumers):
-                registry.get(consumer.op_type).reorder_reduction_rows(consumer, out_tv, order)
+                get_family_resolver_registry().get(consumer.op_type).reorder_reduction_rows(consumer, out_tv, order)
 
         producer.add_trait(TraitInstance('output_view', {'kind': kind}))
         graph.remove_node(node, mode='contract')

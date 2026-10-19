@@ -1,7 +1,7 @@
 """Pool fusion on aie4ml logical IR."""
 
 from ..ir import TraitInstance, get_backend_context
-from ..op_impls.family_registry import get_family_resolver_registry
+from ..op_impls.family_registry import fuses
 from .base import AIEPass
 from .utils import keeps_values
 
@@ -23,8 +23,7 @@ class FusePool(AIEPass):
             source, pooled = pool.inputs[0], pool.outputs[0]
             producer = source.producer
             kind = pool.metadata['kind']
-            resolver = get_family_resolver_registry().find(producer.op_type) if producer is not None else None
-            if resolver is None or f'{kind}_pool' not in resolver.supported_fusions:
+            if not fuses(producer, f'{kind}_pool'):
                 raise NotImplementedError(
                     f'{pool.name}: a {kind} pool runs fused into the op producing its input, but '
                     f'{producer.op_type if producer else "the graph input"} does not fuse it.'

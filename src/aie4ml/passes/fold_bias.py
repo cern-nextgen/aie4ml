@@ -7,7 +7,7 @@ import numpy as np
 
 from ..ir import get_backend_context
 from ..ir.graph import has_input_role
-from ..op_impls.family_registry import get_family_resolver_registry
+from ..op_impls.family_registry import fuses
 from .base import AIEPass
 
 
@@ -67,8 +67,7 @@ def _is_biasless_producer(tensor) -> bool:
     producer = tensor.producer
     if producer is None or has_input_role(producer, 'bias'):
         return False
-    resolver = get_family_resolver_registry().find(producer.op_type)
-    return resolver is not None and 'bias' in resolver.supported_fusions
+    return fuses(producer, 'bias')
 
 
 def _refuse_unfused_bias(add) -> None:
@@ -78,9 +77,7 @@ def _refuse_unfused_bias(add) -> None:
         producer = tensor.producer
         if producer is None or not const.is_parameter or tensor.is_parameter:
             continue
-        resolver = get_family_resolver_registry().find(producer.op_type)
-        fuses = resolver is not None and 'bias' in resolver.supported_fusions
-        if np.asarray(const.data).size < np.prod(tensor.shape) and not fuses:
+        if np.asarray(const.data).size < np.prod(tensor.shape) and not fuses(producer, 'bias'):
             raise NotImplementedError(
                 f'{add.name}: a constant added along the rows is a bias, which runs fused into the op producing '
                 f'{tensor.name!r}, and {producer.name} ({producer.op_type}) does not fuse one.'

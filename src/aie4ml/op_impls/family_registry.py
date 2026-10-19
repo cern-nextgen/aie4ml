@@ -166,6 +166,13 @@ def get_family_resolver_registry() -> FamilyResolverRegistry:
     return _GLOBAL_FAMILY_RESOLVER_REGISTRY
 
 
+def fuses(node: Any, capability: str) -> bool:
+    """Whether some variant of `node`'s family fuses `capability` or writes it as an output view; never for a graph
+    input (no node) or an op no family implements."""
+    family = _GLOBAL_FAMILY_RESOLVER_REGISTRY.find(node.op_type) if node is not None else None
+    return family is not None and capability in family.supported_fusions | family.supported_output_views
+
+
 def family_resolver(*op_types: str):
     def decorator(cls):
         instance = cls()

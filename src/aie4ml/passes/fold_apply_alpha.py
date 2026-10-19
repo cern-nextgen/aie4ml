@@ -10,7 +10,7 @@ import numpy as np
 from ..aie_types import FloatIntent
 from ..ir import get_backend_context
 from ..ir.graph import has_input_role, input_tensor_for_role
-from ..op_impls.family_registry import get_family_resolver_registry
+from ..op_impls.family_registry import fuses
 from .base import AIEPass
 
 
@@ -41,8 +41,7 @@ class FoldApplyAlpha(AIEPass):
             p_min = int(np.round(-np.log2(scale.max())))
 
             dense_node = node.inputs[0].producer
-            family = get_family_resolver_registry().find(dense_node.op_type) if dense_node is not None else None
-            if family is None or 'apply_alpha' not in family.supported_fusions:
+            if not fuses(dense_node, 'apply_alpha'):
                 raise NotImplementedError(
                     f'{node.name}: a per-channel scale folds into the Dense before it, not into '
                     f'{dense_node.op_type if dense_node is not None else "the graph input"}.'

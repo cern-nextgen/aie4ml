@@ -4,14 +4,8 @@
 from __future__ import annotations
 
 from ..ir import TraitInstance, get_backend_context
-from ..op_impls.family_registry import get_family_resolver_registry
+from ..op_impls.family_registry import fuses
 from .base import AIEPass
-
-
-def _absorbs(node, scale: str) -> bool:
-    """Whether `node`'s family takes an 'input_scale' or 'output_scale'; its resolution checks the value."""
-    family = get_family_resolver_registry().find(node.op_type) if node is not None else None
-    return family is not None and scale in family.supported_fusions
 
 
 class FoldScale(AIEPass):
@@ -42,13 +36,13 @@ class FoldScale(AIEPass):
             # A scale before its quantizer scales what is quantized: only the producer's requantization applies it
             # exactly. One after reads quantized codes, which a consumer can scale as it reads them.
             consumer = consumers[0] if len(consumers) == 1 and not scale_node.metadata.get('before_quantizer') else None
-            if _absorbs(consumer, 'input_scale'):
+            if fuses(consumer, 'input_scale'):  # its resolution checks the value
                 _accumulate_scale(consumer, 'input_scale', scale)
                 graph.remove_node(scale_node, mode='bypass')
                 changed = True
                 continue
 
-            if _absorbs(producer, 'output_scale'):
+            if fuses(producer, 'output_scale'):
                 if len(in_tensor.consumers) != 1:
                     raise NotImplementedError(
                         f'{scale_node.name}: cannot fold output scale because {in_tensor.name!r} '
