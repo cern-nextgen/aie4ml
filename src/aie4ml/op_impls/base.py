@@ -68,6 +68,9 @@ def row_flow(alternating_horizontal: bool, row: int, cas_length: int) -> RowFlow
 
 STACK_BANK = 1
 """The bank every op's graph pins each kernel's stack and small parameters (bias, scales) to, in its own tile."""
+STACK_BANK_RESERVED_BYTES = 1536
+"""What a buffer in `STACK_BANK` leaves to the 1 KB stack and ADF's system data (sync buffer, statics, alignment,
+reserved words): 1216-1280 bytes in all (AIE-MLv2, Vitis 2026.1.1), so a 15360-byte buffer there failed placement."""
 WEIGHT_BANK = 2
 """The bank every op's graph pins each kernel's weights to, in its own tile."""
 KERNEL_BANKS = (STACK_BANK, WEIGHT_BANK)

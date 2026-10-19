@@ -5,7 +5,15 @@ from typing import Any, ClassVar, Dict
 
 from ....aie_types import FloatIntent
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
-from ...base import KERNEL_BANKS, PING_PONG_BANKS, BufferLocation, OpImplFootprint, OpImplVariant, row_flow
+from ...base import (
+    KERNEL_BANKS,
+    PING_PONG_BANKS,
+    STACK_BANK_RESERVED_BYTES,
+    BufferLocation,
+    OpImplFootprint,
+    OpImplVariant,
+    row_flow,
+)
 from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
 from ...utils import (
@@ -31,13 +39,13 @@ from .common import elementwise_vec_size
 from .config import AddConfig, AddFlags
 
 
-def _adopted_contract(node: OpNode, input_contracts):
+def _adopted_contract(node: OpNode, input_contracts, max_elements: int):
     """The producer contract whose layout the add takes for all its tensors, or None when it lays out its own.
 
     An add sums element by element, so any one layout serves all its tensors: it takes its first operand's -- a conv
     frame, a matmul's microtiles, a row band -- so that operand hands over directly, and the other does too where
     its producer writes the same layout. It needs every tensor read plainly, of one shape, and each producer port to
-    hold one tile of the producer's view (a halo row does not).
+    hold one tile of the producer's view (a halo row does not), of at most `max_elements`.
     """
     tensors = (*node.inputs, *node.outputs)
     if len({tuple(t.shape) for t in tensors}) != 1:
@@ -48,6 +56,8 @@ def _adopted_contract(node: OpNode, input_contracts):
     if contract is None or contract.inner_shards is not None or contract.view.perm is not None:
         return None
     tile = math.prod(contract.view.tile)
+    if tile > max_elements:
+        return None
     if any(math.prod(staging_tile_shape(staging)) != tile for staging in contract.port_staging):
         return None
     return contract
@@ -72,7 +82,6 @@ class AddOpImplVariant(OpImplVariant):
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
-        adopted = _adopted_contract(node, input_contracts)
         first = next((t for t in (lhs_tensor, rhs_tensor) if t.name in input_contracts), None)
         staging_contract = 'outer' if first is None else input_contracts[first.name].contract
         # An operand read through a transpose crosses a memory tile anyway, which can re-shard it: the add keeps
@@ -95,6 +104,9 @@ class AddOpImplVariant(OpImplVariant):
         bank_bytes = int(device.bank_mem_bytes)
         max_rows = max(1, int(device.rows) - int(device.row_start))
         elem_bytes = storage_bytes_for_spec(precision['lhs'])
+        # Its second operand's ping shares `STACK_BANK` with the stack (`buffer_locations`): a tile fits what it leaves.
+        room = bank_bytes - STACK_BANK_RESERVED_BYTES
+        adopted = _adopted_contract(node, input_contracts, room // elem_bytes)
         # The kernel adds whole vectors: rows padded to a DMA word when a tile then holds whole vectors, else to one.
         aligns = (max(1, 4 // elem_bytes), vec_size)
 
@@ -109,7 +121,7 @@ class AddOpImplVariant(OpImplVariant):
                 cas_num, tile_inner = find_tile_split(
                     partition_size=full_inner,
                     max_rows=max_rows,
-                    bank_bytes=bank_bytes,
+                    bank_bytes=room,
                     tile_bytes_fn=lambda ti: compacted_outer * ti * elem_bytes,
                     parallel_cfg=parallel_cfg,
                     input_contracts=input_contracts,
@@ -138,7 +150,7 @@ class AddOpImplVariant(OpImplVariant):
                 cas_num, tile_outer = find_tile_split(
                     partition_size=last_outer,
                     max_rows=max_rows,
-                    bank_bytes=bank_bytes,
+                    bank_bytes=room,
                     tile_bytes_fn=lambda to, inner=full_inner: outer_prefix * to * inner * elem_bytes,
                     parallel_cfg=parallel_cfg,
                     input_contracts=input_contracts,

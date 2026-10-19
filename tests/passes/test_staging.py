@@ -205,6 +205,24 @@ def test_a_consumer_adopts_the_split_its_producers_agree_on(two_denses_into_add,
     assert {('fc_a_aie', 'add_aie'), ('fc_b_aie', 'add_aie')} <= direct_edges(ctx)
 
 
+def test_an_add_tile_leaves_room_for_the_stack_beside_its_second_operand(tmp_path):
+    """Its second operand's ping shares the stack's bank, so a 64x256 int8 tile (a whole bank) takes two rows."""
+    rows, cols = 64, 256
+    nodes: list = []
+    dq(nodes, 'a_i8', 'a', 'a')
+    dq(nodes, 'b_i8', 'b', 'b')
+    nodes.append(helper.make_node('Add', ['a', 'b'], ['sum'], name='add'))
+    qdq(nodes, 'sum', 'y', 'y')
+    model = make_model(
+        'wide_add',
+        nodes=nodes,
+        inputs=[('a_i8', TensorProto.INT8, [rows, cols]), ('b_i8', TensorProto.INT8, [rows, cols])],
+        outputs=[('y', TensorProto.FLOAT, [rows, cols])],
+        initializers=[*qparams('a'), *qparams('b'), *qparams('y')],
+    )
+    assert config_of(lower(model, tmp_path), 'add_aie').parallelism.cas_num == 2
+
+
 def _dense_chain(features):
     """x -> dense to `features` -> dense: the second reads the first's output whole or in slices."""
     rng = np.random.default_rng(5)

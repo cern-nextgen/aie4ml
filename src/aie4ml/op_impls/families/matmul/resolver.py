@@ -10,6 +10,7 @@ from ....aie_types import AIEDataType, legality_format
 from ....errors import ConfigRefused
 from ....ir import input_role, input_tensor_for_role
 from ....ir.graph import STAGING_CONTRACTS
+from ...base import STACK_BANK_RESERVED_BYTES
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
 from ...utils.io import view_shape
@@ -45,11 +46,6 @@ def _bank_capacity_bytes(device: Any) -> int:
     return max(1, int(getattr(device, 'bank_mem_bytes', 0) or 1))
 
 
-# B shares its bank with the 1 KB stack and ADF's system data (sync buffer, statics, alignment, reserved words):
-# 1216-1280 bytes in all (AIE-MLv2, Vitis 2026.1.1), so a B of 15360 bytes failed placement.
-_MATMUL_RHS_STACK_BYTES = 1536
-
-
 def _tile_bank_usage(
     *,
     op_type: str,
@@ -66,7 +62,7 @@ def _tile_bank_usage(
     # tile_inner_rhs=N) both fall out of the same formula.
     lhs_tile_bytes = int(outer_extent) * int(tile_inner_lhs) * max(1, int(lhs_bytes))
     rhs_tile_bytes = int(tile_inner_lhs) * int(tile_inner_rhs) * max(1, int(rhs_bytes))
-    rhs_tile_bytes += _MATMUL_RHS_STACK_BYTES if op_type == 'matmul' else 0
+    rhs_tile_bytes += STACK_BANK_RESERVED_BYTES if op_type == 'matmul' else 0  # B sits in `KERNEL_BANKS`
     output_tile_bytes = int(outer_extent) * int(tile_inner_rhs) * max(1, int(output_bytes))
     return {
         'lhs_tile_bytes': lhs_tile_bytes,
