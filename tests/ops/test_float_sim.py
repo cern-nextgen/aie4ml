@@ -1275,10 +1275,7 @@ def _imports():
 
 def _build_models(keras, qkeras, n_in, n_h, n_out, bits=16, seed=0):
     """Return (qkeras_model, keras_reference) sharing the same weights."""
-    import tensorflow as tf
-
-    tf.random.set_seed(seed)
-    np.random.seed(seed)
+    keras.utils.set_random_seed(seed)  # Keras 3 initializers draw from their own seed state, not TensorFlow's
 
     from keras import Input, Model
     from keras.initializers import RandomNormal
