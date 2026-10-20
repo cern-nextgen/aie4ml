@@ -330,3 +330,35 @@ def test_hls4ml_int16_conv_matches_qkeras(tmp_path, part):
     want = model.predict(x, verbose=0)
     got = hls_model.predict(x.reshape(2, 1, H, W, CIN), simulator='x86')
     np.testing.assert_equal(np.asarray(got).reshape(want.shape), want)
+
+
+def test_a_transpose_into_a_conv_is_refused(tmp_path):
+    """A Keras Permute folds into the conv as an io_view, which no conv kernel reads: refused, not computed on the
+    untransposed frame."""
+    hls4ml = pytest.importorskip('hls4ml')
+    pytest.importorskip('qkeras')
+    from keras.models import Sequential
+    from qkeras import QActivation, QConv2D, quantized_bits, quantized_relu
+
+    q_w = quantized_bits(BITS, 2, alpha=1)
+    model = Sequential(
+        [
+            keras.Input(shape=(H, W, CIN)),
+            keras.layers.Permute((2, 1, 3), name='permute'),
+            QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
+            QActivation(quantized_relu(BITS, 2), name='relu'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
+    with pytest.raises(NotImplementedError, match='io_view perm'):
+        hls4ml.converters.convert_from_keras_model(
+            model,
+            backend='AIE',
+            io_type='io_parallel',
+            output_dir=str(tmp_path / 'proj'),
+            part=PART,
+            hls_config=config,
+            project_name='proj',
+            batch_size=1,
+        )

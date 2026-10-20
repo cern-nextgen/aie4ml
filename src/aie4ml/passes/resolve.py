@@ -12,7 +12,7 @@ from ..ir.graph import (
     input_role,
 )
 from ..op_impls.family_registry import get_family_resolver_registry
-from ..op_impls.utils.io import check_io_view, resolve_io_route
+from ..op_impls.utils.io import check_io_view, resolve_io_route, view_layout
 from .base import AIEPass
 
 
@@ -43,7 +43,7 @@ def resolve_instance(node, device, input_contracts, choice=None, shared=()) -> E
     config, variant = (
         get_family_resolver_registry().get(node.op_type).resolve(node, device, directives, input_contracts)
     )
-    _check_transposed_views(node, config, variant)
+    _check_views(node, config, variant)
     variant.validate_config(node, config, device)
     _check_fits_array(node, config.parallelism, device)
     ports = variant.build_ports(node, config)
@@ -104,12 +104,21 @@ def port_staging(node, variant, config, ports) -> dict[str, tuple]:
     return staging
 
 
-def _check_transposed_views(node, config, variant) -> None:
-    """A transposed view holds each block in the tensor's order, not the view's: only a kernel that transposes the
+def _check_views(node, config, variant) -> None:
+    """The variant views each tensor in the order the node's `io_view` gives it, as a folded transpose left it. A
+    transposed view holds each block in the tensor's order, not the view's: only a kernel that transposes the
     blocks it loads may read one, and only in blocks. Refuse rather than feed a kernel permuted data.
     """
-
-    for name, view in (getattr(config, 'io_views', None) or {}).items():
+    for direction, tensors in (('inputs', node.inputs), ('outputs', node.outputs)):
+        for tensor in tensors:
+            perm = _moved(view_layout(node, tensor, direction).get('perm'))
+            view = config.io_views.get(tensor.name)
+            if perm is not None and (view is None or _moved(view.perm) != perm):
+                raise NotImplementedError(
+                    f'{node.name}: {variant.variant_id} does not read {tensor.name!r} through the io_view perm '
+                    f'{list(perm)} a folded transpose gave it.'
+                )
+    for name, view in config.io_views.items():
         if not view.is_transposed:
             continue
         if not variant.kernel_transposes_microtile:
@@ -122,6 +131,13 @@ def _check_transposed_views(node, config, variant) -> None:
                 f'{node.name}: {name!r} is a transposed view staged in whole rows; the DMA needs a '
                 'microtiled staging to walk the grid in view order.'
             )
+
+
+def _moved(perm):
+    """`perm` as a tuple, or None where it keeps every axis in place."""
+    if perm is None or list(perm) == sorted(perm):
+        return None
+    return tuple(int(axis) for axis in perm)
 
 
 def _folded_views(node):
