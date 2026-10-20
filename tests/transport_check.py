@@ -11,11 +11,11 @@ than against itself.
 from __future__ import annotations
 
 import numpy as np
-from aie4ml.ir.graph import sanitize_identifier
 from aie4ml.op_impls.common_types import PORT_KIND_STREAM
 from aie4ml.passes.transport.collect import TransportCollector
 from aie4ml.passes.transport.layout import port_layout
 from aie4ml.simulation import _extract_port_tile, _framed, _insert_port_tile, build_io_layout
+from aie4ml.utils import sanitize_identifier
 
 UNWRITTEN = -1  # a memory-tile position no writer reached
 PADDING = -2  # a producer buffer position that holds no element of the tensor

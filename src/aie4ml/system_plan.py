@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 import numpy as np
 
 from .ir import get_backend_context
-from .ir.graph import sanitize_identifier
+from .utils import sanitize_identifier
 
 # Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
 # This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is

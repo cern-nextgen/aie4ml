@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from ..ir.graph import ExecutionInstance, ExecutionValue, OpNode, sanitize_identifier
+from ..ir.graph import ExecutionInstance, ExecutionValue, OpNode
+from ..utils import sanitize_identifier
 from .common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortMap
 
 

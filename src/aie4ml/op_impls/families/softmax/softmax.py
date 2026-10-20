@@ -203,6 +203,7 @@ class _SoftmaxVariantBase(RowWiseOpImplVariant):
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:
         raise NotImplementedError
 
+
 class _SoftmaxTiledMixin(TiledRowWiseMixin):
     """The tiled envelope, shared by the HCCS and exp tiled variants."""
 

@@ -15,9 +15,9 @@ from itertools import zip_longest
 
 from ..errors import ConfigRefused
 from ..ir import get_backend_context
-from ..ir.graph import sanitize_identifier
 from ..op_impls.base import KERNEL_BANKS
 from ..op_impls.common_types import PORT_KIND_BUFFER
+from ..utils import sanitize_identifier
 from .base import AIEPass
 from .shared_buffer import SHARED_MEMORY, hand_over_problem, placed_buffers, placed_locations, reached
 from .transport.dma_resources import KERNEL_BUFFERS, memtile_port_bds, pool_use, tile_port_bds
