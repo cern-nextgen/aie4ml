@@ -97,16 +97,16 @@ def design_directives(
     pipeline: Path, directives: Optional[Dict[str, Dict[str, Any]]] = None
 ) -> Dict[str, Dict[str, Any]]:
     """`directives` (LayerDirectives) with the design a lowering recorded in `pipeline`, its aie_pipeline.json,
-    pinned: each layer's parallelism, microtiling and kernel as the design search chose them, and its place. Lowering
-    the same model with them builds that design again without searching; the kernels the compiler adds and the
-    hand-overs it shares follow from the layers pinned. A directive the record contradicts is refused."""
+    pinned: each layer's parallelism and microtiling as the design search chose them, and its place. Lowering the
+    same model with them builds that design again; the kernels the compiler adds and the hand-overs it shares follow
+    from the layers pinned, and a fallback kernel (`fallback_kernels`), which no directive names, is chosen again
+    by the same criterion. A directive the record contradicts is refused."""
     recorded = json.loads(Path(pipeline).read_text())
     chosen, placed = recorded['optimizer'], recorded['physical']['placements']
     merged = {layer: dict(given) for layer, given in (directives or {}).items()}
     for node in recorded['logical']:
         name = node['name']
         design = {key: chosen[key][name] for key in ('parallelism', 'microtiling') if name in chosen[key]}
-        design.update(chosen['kernel'].get(name, {}))
         if name in placed:
             design['placement'] = {key: placed[name][key] for key in ('col', 'row')}
         if not design:

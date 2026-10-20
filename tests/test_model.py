@@ -10,7 +10,7 @@ from aie4ml import model as aie_model
 from aie4ml.frontends.onnx import from_onnx
 from frontends.test_onnx_aie1 import _dense_model
 from helpers import PART
-from ops.test_conv2d import AIE1_PART, _strided_chain_model
+from ops.test_conv2d import AIE1_PART, _strided_chain_model, _strided_model
 
 
 def test_a_model_builds_its_own_project_over_another_in_the_same_directory(tmp_path, monkeypatch):
@@ -64,6 +64,25 @@ def test_a_recorded_design_is_built_again_without_a_search(tmp_path):
     assert again.context.ir.optimizer['designs_tried'] == 1
     with pytest.raises(ValueError, match='contradicts the recorded design'):
         design_directives(recorded, {'first': {'placement': {'col': 99, 'row': 0}}})
+
+
+def test_a_recorded_fallback_kernel_is_built_again(tmp_path):
+    """A design the search built with a fallback kernel (`fallback_kernels`), pinned from its record, takes that
+    kernel again at the same places: no directive names it, the search chooses it by the same criterion."""
+    config = {'Part': PART, 'AIEConfig': {'Iterations': 1, 'MaxTiles': 1}}
+    model = _strided_model(stride=1, k=3, channels_in=2, channels_out=8, size=12, pad=1)
+    first = from_onnx(model, config, output_dir=tmp_path / 'first', project_name='proj')
+    first.write()
+    recorded = tmp_path / 'first' / 'aie_pipeline.json'
+    assert first.context.ir.optimizer['kernel'] == {'b_aie': {'input_fold': False}}
+    pinned = {**config, 'LayerDirectives': design_directives(recorded)}
+    assert 'input_fold' not in pinned['LayerDirectives']['b']
+    again = from_onnx(model, pinned, output_dir=tmp_path / 'again', project_name='proj')
+    again.write()
+    assert again.context.ir.optimizer['kernel'] == first.context.ir.optimizer['kernel']
+    replayed = tmp_path / 'again' / 'aie_pipeline.json'
+    first_plan, second_plan = (json.loads(path.read_text())['physical'] for path in (recorded, replayed))
+    assert first_plan['placements'] == second_plan['placements']
 
 
 @pytest.mark.parametrize('frac', [3, 0, -2])

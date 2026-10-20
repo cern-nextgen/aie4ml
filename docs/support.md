@@ -47,7 +47,7 @@ compiler keeps what is given and chooses the rest:
 
 The choice is in the project's `aie_pipeline.json` (`optimizer`) and the `aie4ml.report` summary.
 `aie4ml.design_directives(aie_pipeline_json, directives)` adds it to `directives` with every layer's place: lowering
-the same model with them builds that design again, place for place, without a search.
+the same model with them builds that design again, place for place.
 
 ## Dense and MatMul
 
