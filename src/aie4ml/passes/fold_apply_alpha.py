@@ -1,7 +1,7 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Fold per-channel scale nodes into their predecessor Dense weight precision."""
+"""Fold an hls4ml ApplyAlpha, a per-channel scale and bias, into the Dense before it."""
 
 from dataclasses import replace
 
@@ -15,14 +15,11 @@ from .base import AIEPass
 
 
 class FoldApplyAlpha(AIEPass):
-    """Fold output scale into a preceding Dense when legal.
+    """Fold a per-channel `y = x * scale + bias` (an hls4ml ApplyAlpha) into the Dense before it: its weights take
+    the scale, its bias the scale and the bias.
 
-    For applyalpha nodes with constant per-channel scale, this pass updates the
-    producer Dense quant intent and bias, then removes the scale node.
-
-    This is mainly a graph simplification/optimization pass. It is only bit-exact
-    when the incoming weight data already matches the frontend quantization grid,
-    or that grid has been reconstructed exactly before folding.
+    Integer weights keep their codes on a grid the scale moves, which is exact only for one power of two every
+    channel shares; another scale is refused rather than rounded. Float weights take any scale.
     """
 
     def __init__(self):
@@ -36,26 +33,31 @@ class FoldApplyAlpha(AIEPass):
         for node in list(graph.nodes):
             if node.op_type != 'applyalpha':
                 continue
-
-            scale = np.asarray(node.metadata['scale'], dtype=np.float64)
-            p_min = int(np.round(-np.log2(scale.max())))
-
-            dense_node = node.inputs[0].producer
-            if not fuses(dense_node, 'apply_alpha'):
+            dense = node.inputs[0].producer
+            if not fuses(dense, 'apply_alpha'):
                 raise NotImplementedError(
                     f'{node.name}: a per-channel scale folds into the Dense before it, not into '
-                    f'{dense_node.op_type if dense_node is not None else "the graph input"}.'
+                    f'{dense.op_type if dense is not None else "the graph input"}.'
                 )
+            scale = np.asarray(node.metadata['scale'], dtype=np.float64)
+            alpha_bias = np.asarray(node.metadata['bias'], dtype=np.float64)
 
-            weight_tv = input_tensor_for_role(dense_node, 'rhs')
-            old_w = weight_tv.precision
-            if isinstance(old_w, FloatIntent):
-                continue
-            weight_tv.precision = replace(old_w, frac=old_w.frac + p_min)
+            weight = input_tensor_for_role(dense, 'rhs')
+            if not isinstance(weight.precision, FloatIntent):
+                shift = -np.log2(scale[0])
+                if np.any(scale != scale[0]) or shift != np.round(shift):
+                    raise NotImplementedError(
+                        f'{node.name}: folds into {dense.name} only one power-of-two scale every channel shares, '
+                        f'got {sorted(set(scale.tolist()))}; quantize its weights with alpha=1 or one po2 alpha.'
+                    )
+                weight.precision = replace(weight.precision, frac=weight.precision.frac + int(shift))
+            weight.data = np.asarray(weight.data, dtype=np.float64) * scale
 
-            if has_input_role(dense_node, 'bias'):
-                bias_tv = input_tensor_for_role(dense_node, 'bias')
-                bias_tv.data = np.asarray(bias_tv.data, dtype=np.float64) * scale
+            if has_input_role(dense, 'bias'):
+                bias = input_tensor_for_role(dense, 'bias')
+                bias.data = np.asarray(bias.data, dtype=np.float64) * scale + alpha_bias
+            elif np.any(alpha_bias):
+                raise NotImplementedError(f'{node.name}: {dense.name} has no bias to take its bias.')
 
             graph.remove_node(node, mode='contract')
             changed = True

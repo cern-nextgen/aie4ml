@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 from aie4ml.ir import get_backend_context
 
@@ -276,6 +277,65 @@ def test_two_permutes_compose(tmp_path):
     )
     fc2 = get_backend_context(aie_model).ir.execution.get('fc2_aie')
     assert all(view.perm is None for view in fc2.port_views.values())
+
+
+def _alpha_dense(tmp_path, channels_alike: bool):
+    """A QDense quantized with alpha='auto_po2', which hls4ml follows with an ApplyAlpha holding its scale and its bias:
+    one po2 scale (1/4) where every channel holds the same weights, one per channel otherwise. The ApplyAlpha output
+    keeps the accumulator's fractional bits, so the AIE output is exactly QKeras's."""
+    np, hls4ml, keras, qkeras = _imports()
+    model = keras.Sequential(
+        [
+            keras.Input(shape=(16,)),
+            qkeras.QActivation(qkeras.quantized_bits(8, 3), name='input_quant'),
+            qkeras.QDense(
+                8,
+                name='dense0',
+                kernel_quantizer=qkeras.quantized_bits(8, 0, alpha='auto_po2'),
+                bias_quantizer=qkeras.quantized_bits(8, 2, alpha=1),
+            ),
+        ]
+    )
+    rng = np.random.default_rng(1)
+    weights = rng.uniform(-1, 1, (16, 8))
+    weights = np.repeat(weights[:, :1], 8, axis=1) * 0.2 if channels_alike else weights * 2.0 ** -np.arange(8)
+    model.get_layer('dense0').set_weights([weights.astype('float32'), rng.uniform(-0.5, 0.5, 8).astype('float32')])
+    cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    cfg['LayerName']['dense0_alpha'] = {'Precision': {'result': 'fixed<32,19>'}}
+
+    def convert():
+        return hls4ml.converters.convert_from_keras_model(
+            model, hls_config=cfg, output_dir=str(tmp_path), project_name='alpha', backend='aie', batch_size=1
+        )
+
+    return model, convert
+
+
+@pytest.mark.aie_ir
+def test_an_alpha_scaled_dense_keeps_its_bias(tmp_path):
+    """hls4ml moves the bias onto the ApplyAlpha: folding it back gives the Dense the bias QKeras adds."""
+    model, convert = _alpha_dense(tmp_path, channels_alike=True)
+    dense = get_backend_context(convert()).ir.execution.get('dense0_aie').node
+    layer = model.get_layer('dense0')
+    bias = [t for t in dense.inputs if dense.roles.get(t.name) == 'bias'][0]
+    assert (bias.data == np.asarray(layer.bias_quantizer_internal(layer.bias))).all()
+
+
+@pytest.mark.aie_ir
+def test_a_scale_per_channel_is_refused(tmp_path):
+    """One weight grid cannot hold channels scaled by different powers of two."""
+    _, convert = _alpha_dense(tmp_path, channels_alike=False)
+    with pytest.raises(NotImplementedError, match='only one power-of-two scale every channel shares'):
+        convert()
+
+
+def test_an_alpha_scaled_dense_matches_qkeras(tmp_path):
+    _require_vitis()
+    model, convert = _alpha_dense(tmp_path, channels_alike=True)
+    aie_model = convert()
+    aie_model.compile()
+    x = np.random.default_rng(2).random((1, 16)).astype('float32') * 2.0 - 1.0
+    np.testing.assert_equal(model.predict(x, verbose=0), aie_model.predict(x, simulator='x86')[:1])
 
 
 @pytest.mark.aie_ir

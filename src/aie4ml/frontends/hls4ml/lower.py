@@ -210,9 +210,9 @@ class LowerToAieIr(ModelOptimizerPass):
             meta['axis_order'] = tuple(range(self._input_rank(layer)))
 
         if layer.class_name == 'ApplyAlpha':
-            scale = layer.get_attr('scale_data')
-            if scale is not None:
-                meta['scale'] = np.asarray(scale, dtype=np.float64).flatten().tolist()
+            # y = x * scale + bias, per channel: hls4ml moves the layer's bias here, off the Dense before it.
+            for key in ('scale', 'bias'):
+                meta[key] = np.asarray(layer.get_attr(f'{key}_data'), dtype=np.float64).flatten().tolist()
 
         if layer.class_name == 'LayerNormalization':
             meta['input_roles'] = ['lhs', 'gamma', 'beta']
