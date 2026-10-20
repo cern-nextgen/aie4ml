@@ -20,7 +20,6 @@ from ....ir.graph import (
 from ....quant_utils import quantize_to_int
 from ...base import (
     LayoutConversion,
-    OpImplFootprint,
     OpImplVariant,
     StreamLocation,
     cascade_locations,
@@ -1000,6 +999,3 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
         if int(params['cout']) % CHANNEL_BLOCK:
             total += int(params['band_rows']) * int(params['out_w']) * int(params['cout']) + 16
         return total
-
-    def footprint(self, _node, _config) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=1)

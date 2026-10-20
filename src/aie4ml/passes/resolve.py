@@ -48,7 +48,7 @@ def resolve_instance(node, device, input_contracts, choice=None, shared=()) -> E
     )
     _check_transposed_views(node, config, variant)
     variant.validate_config(node, config, device)
-    _check_fits_array(node, variant.footprint(node, config), device)
+    _check_fits_array(node, config.parallelism, device)
     ports = variant.build_ports(node, config)
     variant.validate_ports(node, ports, device)
 
@@ -76,12 +76,13 @@ def resolve_instance(node, device, input_contracts, choice=None, shared=()) -> E
     )
 
 
-def _check_fits_array(node, footprint, device) -> None:
+def _check_fits_array(node, parallelism, device) -> None:
     """A kernel graph larger than the array placement searches can never be placed."""
     columns, rows = int(device.columns) - int(device.column_start), int(device.rows) - int(device.row_start)
-    if footprint.width > columns or footprint.height > rows:
+    width, height = int(parallelism.cas_length), int(parallelism.cas_num)
+    if width > columns or height > rows:
         raise ConfigRefused(
-            f'{node.name}: its kernel graph spans {footprint.width}x{footprint.height} tiles (columns x rows), beyond '
+            f'{node.name}: its kernel graph spans {width}x{height} tiles (columns x rows), beyond '
             f'the {columns}x{rows} tiles of the {device.platform} array; split it the other way.'
         )
 

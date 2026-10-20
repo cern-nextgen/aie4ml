@@ -357,7 +357,7 @@ def test_conv_partitions_channel_blocks_across_tiles(conv_model, tmp_path):
     c1, c2 = ctx.ir.execution.get('c1_aie'), ctx.ir.execution.get('c2_aie')
     assert (c1.config.parallelism.cas_num, c1.config.parallelism.cas_length) == (3, 1)
     assert (c2.config.parallelism.cas_num, c2.config.parallelism.cas_length) == (1, 3)
-    assert c2.variant.footprint(c2.node, c2.config).width == 3  # a three-tile cascade
+    assert c2.config.parallelism.cas_length == 3  # a three-tile cascade
 
     # Each of c1's ports carries one channel block of the shared frame, and c2 reads them back.
     tensor = c1.node.outputs[0].name

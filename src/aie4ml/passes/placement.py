@@ -55,7 +55,6 @@ class Rect:
     input_face: PortFace
     output_face: PortFace
 
-    extras: Dict[str, Any] = field(default_factory=dict)
     buffer_locations: Optional[Callable[[int], Tuple[BufferLocation, ...]]] = None
     stream_locations: Optional[Callable[[int], Tuple[StreamLocation, ...]]] = None
     _locations: Dict[int, Tuple[BufferLocation, ...]] = field(default_factory=dict, repr=False, compare=False)
@@ -180,69 +179,8 @@ class PlacementOutranked(ConfigRefused):
 
 
 # ---------------------------------------------------------------------------
-# Footprint parsing and geometry
+# Geometry
 # ---------------------------------------------------------------------------
-
-
-def _parse_face(
-    raw: Optional[Dict[str, Any]],
-    *,
-    default_side: str,
-    w: int,
-    h: int,
-) -> PortFace:
-    side = str((raw or {}).get('side', default_side))
-    if side not in ('left', 'right', 'top', 'bottom'):
-        raise ValueError(f'Invalid face side: {side!r}')
-
-    limit = h if side in ('left', 'right') else w
-    start = int((raw or {}).get('start', 0))
-    end = int((raw or {}).get('end', limit - 1))
-
-    if start < 0 or end < start or end >= limit:
-        raise ValueError(f'Invalid face span ({start}, {end}) for side={side!r} with limit={limit}.')
-
-    return PortFace(side=side, start=start, end=end)
-
-
-def _coerce_rect(footprint: Any) -> Rect:
-    """
-    Convert a kernel variant footprint object into a Rect.
-
-    Required footprint contract:
-      footprint.width
-      footprint.height
-
-    Optional footprint.extras keys:
-      input_face:  {"side": ..., "start": ..., "end": ...}
-      output_face: {"side": ..., "start": ..., "end": ...}
-      input_side:  "left" | "right" | "top" | "bottom"
-      output_side: "left" | "right" | "top" | "bottom"
-    """
-    w = int(getattr(footprint, 'width'))
-    h = int(getattr(footprint, 'height'))
-    extras = dict(getattr(footprint, 'extras', {}) or {})
-
-    input_face = _parse_face(
-        extras.get('input_face'),
-        default_side=str(extras.get('input_side', 'left')),
-        w=w,
-        h=h,
-    )
-    output_face = _parse_face(
-        extras.get('output_face'),
-        default_side=str(extras.get('output_side', 'right')),
-        w=w,
-        h=h,
-    )
-
-    return Rect(
-        w=w,
-        h=h,
-        input_face=input_face,
-        output_face=output_face,
-        extras=extras,
-    )
 
 
 def _face_abs_box(placed: Placed, face: PortFace) -> Tuple[float, float, float, float]:
@@ -538,10 +476,8 @@ def placer_time(ctx) -> float:
 def instance_rect(inst, row_offset: int) -> Rect:
     """The tiles an instance takes and where it pins its buffers and streams, an anchor row counted from the array's
     row `row_offset`."""
-    footprint = inst.variant.footprint(inst.node, inst.config)
-    if footprint is None:
-        raise RuntimeError(f'{inst.node.name}: kernel variant did not provide a footprint.')
-    rect = _coerce_rect(footprint)
+    w, h = int(inst.config.parallelism.cas_length), int(inst.config.parallelism.cas_num)
+    rect = Rect(w, h, input_face=PortFace('left', 0, h - 1), output_face=PortFace('right', 0, h - 1))
     rect.buffer_locations = lambda anchor_row: inst.variant.buffer_locations(
         inst.node, inst.config, int(anchor_row) + row_offset
     )

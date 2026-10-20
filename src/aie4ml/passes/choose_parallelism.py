@@ -228,16 +228,16 @@ def _reserved_tiles(inst, shared_ports: set) -> int:
     in its producer's: placement keeps every other op's tiles and buffers off them (`placement`'s conflict rule), so
     they are taken as surely as the footprint. The fewer over the anchor rows' parities (AIE1 mirrors its banks on
     odd rows)."""
-    footprint = inst.variant.footprint(inst.node, inst.config)
+    width, height = int(inst.config.parallelism.cas_length), int(inst.config.parallelism.cas_num)
     inputs = {binding.group for binding in inst.ports.inputs.values()}
     counts = []
     for anchor_row in (0, 1):
         outside, excused = set(), set()
         for loc in inst.variant.buffer_locations(inst.node, inst.config, anchor_row):
             col, row = loc.rel_col, loc.rel_row
-            if loc.port_group not in inputs or (0 <= col < footprint.width and 0 <= row < footprint.height):
+            if loc.port_group not in inputs or (0 <= col < width and 0 <= row < height):
                 continue
-            if not (-1 <= col <= footprint.width and -1 <= row <= footprint.height):
+            if not (-1 <= col <= width and -1 <= row <= height):
                 raise RuntimeError(
                     f'{inst.name}: buffer {loc.port_group}[{loc.port}] pinned at ({col}, {row}), beyond the tiles next '
                     'to its footprint that the design search accounts for.'
@@ -514,7 +514,7 @@ class _Search:
             for converter in kernels[:-1]:
                 target = converter.outputs[0]
                 self.values.setdefault(target, ExecutionValue(target, producer=converter.name))
-            tiles = sum(self._area(kernel.variant.footprint(kernel.node, kernel.config)) for kernel in kernels)
+            tiles = sum(kernel.config.parallelism.tiles for kernel in kernels)
             cycles = tuple(kernel_cycles(kernel, self.ctx.device) for kernel in kernels)
             resolved = (tuple(kernels), tiles, cycles)
         except ConfigRefused as refusal:
@@ -522,10 +522,6 @@ class _Search:
             resolved = None
         self._resolved[key] = resolved
         return resolved
-
-    @staticmethod
-    def _area(footprint) -> int:
-        return footprint.width * footprint.height
 
     def _own_legs(self, node: OpNode, kernels, live: Dict[str, Any]):
         """The legs of `node`'s kernels that no other layer's choice bears on -- into each from the graph's inputs and
@@ -681,7 +677,7 @@ class _Search:
                     (
                         rect.w,
                         rect.h,
-                        repr((rect.input_face, rect.output_face, rect.extras)),
+                        repr((rect.input_face, rect.output_face)),
                         tuple(rect.locations_at(row) for row in rows),
                         tuple(tuple(rect.stream_locations(row)) if rect.stream_locations else () for row in rows),
                         frozenset(binding.group for binding in inst.ports.outputs.values()),

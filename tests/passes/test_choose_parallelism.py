@@ -93,8 +93,7 @@ def _feature_concat_model(tokens=16):
 
 
 def _placed_tiles(ctx) -> int:
-    footprints = (inst.variant.footprint(inst.node, inst.config) for inst in ctx.ir.execution)
-    return sum(f.width * f.height for f in footprints)
+    return sum(inst.config.parallelism.tiles for inst in ctx.ir.execution)
 
 
 def _splits(ctx) -> dict:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from ..ir.graph import ExecutionInstance, ExecutionValue, OpNode
@@ -125,19 +125,6 @@ class LayoutConversion:
     source_view: Any
 
 
-@dataclass(frozen=True)
-class OpImplFootprint:
-    """Rectangular tile footprint required by an op implementation."""
-
-    width: int
-    height: int
-    extras: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.width <= 0 or self.height <= 0:
-            raise ValueError(f'Footprint dimensions must be positive, got {self.width}x{self.height}.')
-
-
 def rom_artifact(
     inst: ExecutionInstance, name: str, kind: str, array: Any, precision: Any, port: str
 ) -> Dict[str, Any]:
@@ -160,7 +147,7 @@ class OpImplVariant:
 
     Each subclass owns the full lifecycle: selection (matches + plevel),
     configuration (resolve), verification (validate_config), and code
-    generation (build_template_params, build_ports, footprint, pack, get_artifacts).
+    generation (build_template_params, build_ports, pack, get_artifacts).
     """
 
     variant_id: ClassVar[str] = ''
@@ -259,10 +246,6 @@ class OpImplVariant:
         _port: int,
     ) -> Any:
         return None
-
-    def footprint(self, _node: OpNode, config: Any) -> OpImplFootprint:
-        """The tiles its kernels span: a cascade of `cas_length` across, `cas_num` chains down."""
-        return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
 
     def work(self, node: OpNode, config: Any) -> Optional[int]:
         """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which designs

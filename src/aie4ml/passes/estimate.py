@@ -24,18 +24,19 @@ def kernel_cycles(inst, device) -> int:
     are taken as spread evenly over its tiles; its multiply-accumulates per tile are its variant's `work`."""
     node, config = inst.node, inst.config
     work = inst.variant.work(node, config)
-    footprint = inst.variant.footprint(node, config)
+    parallelism = config.parallelism
     widths = [element_bytes(inst.variant.input_precision(config, item.role)) for item in inst.inputs]
     loads = sum(prod(inst.port_views[item.tensor].tile) * width for item, width in zip(inst.inputs, widths))
-    parameters = [t for t in node.inputs if t.is_parameter]
-    loads += sum(
+    parameter_bytes = sum(
         prod(t.shape) * element_bytes(resolve_exact_storage_dtype(t.precision, namespace=t.name, layer_name=node.name))
-        for t in parameters
-    ) // (footprint.width * footprint.height)
+        for t in node.inputs
+        if t.is_parameter
+    )
+    loads += parameter_bytes // parallelism.tiles
     cycles = loads / LOAD_BYTES_PER_CYCLE
     if work is not None:
         cycles = max(cycles, work * widths[0] / device.int8_macs_per_cycle)  # the peak halves as operands widen
-    return round(cycles) + CALL_CYCLES + (footprint.width - 1) * CASCADE_HOP_CYCLES
+    return round(cycles) + CALL_CYCLES + (int(parallelism.cas_length) - 1) * CASCADE_HOP_CYCLES
 
 
 def leg_cycles(leg: Connection, realization: str, shared: bool, execution, device) -> Tuple[int, int]:

@@ -27,6 +27,11 @@ class ParallelismConfig:
     cas_length: int = 1
     contract: str = 'inner'
 
+    @property
+    def tiles(self) -> int:
+        """The tiles its kernels span: a cascade of `cas_length` across, `cas_num` chains down."""
+        return int(self.cas_length) * int(self.cas_num)
+
 
 def parse_directives(directives) -> tuple[dict, dict]:
     """Return (io_route, parallel_cfg) from a directives dict."""
