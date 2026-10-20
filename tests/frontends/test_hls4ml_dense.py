@@ -255,6 +255,30 @@ def test_a_permute_between_dense_layers_converts(tmp_path):
 
 
 @pytest.mark.aie_ir
+def test_two_permutes_compose(tmp_path):
+    """A transpose of a transpose folds as one view, the two permutations composed: two swaps read the plain tensor."""
+    _np, hls4ml, keras, qkeras = _imports()
+    q8 = qkeras.quantized_bits(8, 0, alpha=1)
+    model = keras.Sequential(
+        [
+            keras.layers.Input((16, 32)),
+            qkeras.QActivation(qkeras.quantized_bits(8, 2), name='in_q'),
+            qkeras.QDense(16, kernel_quantizer=q8, bias_quantizer=q8, name='fc1'),
+            qkeras.QActivation(qkeras.quantized_relu(8), name='relu1'),
+            keras.layers.Permute((2, 1), name='permute1'),
+            keras.layers.Permute((2, 1), name='permute2'),
+            qkeras.QDense(8, kernel_quantizer=q8, bias_quantizer=q8, name='fc2'),
+        ]
+    )
+    cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    aie_model = hls4ml.converters.convert_from_keras_model(
+        model, hls_config=cfg, output_dir=str(tmp_path), project_name='permutes', backend='aie', batch_size=1
+    )
+    fc2 = get_backend_context(aie_model).ir.execution.get('fc2_aie')
+    assert all(view.perm is None for view in fc2.port_views.values())
+
+
+@pytest.mark.aie_ir
 def test_a_keras_add_lowers_to_the_aie_add_and_other_merges_are_refused(tmp_path):
     """hls4ml calls a Keras Add a Merge layer with op 'add': it lowers to the AIE add, its operands in order. No AIE
     kernel implements another merge."""

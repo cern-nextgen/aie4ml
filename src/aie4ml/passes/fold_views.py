@@ -4,6 +4,7 @@ import numpy as np
 
 from ..ir import TraitInstance, get_backend_context
 from ..op_impls.family_registry import fuses, get_family_resolver_registry
+from ..op_impls.utils.io import view_layout
 from .base import AIEPass
 from .utils import keeps_values
 
@@ -86,15 +87,16 @@ class FoldViewOps(AIEPass):
                 'tensor; a view op must be recorded on the canonical tensor.'
             )
 
-        # buffer_order is derived (the fixed axis reversal); only perm is view data.
-        in_view = {
-            'perm': [int(p) for p in perm],
-        }
+        # A transpose folded into this one already permutes its input: its consumers read the two composed.
+        upstream = view_layout(node, in_tv, 'inputs').get('perm')
+        if upstream is not None:
+            perm = [int(upstream[axis]) for axis in perm]
 
         for consumer in out_tv.consumers:
             cons_view = self._io_view_data(consumer)
-            cons_view['inputs'][in_tv.name] = dict(in_view)
             cons_view['inputs'].pop(out_tv.name, None)
+            if perm != sorted(perm):  # one keeping every axis in place is no view; buffer_order is derived
+                cons_view['inputs'][in_tv.name] = {'perm': list(perm)}
             if out_tv.name in consumer.roles:
                 consumer.roles[in_tv.name] = consumer.roles.pop(out_tv.name)
 

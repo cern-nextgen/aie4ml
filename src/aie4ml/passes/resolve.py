@@ -111,12 +111,12 @@ def _check_views(node, config, variant) -> None:
     """
     for direction, tensors in (('inputs', node.inputs), ('outputs', node.outputs)):
         for tensor in tensors:
-            perm = _moved(view_layout(node, tensor, direction).get('perm'))
+            perm = view_layout(node, tensor, direction).get('perm')
             view = config.io_views.get(tensor.name)
-            if perm is not None and (view is None or _moved(view.perm) != perm):
+            if perm is not None and (view is None or view.perm != tuple(perm)):
                 raise NotImplementedError(
                     f'{node.name}: {variant.variant_id} does not read {tensor.name!r} through the io_view perm '
-                    f'{list(perm)} a folded transpose gave it.'
+                    f'{perm} a folded transpose gave it.'
                 )
     for name, view in config.io_views.items():
         if not view.is_transposed:
@@ -131,13 +131,6 @@ def _check_views(node, config, variant) -> None:
                 f'{node.name}: {name!r} is a transposed view staged in whole rows; the DMA needs a '
                 'microtiled staging to walk the grid in view order.'
             )
-
-
-def _moved(perm):
-    """`perm` as a tuple, or None where it keeps every axis in place."""
-    if perm is None or list(perm) == sorted(perm):
-        return None
-    return tuple(int(axis) for axis in perm)
 
 
 def _folded_views(node):
