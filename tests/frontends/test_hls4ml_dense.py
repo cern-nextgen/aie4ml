@@ -1,19 +1,14 @@
 """hls4ml/QKeras frontend: a QDense stack converted through the AIE backend."""
 
 import os
-import random
 from pathlib import Path
 
-import numpy as np
 import pytest
 from aie4ml.ir import get_backend_context
 
 keras = pytest.importorskip('keras')
 
 SEED = 123
-random.seed(SEED)
-np.random.seed(SEED)
-keras.utils.set_random_seed(SEED)
 
 
 def _require_vitis():

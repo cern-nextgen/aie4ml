@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip('keras')  # at collection, so the conftest seeds it for every test
+
 BATCH = 1
 ITERATIONS = 5
 
