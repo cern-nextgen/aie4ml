@@ -11,6 +11,7 @@ from typing import Any, Dict
 
 from .ir.graph import ExecutionInstance, OpNode
 from .op_impls.common_types import to_plain
+from .op_impls.family_registry import get_family_resolver_registry
 
 
 def dump_pipeline_ir(ctx, destination: Path) -> None:
@@ -32,6 +33,7 @@ def dump_pipeline_ir(ctx, destination: Path) -> None:
 
 
 def serialize_logical_node(node: OpNode) -> Dict[str, Any]:
+    family = get_family_resolver_registry().find(node.op_type)
     return {
         'name': node.name,
         'op_type': node.op_type,
@@ -39,6 +41,7 @@ def serialize_logical_node(node: OpNode) -> Dict[str, Any]:
         'outputs': [t.name for t in node.outputs],
         'traits': {name: trait.data for name, trait in node.traits.items()},
         'metadata': dict(node.metadata),
+        'macs': family.macs(node) if family is not None else 0,
     }
 
 

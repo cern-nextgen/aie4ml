@@ -7,6 +7,8 @@ import pytest
 from aie4ml.errors import ConfigRefused
 from aie4ml.ir.graph import shard_major_order
 from aie4ml.op_impls.utils.tensor_view import staging_tile_shape
+from aie4ml.report import _plan_ops
+from aie4ml.serialization import serialize_logical_node
 from helpers import (
     PART,
     TensorProto,
@@ -1152,6 +1154,16 @@ def test_folded_row_bands_and_channel_slices_each_get_a_folder(tmp_path):
     written = [fold.staging[fold.outputs[0]][port] for port in range(6)]
     read = [conv.staging[conv.inputs[0].tensor][port] for port in range(6)]
     assert [w['offset'] for w in written] == [r['offset'] for r in read]
+
+
+def test_a_folded_conv_counts_the_models_ops(tmp_path):
+    """The report rates a conv by the model's multiply-accumulates, not by the folded frame its kernel reads."""
+    model = _strided_model(stride=1, k=3, channels_in=2, channels_out=8, size=12, name='conv_folded_ops', pad=1)
+    ctx = lower(model, tmp_path)
+    conv = ctx.ir.execution.get('b_aie')
+    assert conv.config.input_fold is not None
+    plan = {'logical': [serialize_logical_node(node) for node in ctx.ir.logical]}
+    assert _plan_ops(plan) == 2 * (3 * 3 * 2) * (12 * 12 * 8)  # a multiply and an add per MAC
 
 
 @pytest.mark.requires_vitis

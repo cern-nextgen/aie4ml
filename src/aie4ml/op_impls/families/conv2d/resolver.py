@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from ....ir.graph import VIEW_FLATTEN_2D, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import SpatialAccess2D
@@ -40,6 +42,12 @@ class Conv2dFamilyResolver(FamilyResolver):
 
     def spatial_access(self, node) -> SpatialAccess2D:
         return spatial_access_of(node)
+
+    def macs(self, node) -> int:
+        """`kh * kw * Cin / groups` for each output element of an image, whether written as a frame or flattened."""
+        kh, kw = (int(k) for k in node.metadata['kernel_shape'])
+        channels_in = int(input_tensor_for_role(node, 'lhs').shape[-1]) // int(node.metadata.get('groups', 1))
+        return kh * kw * channels_in * math.prod(node.outputs[0].shape[1:])
 
     def validate_structure(self, node, _device) -> None:
         lhs = input_tensor_for_role(node, 'lhs')

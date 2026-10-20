@@ -64,6 +64,11 @@ class FamilyResolver(ABC):
         speed, is slower. Internal: no user sets them."""
         return ()
 
+    def macs(self, _node: Any) -> int:
+        """Multiply-accumulates per inference as the model states the op, padding aside: what its throughput is
+        rated by. 0 for an op that multiplies nothing."""
+        return 0
+
     def spatial_access(self, _node: Any):
         """The 2-D window read around each output pixel (sizes its producer's frame), or None."""
         return None

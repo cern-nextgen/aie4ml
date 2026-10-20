@@ -174,44 +174,9 @@ def _convert_to_ns(value: float, unit: str) -> float:
 
 
 def _plan_ops(doc: Dict[str, Any]) -> int:
-    """MAC-equivalent ops per inference, from the plan rather than a live model.
-
-    Every multiplying op contributes: each output element costs one multiply and one add per
-    element of its reduction, which is the input features for a GEMM and `kh * kw * Cin / groups`
-    for a convolution.
-    """
-    shapes = {}
-    for entry in doc.get('execution', []):
-        for name, view in ((entry.get('config') or {}).get('io_views') or {}).items():
-            shapes[name] = view.get('logical') or []
-    ops = 0
-    for node in doc.get('logical', []):
-        meta = node.get('metadata') or {}
-        out = shapes.get((node.get('outputs') or [None])[0]) or []
-        inputs = [shapes.get(name) or [] for name in (node.get('inputs') or [])]
-        if not out:
-            continue
-        if node.get('op_type') in ('dense', 'matmul') and 'n_in' in meta:
-            reduction, outputs = int(meta['n_in']), int(meta['n_out'])
-            independent = _prod(out[:-1])
-        elif node.get('op_type') == 'conv2d' and inputs and len(inputs[0]) == 4:
-            kh, kw = (int(k) for k in meta['kernel_shape'])
-            channels_in = int(inputs[0][-1]) // int(meta.get('groups', 1))
-            # A flattened output is one row of every output pixel and channel.
-            outputs = int(inputs[1][-1]) if len(inputs) > 1 and inputs[1] else int(out[-1])
-            reduction = kh * kw * channels_in
-            independent = _prod(out[1:]) // outputs if len(out) == 2 else _prod(out[1:-1])
-        else:
-            continue
-        ops += 2 * reduction * outputs * independent
-    return ops
-
-
-def _prod(dims) -> int:
-    total = 1
-    for dim in dims:
-        total *= int(dim)
-    return total
+    """Ops per inference, from the plan rather than a live model: a multiply and an add for each multiply-accumulate
+    its families count (`FamilyResolver.macs`)."""
+    return 2 * sum(int(node['macs']) for node in doc.get('logical', []))
 
 
 def _critical_path(edges: List[tuple], stage_cycles: Dict[str, int]) -> Dict[str, Any]:

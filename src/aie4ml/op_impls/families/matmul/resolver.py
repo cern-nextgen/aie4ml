@@ -448,6 +448,10 @@ class _MatmulFamilyBase(FamilyResolver):
     def microtiling_candidates(self, node, device):
         return matmul_microtiling_candidates(node, device)
 
+    def macs(self, node) -> int:
+        """One per element of the reduction, for each output element."""
+        return int(input_tensor_for_role(node, 'lhs').shape[-1]) * math.prod(node.outputs[0].shape)
+
     def reorder_reduction_rows(self, node, tensor, order) -> None:
         rhs = input_tensor_for_role(node, 'rhs')
         order = np.asarray(order)
