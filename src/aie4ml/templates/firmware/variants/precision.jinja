@@ -1,0 +1,5 @@
+{% macro rounding(mode) %}
+#if __cplusplus >= 202002L
+  static constexpr auto ROUNDING   = aie::rounding_mode::{{ mode }};
+  static constexpr auto SATURATION = aie::saturation_mode::saturate;
+#endif{% endmacro %}

@@ -1,5 +1,6 @@
 {% set P = L.op_impl.parameters %}
 {% from 'variants/placement.jinja' import buffer_locations %}
+{% from 'variants/precision.jinja' import rounding %}
 struct {{L.struct_name}} {
   using input_t  = {{P.precision.lhs.c_type}};
   using output_t = {{P.precision.output.c_type}};
@@ -26,12 +27,7 @@ struct {{L.struct_name}} {
   static constexpr int16_t EXP_B1 = -11004;
   static constexpr int16_t EXP_C0 = 16384;
   static constexpr int     EXP_ZF = 8;
-  static constexpr const char* ROUNDING_TOKEN = "floor";
-  static constexpr const char* SATURATION_TOKEN = "saturate";
-#if __cplusplus >= 202002L
-  static constexpr auto ROUNDING   = aie::rounding_mode::floor;
-  static constexpr auto SATURATION = aie::saturation_mode::saturate;
-#endif
+{{ rounding('floor') }}
 
   alignas(16) static inline int16_t B[CAS_NUM] = {
     {%- for v in P.packed_hccs.B -%}{{ v|int }}{{ ", " if not loop.last else "" }}{%- endfor -%}

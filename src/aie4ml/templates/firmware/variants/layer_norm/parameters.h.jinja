@@ -1,5 +1,6 @@
 {% set P = L.op_impl.parameters %}
 {% from 'variants/placement.jinja' import buffer_locations %}
+{% from 'variants/precision.jinja' import rounding %}
 struct {{L.struct_name}} {
   using input_t  = {{P.precision.lhs.c_type}};
   using output_t = {{P.precision.output.c_type}};
@@ -21,12 +22,7 @@ struct {{L.struct_name}} {
   static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
   static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
   static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.transpose_input else 'false' }};
-  static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
-  static constexpr const char* SATURATION_TOKEN = "saturate";
-#if __cplusplus >= 202002L
-  static constexpr auto ROUNDING   = aie::rounding_mode::{{ P.rounding_mode }};
-  static constexpr auto SATURATION = aie::saturation_mode::saturate;
-#endif
+{{ rounding(P.rounding_mode) }}
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};
 };

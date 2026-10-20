@@ -1,4 +1,5 @@
 {% from 'variants/placement.jinja' import buffer_locations %}
+{% from 'variants/precision.jinja' import rounding %}
 {% set P = L.op_impl.parameters %}
 struct {{L.struct_name}} {
   using data_t = {{P.precision.lhs.c_type}};
@@ -65,10 +66,5 @@ struct {{L.struct_name}} {
   using acc_scalar_t = {{ P.accumulator_tag }};
   // The partial sums a cascade carries: the mmul's own accumulator.
   using cascade_t = {{ P.cascade_accumulator_tag }};
-  static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
-  static constexpr const char* SATURATION_TOKEN = "saturate";
-#if __cplusplus >= 202002L
-  static constexpr auto ROUNDING   = aie::rounding_mode::{{ P.rounding_mode }};
-  static constexpr auto SATURATION = aie::saturation_mode::saturate;
-#endif
+{{ rounding(P.rounding_mode) }}
 };
