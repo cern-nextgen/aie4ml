@@ -4,13 +4,16 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 from ..errors import ConfigRefused
-from ..ir.graph import has_input_role
+from ..ir.graph import VIEW_FLATTEN_2D, has_input_role
 from .utils import requested_port_kinds
 
 if TYPE_CHECKING:
     from .base import OpImplVariant
 
 COMMON_DIRECTIVES = frozenset({'placement', 'io_route', 'ports'})
+# What a kernel may fuse, as the passes ask (`fuses`) and `fusions_of` names a node's: a variant declares from these.
+FUSIONS = frozenset({'bias', 'relu', 'max_pool', 'output_scale', 'input_scale', 'apply_alpha'})
+OUTPUT_VIEWS = frozenset({VIEW_FLATTEN_2D})
 
 
 def fusions_of(node: Any) -> frozenset:

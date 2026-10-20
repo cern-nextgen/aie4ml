@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .base import OpImplVariant
+from .family_registry import FUSIONS, OUTPUT_VIEWS
 
 _TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / 'templates' / 'firmware' / 'variants'
 
@@ -32,6 +33,9 @@ def register_variant(cls):
     missing = [hook for hook in ('matches', 'resolve') if getattr(cls, hook) is getattr(OpImplVariant, hook)]
     if missing:
         raise TypeError(f'{cls.__name__}: registered for resolution to select, it must implement {missing}.')
+    unknown = sorted((cls.supported_fusions - FUSIONS) | (cls.supported_output_views - OUTPUT_VIEWS))
+    if unknown:
+        raise TypeError(f'{cls.__name__}: declares {unknown}, which no pass fuses; see FUSIONS and OUTPUT_VIEWS.')
     if cls.param_template:
         expected = _TEMPLATE_ROOT / cls.param_template / 'parameters.h.jinja'
         if not expected.exists():
