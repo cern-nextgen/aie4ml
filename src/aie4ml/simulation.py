@@ -11,7 +11,7 @@ import numpy as np
 
 from .aie_types import FLOAT_FORMATS, AIEDataType
 from .ir import get_backend_context
-from .quant_utils import apply_rounding, dtype_for_precision, handle_overflow
+from .quant_utils import dtype_for_precision, quantize_to_int
 
 log = logging.getLogger(__name__)
 
@@ -246,11 +246,7 @@ def _quantize_to_int(data: np.ndarray, dtype: AIEDataType) -> np.ndarray:
     if np.issubdtype(data.dtype, np.integer):
         return data.astype(dtype_for_precision(dtype.width, dtype.signed), copy=False)
 
-    scaled = np.ldexp(np.asarray(data, dtype=np.float64), int(dtype.frac))
-    rounded = apply_rounding(scaled, dtype.rounding)
-    integers = rounded.astype(np.int64, copy=False)
-    clipped = handle_overflow(integers, int(dtype.width), bool(dtype.signed), dtype.saturation)
-    return clipped.astype(dtype_for_precision(dtype.width, dtype.signed), copy=False)
+    return quantize_to_int(data, dtype.frac, int(dtype.width), bool(dtype.signed), dtype.rounding, dtype.saturation)
 
 
 def _framed(tiles: np.ndarray, port: IOPortLayout) -> np.ndarray:

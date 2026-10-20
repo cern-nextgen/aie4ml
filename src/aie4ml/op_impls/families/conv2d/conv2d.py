@@ -17,6 +17,7 @@ from ....ir.graph import (
     input_role,
     input_tensor_for_role,
 )
+from ....quant_utils import quantize_to_int
 from ...base import (
     LayoutConversion,
     OpImplFootprint,
@@ -50,7 +51,6 @@ from ..matmul.common import (
     describe_inner_output_staging,
     np_bias_dtype_for_spec,
     np_dtype_for_spec,
-    quantize_to_int,
     select_generation_key,
 )
 from ..matmul.config import MatmulMicrotileConfig

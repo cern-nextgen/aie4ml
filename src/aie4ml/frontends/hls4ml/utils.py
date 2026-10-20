@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -110,13 +111,7 @@ def _create_weight_tensors(layer, graph: LogicalIR):
         weight_data, weight_intent = weight_var.data, raw_intent
     else:
         weight_data = getattr(weight_var, 'data_unquantized', weight_var.data)
-        weight_intent = QuantIntent(
-            width=raw_intent.width,
-            frac=raw_intent.frac,
-            signed=raw_intent.signed,
-            rounding=RoundingMode.RND_CONV,
-            saturation=raw_intent.saturation,
-        )
+        weight_intent = replace(raw_intent, rounding=RoundingMode.RND_CONV)
 
     weight_tv = TensorVar(
         name=f'{layer.name}_weight',

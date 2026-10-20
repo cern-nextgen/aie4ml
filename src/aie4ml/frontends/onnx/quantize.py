@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
 from ...aie_types import QuantIntent
@@ -19,17 +21,7 @@ def _pin_if_unset(tensor, intent: QuantIntent, *, force_signed: bool) -> None:
     """Pin an un-quantized activation to a downstream Quantize's intent."""
     if tensor is None or tensor.is_parameter or tensor.precision is not None:
         return
-    tensor.precision = (
-        QuantIntent(
-            width=int(intent.width),
-            frac=int(intent.frac),
-            signed=True,
-            rounding=intent.rounding,
-            saturation=intent.saturation,
-        )
-        if force_signed
-        else intent
-    )
+    tensor.precision = replace(intent, signed=True) if force_signed else intent
 
 
 def _pin_back(tensor, intent: QuantIntent, *, force_signed: bool = False) -> None:

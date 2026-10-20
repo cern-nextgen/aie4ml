@@ -87,3 +87,22 @@ def handle_overflow(
         return np.clip(values, sym_min, info.max)
 
     raise ValueError(f'Unsupported saturation mode {mode}')
+
+
+def quantize_to_int(
+    array: np.ndarray,
+    frac_bits: int,
+    target_bits: int,
+    signed: bool = True,
+    rounding_mode=None,
+    saturation_mode=None,
+) -> np.ndarray:
+    """Float data as fixed-point integers at `frac_bits`, rounded and saturated to `target_bits`."""
+    if array is None:
+        return None
+    scaled = np.ldexp(np.asarray(array, dtype=np.float64), int(frac_bits))
+    rounded = apply_rounding(scaled, rounding_mode)
+    integers = rounded.astype(np.int64)
+    processed = handle_overflow(integers, target_bits, signed, saturation_mode)
+    dtype = dtype_for_precision(target_bits, signed)
+    return processed.astype(dtype, copy=False)

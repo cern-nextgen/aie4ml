@@ -7,7 +7,6 @@ import numpy as np
 from ....aie_types import FLOAT_FORMATS, FloatIntent
 from ....errors import ConfigRefused
 from ....ir.graph import STAGING_CONTRACTS, input_tensor_for_role
-from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 from ...utils import (
     STORAGE_LAYOUT_LINEAR,
     AxisPlan,
@@ -358,25 +357,6 @@ def pack_as_float(array: np.ndarray, fmt) -> np.ndarray:
         f32 = np.asarray(array, dtype=np.float32)
         return np.asarray(vfloat32_to_fp8(f32), dtype=np.uint8)
     return np.asarray(array, dtype=np.float32)
-
-
-def quantize_to_int(
-    array: np.ndarray,
-    frac_bits: int,
-    target_bits: int,
-    signed: bool = True,
-    rounding_mode=None,
-    saturation_mode=None,
-) -> np.ndarray:
-    """Quantize float weight/bias data to fixed-point integers for mmul kernels."""
-    if array is None:
-        return None
-    scaled = np.ldexp(np.asarray(array, dtype=np.float64), int(frac_bits))
-    rounded = apply_rounding(scaled, rounding_mode)
-    integers = rounded.astype(np.int64)
-    processed = handle_overflow(integers, target_bits, signed, saturation_mode)
-    dtype = dtype_for_precision(target_bits, signed)
-    return processed.astype(dtype, copy=False)
 
 
 def pack_mmul_rhs_matrix(

@@ -70,7 +70,7 @@ def test_a_recorded_design_is_built_again_without_a_search(tmp_path):
 def test_fixed_point_scaling_holds_for_a_step_coarser_than_one(frac):
     """A negative frac (bit-exact types of coarse constants) scales by 2**frac like any other, never by 1."""
     from aie4ml.aie_types import AIEDataType, RoundingMode, SaturationMode
-    from aie4ml.op_impls.families.matmul.common import quantize_to_int
+    from aie4ml.quant_utils import quantize_to_int
     from aie4ml.simulation import _quantize_to_int
 
     values = np.array([-8.0, 4.0, 12.0])

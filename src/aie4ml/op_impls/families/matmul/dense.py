@@ -13,6 +13,7 @@ from ....ir.graph import (
     input_tensor_for_role,
     shard_major_order,
 )
+from ....quant_utils import quantize_to_int
 from ...base import OpImplVariant, StreamLocation, cascade_locations, cascade_ports, rom_artifact
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
@@ -39,7 +40,6 @@ from .common import (
     pack_as_float,
     pack_mmul_rhs_matrix,
     pack_vector_by_n_slice,
-    quantize_to_int,
     requested_contract,
 )
 from .config import DenseConfig, DenseFlags
