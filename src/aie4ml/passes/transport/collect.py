@@ -4,7 +4,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ...errors import ConfigRefused
 from ...ir import ExecutionView, OpNode
-from ...op_impls.utils.tensor_view import map_view_axis
 from .model import Connection, EdgeEntry, Endpoint
 
 
@@ -244,14 +243,12 @@ class TransportCollector:
 
     @staticmethod
     def _view_axis_to_buffer_dim(view, axis: int) -> int:
+        """The buffer position of a view op's axis. Folding records view ops on the canonical tensor, so the axis is
+        logical whatever perm the port reads the tensor through."""
         rank = int(view.rank)
-        normalized = int(axis)
-        if normalized < 0:
-            normalized += rank
-        if normalized < 0 or normalized >= rank:
+        if not 0 <= int(axis) < rank:
             raise ValueError(f'view axis {axis} is out of range for rank {rank}.')
-        real_axis = map_view_axis(view, normalized)
-        return int(view.buffer_order.index(int(real_axis)))
+        return int(view.buffer_order.index(int(axis)))
 
     # -------------------------------------------------------------------------
     # Group edges

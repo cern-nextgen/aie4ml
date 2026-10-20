@@ -325,6 +325,47 @@ def test_concat_of_transposed_values_joins_the_canonical_axis(tmp_path):
     assert {('first_aie.out1[0]', 'tail_aie.in1[0]'), ('second_aie.out1[0]', 'tail_aie.in1[1]')} <= edges
 
 
+def _concat_read_transposed_model(axis: int):
+    """Two [8, 16] values joined on `axis` and read through a transpose, by a softmax over the joined rows (AIE-ML)."""
+    nodes, initializers = [], []
+    first_input, second_input = _input(nodes, initializers, 'a', 8), _input(nodes, initializers, 'b', 8)
+    first = _dense(nodes, initializers, 'a', 'first', seed=1)
+    second = _dense(nodes, initializers, 'b', 'second', seed=2)
+    nodes.append(helper.make_node('Concat', [first, second], ['joined'], name='concat', axis=axis))
+    nodes.append(helper.make_node('Softmax', [_transposed(nodes, 'joined', 'joined_t')], ['sm'], name='sm', axis=-1))
+    qdq(nodes, 'sm', 'y', 'smo')
+    initializers.extend(qparams('smo', frac=8, unsigned=True))
+    return make_model(
+        'concat_read_transposed',
+        nodes=nodes,
+        inputs=[first_input, second_input],
+        outputs=[('y', TensorProto.FLOAT, [16, 16] if axis == 0 else [32, 8])],
+        initializers=initializers,
+    )
+
+
+CONCAT_READ_TRANSPOSED = {'first': _parallelism(1), 'second': _parallelism(1), 'sm': {'parallelism': {'cas_num': 2}}}
+
+
+def test_a_concat_read_through_a_transpose_splits_its_canonical_axis(tmp_path):
+    """The concat axis names the canonical tensor whatever perm its reader views it through: two softmax row bands of
+    the transposed value are the two inputs joined on features, and each reads both inputs joined on rows."""
+    lower(_concat_read_transposed_model(1), tmp_path / 'features', CONCAT_READ_TRANSPOSED)
+    with pytest.raises(ConfigRefused, match='does not fit exactly inside one concat input slice'):
+        lower(_concat_read_transposed_model(0), tmp_path / 'rows', CONCAT_READ_TRANSPOSED)
+
+
+@pytest.mark.requires_vitis
+def test_a_concat_read_through_a_transpose_matches_onnx(tmp_path):
+    from helpers import assert_x86_matches_onnx
+
+    rng = np.random.default_rng(0)
+    feeds = {name: rng.integers(-20, 20, size=(8, 16), dtype=np.int8) for name in ('a_q', 'b_q')}
+    assert_x86_matches_onnx(
+        _concat_read_transposed_model(1), feeds, CONCAT_READ_TRANSPOSED, tmp_path, frac=8, max_code_diff=1
+    )
+
+
 def test_concat_of_differently_viewed_values_is_refused(tmp_path):
     with pytest.raises(ValueError, match=r'different axis orders .* canonical axis \[0, 1\]'):
         lower(_transposed_concat_model(second_transposed=False), tmp_path, part=AIE1_PART)
