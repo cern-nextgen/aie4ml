@@ -3,6 +3,7 @@
 import pytest
 from aie4ml.device_catalog import resolve_device
 from aie4ml.errors import ConfigRefused
+from aie4ml.op_impls.utils import TraversalStep
 from aie4ml.passes.transport.dma_resources import memtile_port_bds, pool_use, tile_port_bds
 
 AIE_ML, AIE_MLV2 = 'AIE-ML', 'AIE-MLV2'
@@ -10,7 +11,7 @@ AIE_ML, AIE_MLV2 = 'AIE-ML', 'AIE-MLV2'
 
 def _walk(tile, extent, boundary=None, offset=(0, 0)):
     """A 2-D memory-tile walk of `tile`-sized tiles over `extent`, the data ending at `boundary`."""
-    traversal = [{'dimension': d, 'stride': t, 'wrap': e // t} for d, (t, e) in enumerate(zip(tile, extent)) if e > t]
+    traversal = [TraversalStep(d, t, e // t) for d, (t, e) in enumerate(zip(tile, extent)) if e > t]
     desc = {'tiling_dimension': list(tile), 'offset': list(offset), 'tile_traversal': traversal}
     if boundary is not None:
         desc['boundary_dimension'] = list(boundary)
@@ -40,10 +41,10 @@ def _frame_walk(cols, rows, offset=(0, 0, 0, 0), boundary=None):
         'tiling_dimension': [8, 1, 1, 1],
         'offset': list(offset),
         'tile_traversal': [
-            {'dimension': 1, 'stride': 1, 'wrap': cols},
-            {'dimension': 2, 'stride': 1, 'wrap': rows},
-            {'dimension': 3, 'stride': 1, 'wrap': 1},
-            {'dimension': 0, 'stride': 8, 'wrap': 1},
+            TraversalStep(1, 1, cols),
+            TraversalStep(2, 1, rows),
+            TraversalStep(3, 1, 1),
+            TraversalStep(0, 8, 1),
         ],
     }
     if boundary is not None:
@@ -85,7 +86,7 @@ def test_a_compute_tile_port_repeats_its_bd_for_every_loop_past_the_dma_dimensio
     dma = resolve_device('xilinx_vek280_base_202610_1', {})[0].tile_dma
 
     def walk(*wraps):
-        return {'tile_traversal': [{'dimension': d, 'stride': 1, 'wrap': w} for d, w in enumerate(wraps)]}
+        return {'tile_traversal': [TraversalStep(d, 1, w) for d, w in enumerate(wraps)]}
 
     assert tile_port_bds(None, 2, dma, AIE_ML, 8) == 2  # linear
     assert tile_port_bds(walk(8, 4, 1), 2, dma, AIE_ML, 8) == 2  # the chunk and two loops: one BD per buffer (measured)
@@ -108,6 +109,6 @@ def test_an_aie1_tile_port_walks_one_loop_per_bd_but_an_output_word_walks_two(ac
     walk = {
         'access': access,
         'tiling_dimension': [chunk, 1, 1],
-        'tile_traversal': [{'dimension': d, 'stride': 1, 'wrap': w} for d, w in enumerate(wraps)],
+        'tile_traversal': [TraversalStep(d, 1, w) for d, w in enumerate(wraps)],
     }
     assert tile_port_bds(walk, 2, dma, 'AIE', 8) == bds

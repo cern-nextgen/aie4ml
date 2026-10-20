@@ -14,6 +14,7 @@ from aie4ml.ir import TraitInstance
 from aie4ml.op_impls.common_types import PortBinding, kernel_endpoints, to_plain
 from aie4ml.op_impls.families.matmul.common import select_generation_key
 from aie4ml.op_impls.families.matmul.matmul import MatmulOpImplVariant, MatmulRowWiseOpImplVariant
+from aie4ml.op_impls.utils import TraversalStep
 from aie4ml.op_impls.utils.precision import infer_accumulator_tag
 from aie4ml.passes import PackKernelArtifacts, Resolve
 from aie4ml.writer import AIEProjectEmitter
@@ -570,9 +571,9 @@ def test_aie1_direct_boundaries_publish_linear_io_and_dma_accesses(tmp_path):
         assert descriptor['buffer_dimension'] == [16, 2, 4]
         assert descriptor['tiling_dimension'] == [8, 1, 1]
         assert descriptor['tile_traversal'] == [
-            {'dimension': 1, 'stride': 1, 'wrap': 2},
-            {'dimension': 0, 'stride': 8, 'wrap': 2},
-            {'dimension': 2, 'stride': 1, 'wrap': 4},
+            TraversalStep(1, 1, 2),
+            TraversalStep(0, 8, 2),
+            TraversalStep(2, 1, 4),
         ]
 
     AIEProjectEmitter().emit(aie_model.context)
@@ -790,9 +791,9 @@ def test_direct_padded_output_uses_dma_projection(tmp_path):
     assert descriptor['buffer_dimension'] == [16, 2, 4]
     assert descriptor['tiling_dimension'] == [8, 1, 1]
     assert descriptor['tile_traversal'] == [
-        {'dimension': 1, 'stride': 1, 'wrap': 1},
-        {'dimension': 0, 'stride': 8, 'wrap': 2},
-        {'dimension': 2, 'stride': 1, 'wrap': 4},
+        TraversalStep(1, 1, 1),
+        TraversalStep(0, 8, 2),
+        TraversalStep(2, 1, 4),
     ]
 
 
@@ -832,7 +833,7 @@ def test_a_batch_below_the_padded_tile_moves_only_its_rows(tmp_path):
     )
     aie_model.run_pipeline()
     for io in aie_model.context.ir.physical.plan['io_ports']:
-        walks = {step['dimension']: step['wrap'] for step in io['descriptor']['tile_traversal']}
+        walks = {step.dimension: step.wrap for step in io['descriptor']['tile_traversal']}
         assert io['staging']['tiling_dimension'][1] == 4 and walks[2] == 1, io['direction']
 
 

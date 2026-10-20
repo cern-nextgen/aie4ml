@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Tuple
 
+from .utils.tensor_view import StagingDescriptor
+
 PORT_KIND_BUFFER = 'buffer'
 PORT_KIND_STREAM = 'stream'
 PORT_KINDS = frozenset({PORT_KIND_BUFFER, PORT_KIND_STREAM})
@@ -52,6 +54,8 @@ class PortMap:
 
 
 def to_plain(value: Any):
+    if isinstance(value, StagingDescriptor):
+        return to_plain(value.to_dict())
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):

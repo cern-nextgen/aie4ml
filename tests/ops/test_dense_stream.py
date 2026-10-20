@@ -142,10 +142,10 @@ def test_stream_dense_io_ports_carry_padded_tiles(stream_dense_model, tmp_path):
     l1, l2 = ctx.ir.execution.get('l1_aie'), ctx.ir.execution.get('l2_aie')
     out_desc = l1.staging[l1.node.outputs[0].name][1]
     in_desc = l2.staging[l2.node.inputs[0].name][1]
-    assert out_desc['storage_layout'] == in_desc['storage_layout'] == 'linear'
-    assert out_desc['tiling_dimension'] == in_desc['tiling_dimension'] == [16, ROWS]
-    assert out_desc['io_tiling_dimension'] == in_desc['io_tiling_dimension'] == [HIDDEN // 2, ROWS]
-    assert out_desc['offset'] == in_desc['offset'] == [16, 0]
+    assert out_desc.storage_layout == in_desc.storage_layout == 'linear'
+    assert out_desc.tiling_dimension == in_desc.tiling_dimension == (16, ROWS)
+    assert out_desc.io_tiling_dimension == in_desc.io_tiling_dimension == (HIDDEN // 2, ROWS)
+    assert out_desc.offset == in_desc.offset == (16, 0)
 
 
 def test_stream_dense_emits_stream_graph(stream_dense_model, tmp_path):

@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 from ...aie_types import AIEDataType
 from ...ir import get_backend_context
 from ...op_impls.common_types import PORT_KIND_STREAM
-from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, staging_tile_shape
+from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, StagingDescriptor, traversed_shape
 from ...utils import sanitize_identifier
 from ..base import AIEPass
 from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, hand_over_problem
@@ -200,7 +200,8 @@ class _MemoryPlanMaterializer:
         for graph_port, consumer_port in zip(graph_ports, consumer_ports):
             endpoint = f'{consumer_id}.{consumer.group}[{int(consumer_port)}]'
             staging = graph_input_writer_port_descriptor(entry, int(graph_port))
-            descriptor = graph_input_port_descriptor(entry, int(graph_port))
+            port_staging = graph_input_port_descriptor(entry, int(graph_port))
+            descriptor = port_staging.to_dict()
 
             self.direct_edges.append(
                 {
@@ -216,7 +217,7 @@ class _MemoryPlanMaterializer:
                 # A padded microtiled buffer takes only the logical rows the PLIO carries, as its output does;
                 # left to walk the whole buffer, the DMA would wait for rows the host never sends.
                 descriptor, transfer = direct_boundary_access(
-                    descriptor, staging['io_tiling_dimension'], element_bits=int(element.width), output=False
+                    port_staging, staging['io_tiling_dimension'], element_bits=int(element.width), output=False
                 )
                 if transfer is not None:
                     staging['tiling_dimension'] = [int(value) for value in transfer]  # the host pads to it
@@ -252,7 +253,6 @@ class _MemoryPlanMaterializer:
             endpoint = f'{producer_id}.{producer.group}[{int(producer_port)}]'
             base = inst.staging[producer.tensor][int(producer_port)]
             staging = _host_visible_output_staging(base, stream=stream)
-            descriptor = dict(base)
             graph_port = self._next_graph_output_port
             self._next_graph_output_port += 1
 
@@ -264,15 +264,17 @@ class _MemoryPlanMaterializer:
                 }
             )
             if stream:
-                require_linear_stream_staging(entry.logical_tensor, descriptor)
+                require_linear_stream_staging(entry.logical_tensor, base)
+                descriptor = base.to_dict()
             else:
                 descriptor, transfer = direct_boundary_access(
-                    descriptor, staging['io_tiling_dimension'], element_bits=int(element.width), output=True
+                    base, staging['io_tiling_dimension'], element_bits=int(element.width), output=True
                 )
                 # What the PLIO carries per iteration: the projected transfer (logical rows, columns
                 # rounded up to the microtile) or the whole tile; the host trims to io_tiling.
                 transfer = transfer or list(staging['tiling_dimension'])
-                if int(prod(transfer)) != int(prod(staging_tile_shape(descriptor))):
+                walked = traversed_shape(descriptor['tiling_dimension'], descriptor['tile_traversal'])
+                if int(prod(transfer)) != int(prod(walked)):
                     raise RuntimeError(f'{entry.logical_tensor}: boundary DMA transfer does not match its descriptor.')
                 staging['tiling_dimension'] = [int(value) for value in transfer]
                 endpoints = binding.endpoints[int(producer_port)]
@@ -312,7 +314,7 @@ class _MemoryPlanMaterializer:
             else:
                 inst = self._kernel_inst(producer.node)
                 staging = inst.staging[producer.tensor][port]
-                writers.append((port, staging, port_layout(staging).shifted(producer.offset_base)))
+                writers.append((port, staging.to_dict(), port_layout(staging).shifted(producer.offset_base)))
         readers = []  # (port, staging, layout, zero padding)
         if entry.consumers:
             consumer = entry.single_consumer()
@@ -321,7 +323,7 @@ class _MemoryPlanMaterializer:
                 staging = inst.staging[consumer.tensor][port]
                 # A reader that fills its own border takes its padding as it finds it.
                 layout = port_layout(staging).shifted(consumer.offset_base)
-                readers.append((port, staging, layout, 'boundary_dimension' in staging))
+                readers.append((port, staging.to_dict(), layout, staging.boundary_dimension is not None))
         if entry.graph_output:
             inst = self._kernel_inst(producer.node)
             for port in p_ports:
@@ -471,9 +473,7 @@ class _MemoryPlanMaterializer:
         inst = self._kernel_inst(producer.node)
         base = inst.staging[producer.tensor][port]
         staging = _host_visible_output_staging(base)
-        staging['tiling_dimension'] = self._whole_beats(
-            entry, staging['tiling_dimension'], int(base['inner_dimension'])
-        )
+        staging['tiling_dimension'] = self._whole_beats(entry, staging['tiling_dimension'], base.inner_dimension)
         return staging
 
     def _whole_beats(self, entry: EdgeEntry, tile: List[int], inner: int) -> List[int]:
@@ -501,7 +501,7 @@ class _MemoryPlanMaterializer:
         return stem if idx == 1 else f'{stem}_{idx}'
 
 
-def _host_visible_output_staging(base: Dict[str, Any], *, stream: bool = False) -> Dict[str, Any]:
+def _host_visible_output_staging(base: StagingDescriptor, *, stream: bool = False) -> Dict[str, Any]:
     """
     Rewrite a producer output descriptor for host-visible graph output.
 
@@ -512,10 +512,8 @@ def _host_visible_output_staging(base: Dict[str, Any], *, stream: bool = False) 
     shape stays the staging `tiling_dimension`.
     """
 
-    desc = dict(base)
-    desc['buffer_dimension'] = list(base['io_boundary_dimension'])
-    desc['offset'] = list(base['offset'])
-    desc['logical_origin'] = list(base['logical_origin'])
-    desc['tiling_dimension'] = list(base['tiling_dimension'] if stream else base['io_tiling_dimension'])
+    desc = base.to_dict()
+    desc['buffer_dimension'] = list(base.io_boundary_dimension)
+    desc['tiling_dimension'] = list(base.tiling_dimension if stream else base.io_tiling_dimension)
     desc['storage_layout'] = STORAGE_LAYOUT_LINEAR
     return desc

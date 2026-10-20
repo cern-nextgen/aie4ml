@@ -40,7 +40,7 @@ def memtile_staging_failure(execution, endpoints) -> str | None:
         stagings = inst.staging[endpoint.tensor]
         if endpoint.tensor not in inst.ports.outputs:
             stagings = stagings[:1]
-        if 'transfer_bytes' in stagings[0]:
+        if stagings[0].transfer_bytes is not None:
             return (
                 f'{endpoint.node.name}.{endpoint.group} frames each inference as a padded transfer, which '
                 'memtile staging does not implement'
@@ -101,7 +101,7 @@ def direct_pairing(
         """Why one buffer cannot serve both ports: some position holds a different element, as data or padding."""
         source_staging, target_staging = written(p_port), read(c_port)
         where = f'{producer.node.name}.{producer.group}[{p_port}] -> {consumer.node.name}.{consumer.group}[{c_port}]'
-        if source_staging.get('transfer_bytes') != target_staging.get('transfer_bytes'):
+        if source_staging.transfer_bytes != target_staging.transfer_bytes:
             return f'staging mismatch at {where}: the ports frame each inference as different transfers'
         source = port_layout(source_staging).shifted(producer.offset_base).canonical()
         target = port_layout(target_staging).shifted(consumer.offset_base).canonical()
@@ -116,7 +116,7 @@ def direct_pairing(
         data and padding alike."""
         stagings = [written(p) for p in producer_ports]
         target_staging = read(c_port)
-        if any('transfer_bytes' in staging for staging in (*stagings, target_staging)):
+        if any(staging.transfer_bytes is not None for staging in (*stagings, target_staging)):
             return False
         sources = [port_layout(staging).shifted(producer.offset_base).elements() for staging in stagings]
         coords, data = port_layout(target_staging).shifted(consumer.offset_base).elements()

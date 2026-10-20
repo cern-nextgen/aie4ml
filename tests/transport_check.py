@@ -31,9 +31,7 @@ def walk(desc):
     dims = [int(d) for d in desc['buffer_dimension']]
     rank = len(dims)
     coords = np.array([desc['offset']], dtype=np.int64)
-    loops = [
-        (int(s['dimension']), int(s['wrap']), int(s['stride'])) for s in reversed(desc.get('tile_traversal') or [])
-    ]
+    loops = [(step.dimension, step.wrap, step.stride) for step in reversed(desc.get('tile_traversal') or [])]
     loops += [(axis, int(desc['tiling_dimension'][axis]), 1) for axis in reversed(range(rank))]
     for axis, count, step in loops:  # slowest first
         steps = np.zeros((count, rank), dtype=np.int64)
@@ -118,7 +116,7 @@ class _Plan:
     def _consumer(self, endpoint, producer, port):
         inst = self.execution.get(endpoint.node.name)
         staging = inst.staging[endpoint.tensor][port]
-        return port_layout(staging).shifted(endpoint.offset_base), 'boundary_dimension' in staging
+        return port_layout(staging).shifted(endpoint.offset_base), staging.boundary_dimension is not None
 
     def _tags(self, producer, host_port=None):
         """The tags of a leg's tensor: the span of its producer's data, or the graph input's extent."""

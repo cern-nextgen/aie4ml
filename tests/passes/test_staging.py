@@ -258,7 +258,7 @@ def test_a_split_port_holds_the_slice_its_weights_are_packed_for(tmp_path):
     inst = ctx.ir.execution.get('d2_aie')
     for port in range(2):
         staging = inst.staging[inst.node.inputs[0].name][port]
-        assert staging['logical_origin'] == staging['offset']
+        assert staging.logical_origin == staging.offset
 
 
 def test_a_split_that_leaves_a_stage_no_data_is_refused(tmp_path):

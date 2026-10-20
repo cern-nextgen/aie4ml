@@ -93,9 +93,7 @@ def port_staging(node, variant, config, ports) -> dict[str, tuple]:
     ):
         for tensor, binding in bindings.items():
             staging[tensor] = tuple(describe(node, config, tensor, port) for port in range(int(binding.count)))
-            origins = {
-                tuple(int(o) - int(b) for o, b in zip(s['logical_origin'], s['offset'])) for s in staging[tensor]
-            }
+            origins = {tuple(o - b for o, b in zip(s.logical_origin, s.offset)) for s in staging[tensor]}
             if len(origins) > 1:
                 raise RuntimeError(
                     f"{node.name}: the ports of {tensor!r} place its frame at {sorted(origins)}; each port's "

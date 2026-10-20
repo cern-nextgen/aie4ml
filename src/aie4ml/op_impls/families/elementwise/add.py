@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import ClassVar
 
@@ -33,7 +34,7 @@ from ...utils.precision import (
     resolve_exact_storage_dtype,
     storage_bytes_for_spec,
 )
-from ...utils.tensor_view import microtile_from_staging, staging_tile_shape
+from ...utils.tensor_view import microtile_from_staging
 from .common import elementwise_vec_size
 from .config import AddConfig, AddFlags
 
@@ -57,7 +58,7 @@ def _adopted_contract(node: OpNode, input_contracts, max_elements: int):
     tile = math.prod(contract.view.tile)
     if tile > max_elements:
         return None
-    if any(math.prod(staging_tile_shape(staging)) != tile for staging in contract.port_staging):
+    if any(math.prod(staging.tile_shape) != tile for staging in contract.port_staging):
         return None
     return contract
 
@@ -224,7 +225,7 @@ class AddOpImplVariant(OpImplVariant):
     def describe_input_staging(self, _node, config, tensor_name, port):
         if config.adopted_staging is not None:
             staging = config.adopted_staging[int(port)]
-            return {**staging, 'access': 'read', 'boundary_dimension': list(staging['io_boundary_dimension'])}
+            return dataclasses.replace(staging, access='read', boundary_dimension=staging.io_boundary_dimension)
         return describe_partition_staging(
             config.io_views[tensor_name],
             port,
@@ -234,7 +235,7 @@ class AddOpImplVariant(OpImplVariant):
 
     def describe_output_staging(self, node, config, tensor_name, port):
         if config.adopted_staging is not None:
-            return dict(config.adopted_staging[int(port)])
+            return config.adopted_staging[int(port)]
         return describe_partition_staging(
             config.io_views[tensor_name],
             port,

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
 from ...ir import OpNode
+from ...op_impls.utils import StagingDescriptor
 
 
 @dataclass(frozen=True)
@@ -95,7 +96,9 @@ class TransportUnit:
 
 @dataclass(frozen=True)
 class GraphInputSpec:
-    port_descriptors: Dict[int, Dict[str, Any]]
+    """Per graph-input port: the staging of the kernel port it feeds, in the leg's frame, and what the host writes."""
+
+    port_descriptors: Dict[int, StagingDescriptor]
     writer_descriptors: Dict[int, Dict[str, Any]]
 
 

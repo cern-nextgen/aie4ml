@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import copy
-from typing import Any, Dict, MutableMapping, Sequence
+import dataclasses
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -9,8 +9,8 @@ from ...errors import ConfigRefused
 from ...op_impls.utils import (
     STORAGE_LAYOUT_INNER_BLOCKED,
     STORAGE_LAYOUT_LINEAR,
-    STORAGE_LAYOUT_MICROTILED,
-    STORAGE_LAYOUTS,
+    StagingDescriptor,
+    TraversalStep,
 )
 
 BD_MAX_WRAP = 255
@@ -30,53 +30,46 @@ def describes_natural_order(desc: Dict[str, Any]) -> bool:
     chunk = [int(value) for value in desc['tiling_dimension']]
     if any(int(value) != 0 for value in desc['offset']):
         return False
-    walked = {int(step['dimension']): step for step in desc.get('tile_traversal', ())}
+    walked = {step.dimension: step for step in desc.get('tile_traversal', ())}
     for dim, extent in enumerate(dims):
         step = walked.get(dim)
         if step is None:
             if chunk[dim] != extent:
                 return False
-        elif int(step['wrap']) * chunk[dim] != extent:
+        elif step.wrap * chunk[dim] != extent:
             return False
-        elif int(step['wrap']) > 1 and int(step['stride']) != 1:  # one tile never uses its stride
+        elif step.wrap > 1 and step.stride != 1:  # one tile never uses its stride
             return False
     return sorted(walked) == list(walked)
 
 
 def boundary_access_descriptor(
-    base: Dict[str, Any], *, element_bits: int, project_to_io_boundary: bool = False
-) -> Dict[str, Any]:
-    """Lower a staging layout to an ADF graph-boundary access descriptor.
+    base: StagingDescriptor, *, element_bits: int, project_to_io_boundary: bool = False
+) -> Tuple[Dict[str, Any], Optional[List[int]]]:
+    """Lower a staging layout to an ADF graph-boundary access descriptor, and the shape the PLIO carries per
+    iteration where the walk projects the buffer onto its logical rows.
 
     `element_bits` is the port's element width: a storage layout says how a buffer is arranged,
     not what it holds, while a buffer descriptor counts words.
     """
-
-    storage_layout = base.get('storage_layout')
-    if storage_layout not in STORAGE_LAYOUTS:
-        raise ValueError(f'Unknown or missing staging storage_layout {storage_layout!r}.')
-    if storage_layout == STORAGE_LAYOUT_LINEAR:
-        return copy.deepcopy(base)
-    if storage_layout == STORAGE_LAYOUT_INNER_BLOCKED:
+    if base.storage_layout == STORAGE_LAYOUT_LINEAR:
+        return base.to_dict(), None
+    if base.storage_layout == STORAGE_LAYOUT_INNER_BLOCKED:
         if project_to_io_boundary:
             raise ConfigRefused('A blocked frame is transferred whole; the host trims it.')
-        return _inner_blocked_access_descriptor(base, int(element_bits))
-    if storage_layout != STORAGE_LAYOUT_MICROTILED:
-        raise ConfigRefused(f'No boundary DMA lowering for storage_layout {storage_layout!r}.')
+        return _inner_blocked_access_descriptor(base, int(element_bits)), None
 
-    dimensions = [int(value) for value in base['buffer_dimension']]
-    tile = [int(value) for value in base['tiling_dimension']]
-    if len(dimensions) != 2 or len(tile) != 2:
+    dimensions, tile = list(base.buffer_dimension), list(base.tiling_dimension)
+    if len(dimensions) != 2:
         raise ConfigRefused('Microtiled boundary DMA requires a 2-D kernel buffer.')
 
-    inner = int(base['inner_dimension'])
-    outer = int(base['outer_dimension'])
+    inner, outer = base.inner_dimension, base.outer_dimension
     microtile_inner = tile[inner]
     microtile_outer = tile[outer]
-    if inner != 0 or outer != 1 or any(int(value) != 0 for value in base['offset']):
+    if inner != 0 or outer != 1 or any(base.offset):
         raise ConfigRefused('Microtiled boundary DMA requires a local, inner-contiguous buffer.')
     if microtile_outer == 1 and not project_to_io_boundary:
-        return copy.deepcopy(base)
+        return base.to_dict(), None
 
     inner_extent, outer_extent = dimensions
     if inner_extent % microtile_inner or outer_extent % microtile_outer:
@@ -90,10 +83,7 @@ def boundary_access_descriptor(
     # or whole microtiles) and the logical columns rounded up to the microtile; the host trims.
     transfer_inner_extent, rows_per_tile, tile_rows = inner_extent, microtile_outer, outer_extent // microtile_outer
     if project_to_io_boundary:
-        io_boundary = [int(value) for value in base['io_boundary_dimension']]
-        if len(io_boundary) != 2:
-            raise ConfigRefused('Direct boundary DMA projection requires a 2-D IO boundary.')
-        io_inner, io_outer = io_boundary
+        io_inner, io_outer = base.io_boundary_dimension
         if io_inner > inner_extent or io_outer > outer_extent:
             raise ValueError(
                 f'Direct boundary shape {(outer_extent, inner_extent)} cannot contain IO boundary '
@@ -108,7 +98,7 @@ def boundary_access_descriptor(
         rows_per_tile, tile_rows = min(io_outer, microtile_outer), -(-io_outer // microtile_outer)
 
     microtile_elements = microtile_outer * microtile_inner
-    descriptor = copy.deepcopy(base)
+    descriptor = base.to_dict()
     descriptor['buffer_dimension'] = [
         microtile_elements,
         inner_extent // microtile_inner,
@@ -117,16 +107,15 @@ def boundary_access_descriptor(
     descriptor['tiling_dimension'] = [microtile_inner, 1, 1]
     descriptor['offset'] = [0, 0, 0]
     descriptor['tile_traversal'] = [
-        {'dimension': 1, 'stride': 1, 'wrap': transfer_inner_extent // microtile_inner},
-        {'dimension': 0, 'stride': microtile_inner, 'wrap': rows_per_tile},
-        {'dimension': 2, 'stride': 1, 'wrap': tile_rows},
+        TraversalStep(1, 1, transfer_inner_extent // microtile_inner),
+        TraversalStep(0, microtile_inner, rows_per_tile),
+        TraversalStep(2, 1, tile_rows),
     ]
-    descriptor['transfer_shape'] = [transfer_inner_extent, rows_per_tile * tile_rows]
     descriptor.pop('boundary_dimension', None)
-    return descriptor
+    return descriptor, [transfer_inner_extent, rows_per_tile * tile_rows]
 
 
-def _inner_blocked_access_descriptor(base: Dict[str, Any], element_bits: int) -> Dict[str, Any]:
+def _inner_blocked_access_descriptor(base: StagingDescriptor, element_bits: int) -> Dict[str, Any]:
     """Boundary DMA for an inner-blocked buffer ([c/B][...][B] memory, linear wire order).
 
     One block of the inner axis is one contiguous region whose wire order is already its memory
@@ -134,12 +123,12 @@ def _inner_blocked_access_descriptor(base: Dict[str, Any], element_bits: int) ->
     interleave them per element, which this lowering does not implement (measured on AIE1: such a
     walk needs 20 S2MM descriptors against a budget of 16).
     """
-    descriptor = copy.deepcopy(base)
-    dims = [int(value) for value in base['buffer_dimension']]
-    inner = int(base['inner_dimension'])
-    block = int(base['tiling_dimension'][inner])
-    wraps = {int(step['dimension']): int(step['wrap']) for step in base.get('tile_traversal', ())}
-    if any(int(value) != 0 for dim, value in enumerate(base['offset']) if dim != inner):
+    descriptor = base.to_dict()
+    dims = list(base.buffer_dimension)
+    inner = base.inner_dimension
+    block = base.tiling_dimension[inner]
+    wraps = {step.dimension: step.wrap for step in base.tile_traversal}
+    if any(value for dim, value in enumerate(base.offset) if dim != inner):
         raise ConfigRefused('Inner-blocked boundary DMA transfers whole non-inner axes.')
     if block * wraps.get(inner, 1) != block:
         raise ConfigRefused(
@@ -158,8 +147,8 @@ def _inner_blocked_access_descriptor(base: Dict[str, Any], element_bits: int) ->
             continue
         chunk[dim] = 1
         if int(dims[dim]) > 1:
-            traversal.append({'dimension': dim, 'stride': 1, 'wrap': int(dims[dim])})
-    over = [step for step in traversal if step['wrap'] > BD_MAX_WRAP]
+            traversal.append(TraversalStep(dim, 1, int(dims[dim])))
+    over = [step for step in traversal if step.wrap > BD_MAX_WRAP]
     if over or int(np.prod(chunk)) * element_bits // BD_WORD_BITS > BD_MAX_WRAP:
         raise ConfigRefused(
             f"An inner-blocked boundary transfer of {dims} needs a descriptor beyond a BD's {BD_MAX_WRAP} "
@@ -170,42 +159,36 @@ def _inner_blocked_access_descriptor(base: Dict[str, Any], element_bits: int) ->
     return descriptor
 
 
-def rebase_descriptor_offset(descriptor: MutableMapping[str, Any], offset_base: Sequence[int]) -> None:
-    """Rebase a descriptor's coordinates into an endpoint-local frame.
+def rebase_descriptor_offset(staging: StagingDescriptor, offset_base: Sequence[int]) -> StagingDescriptor:
+    """The staging in an endpoint-local frame.
 
     A view hands a consumer part of a tensor as a tensor of its own, so both where the window sits
     in the buffer and where it sits in the data move with it.
     """
     if not offset_base:
-        return
-    base = [int(value) for value in offset_base]
-    for key in ('offset', 'logical_origin'):
-        values = [int(value) for value in descriptor[key]]
-        if len(values) != len(base):
-            raise RuntimeError(f'descriptor rank mismatch during {key} rebasing ({len(values)} != {len(base)}).')
-        descriptor[key] = [values[dim] - base[dim] for dim in range(len(values))]
+        return staging
+    return dataclasses.replace(staging, **_rebased(staging, offset_base))
 
 
 def localize_descriptor(
-    descriptor: MutableMapping[str, Any],
-    offset_base: Sequence[int],
-    buffer_dimension: Sequence[int],
-) -> None:
-    """Rebase a descriptor and its boundaries into an endpoint-local buffer."""
+    staging: StagingDescriptor, offset_base: Sequence[int], buffer_dimension: Sequence[int]
+) -> StagingDescriptor:
+    """The staging rebased into an endpoint-local buffer of `buffer_dimension`, its boundaries clipped to it."""
     if not offset_base:
-        return
-
-    dims = [int(value) for value in buffer_dimension]
-    rebase_descriptor_offset(descriptor, offset_base)
-    base = [int(value) for value in offset_base]
+        return staging
+    dims, base = [int(value) for value in buffer_dimension], [int(value) for value in offset_base]
     if len(dims) != len(base):
         raise RuntimeError(f'descriptor rank mismatch during localization ({len(dims)} != {len(base)}).')
+    boundaries = {
+        key: tuple(min(extent, max(0, bound - b)) for extent, bound, b in zip(dims, getattr(staging, key), base))
+        for key in ('boundary_dimension', 'io_boundary_dimension')
+        if getattr(staging, key) is not None
+    }
+    return dataclasses.replace(staging, **_rebased(staging, base), buffer_dimension=tuple(dims), **boundaries)
 
-    descriptor['buffer_dimension'] = list(dims)
-    for key in ('boundary_dimension', 'io_boundary_dimension'):
-        if key not in descriptor:
-            continue
-        boundary = [int(value) for value in descriptor[key]]
-        if len(boundary) != len(dims):
-            raise RuntimeError(f'descriptor {key} rank mismatch during localization.')
-        descriptor[key] = [min(dims[dim], max(0, boundary[dim] - base[dim])) for dim in range(len(dims))]
+
+def _rebased(staging: StagingDescriptor, offset_base: Sequence[int]) -> Dict[str, Tuple[int, ...]]:
+    base = [int(value) for value in offset_base]
+    if len(staging.offset) != len(base):
+        raise RuntimeError(f'descriptor rank mismatch during rebasing ({len(staging.offset)} != {len(base)}).')
+    return {key: tuple(v - b for v, b in zip(getattr(staging, key), base)) for key in ('offset', 'logical_origin')}

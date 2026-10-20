@@ -246,7 +246,7 @@ def describe_stream_staging(view: TensorView, port: int, access: str, contract: 
         io_tiling_overrides={inner_dim: k_held, outer_dim: rows_held},
         slice_dim=outer_dim if contract == 'outer' else inner_dim,
         boundary_shape='logical' if access == 'read' else None,
-        extras={'storage_layout': STORAGE_LAYOUT_LINEAR},
+        storage_layout=STORAGE_LAYOUT_LINEAR,
     )
 
 

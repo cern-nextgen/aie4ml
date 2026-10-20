@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import copy
 from typing import Sequence, Tuple
 
 from ...errors import ConfigRefused
 from ...ir import get_backend_context
 from ...ir.graph import ROUTE_MODES
-from ...op_impls.utils.tensor_view import staging_tile_shape
 from ..base import AIEPass
 from .boundary import direct_boundary_access
 from .collect import TransportCollector
@@ -165,14 +163,13 @@ def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
     for port in endpoint.selected_ports(binding.count):
         staging = inst.staging[endpoint.tensor][port]
         if not output:
-            staging = copy.deepcopy(staging)
-            rebase_descriptor_offset(staging, endpoint.offset_base)
-            inner = int(staging['inner_dimension'])
-            if int(staging['io_tiling_dimension'][inner]) < staging_tile_shape(staging)[inner]:
+            staging = rebase_descriptor_offset(staging, endpoint.offset_base)
+            inner = staging.inner_dimension
+            if staging.io_tiling_dimension[inner] < staging.tile_shape[inner]:
                 return f'{endpoint.node.name}.{endpoint.group} pads its inner axis'
         try:
             access, _ = direct_boundary_access(
-                staging, staging['io_tiling_dimension'], element_bits=element.width, output=output
+                staging, staging.io_tiling_dimension, element_bits=element.width, output=output
             )
         except ConfigRefused as refusal:
             return str(refusal)

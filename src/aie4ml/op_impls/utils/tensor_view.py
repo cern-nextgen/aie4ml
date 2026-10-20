@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, Mapping, NamedTuple, Sequence
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 STORAGE_LAYOUT_LINEAR = 'linear'
 STORAGE_LAYOUT_MICROTILED = 'microtiled'
@@ -16,11 +16,10 @@ STORAGE_LAYOUTS = frozenset({STORAGE_LAYOUT_LINEAR, STORAGE_LAYOUT_MICROTILED, S
 class TensorView:
     """Per-tensor shape contract across three axis spaces:
 
-      LOGICAL  host order (TensorVar shape); host-facing io_tiling/io_boundary live here.
+      LOGICAL  host order (TensorVar shape).
       VIEW     kernel order = LOGICAL after `perm`; inner axis [-1], outer [-2].
                full/tile/tile_raw live here.
-      BUFFER   memory order = LOGICAL reversed; BD fields (buffer_dimension,
-               tiling_dimension, offset, tile_traversal) live here.
+      BUFFER   memory order = LOGICAL reversed; every StagingDescriptor vector lives here.
 
     `buffer_order` lists LOGICAL axes, so a VIEW-order shape relabels to LOGICAL before
     it applies (see `ordered_view_shape`). Identity `perm` collapses all three spaces,
@@ -161,13 +160,11 @@ def ordered_view_shape(view: TensorView, kind: str) -> list[int]:
     return [int(shape[index]) for index in view.buffer_order]
 
 
-def staging_tile_shape(desc: Mapping[str, Any]) -> tuple[int, ...]:
-    if 'tiling_dimension' not in desc:
-        raise ValueError('staging descriptor is missing tiling_dimension.')
-    shape = [int(x) for x in desc['tiling_dimension']]
-    for entry in desc.get('tile_traversal', ()):
-        dim = int(entry['dimension'])
-        shape[dim] = int(entry['stride']) * int(entry['wrap'])
+def traversed_shape(tiling_dimension: Sequence[int], tile_traversal: Sequence['TraversalStep']) -> tuple[int, ...]:
+    """The extent an ADF tiling walks per axis: its chunk, or a traversed axis's `stride * wrap`."""
+    shape = [int(x) for x in tiling_dimension]
+    for step in tile_traversal:
+        shape[step.dimension] = step.stride * step.wrap
     return tuple(shape)
 
 
@@ -193,129 +190,125 @@ def canonical_buffer_axes(view: TensorView) -> tuple[int, int, list[int]]:
     return inner_dim, outer_dim, [inner_dim, outer_dim] + tail_dims
 
 
-def make_staging_descriptor(
-    *,
-    access: str,
-    view: TensorView,
-    tiling_dimension: Sequence[int],
-    offset: Sequence[int],
-    tile_traversal: Sequence[Mapping[str, int]],
-    inner_dim: int,
-    outer_dim: int,
-    slice_dim: int | None = None,
-    boundary_shape: str | None = None,
-    io_boundary_shape: str | None = None,
-    io_tiling_dimension: Sequence[int] | None = None,
-    logical_origin: Mapping[int, int] | None = None,
-    extras: Mapping[str, Any] | None = None,
-) -> Dict[str, Any]:
-    # Axis space (see TensorView): BUFFER order = buffer_dimension, tiling_dimension,
-    # offset, tile_traversal, inner/outer/slice_dimension (the BD walk — must agree).
-    # LOGICAL order = io_tiling_dimension, io_boundary_dimension (host-facing).
-    # tiling_dimension is ADF's per-BD chunk, NOT TensorView.tile.
-    descriptor: Dict[str, Any] = {
-        'access': access,
-        'storage_layout': STORAGE_LAYOUT_MICROTILED if view.microtile is not None else STORAGE_LAYOUT_LINEAR,
-        'buffer_dimension': ordered_view_shape(view, 'full'),
-        'tiling_dimension': [int(x) for x in tiling_dimension],
-        'offset': [int(x) for x in offset],
-        'tile_traversal': [{str(k): int(v) for k, v in entry.items()} for entry in tile_traversal],
-        'slice_dimension': int(inner_dim if slice_dim is None else slice_dim),
-        'inner_dimension': int(inner_dim),
-        'outer_dimension': int(outer_dim),
-        # Where this port's window starts in the logical tensor, per axis and signed: the op that
-        # partitions the tensor states it, because only it knows how its ports divide the work.
-        # Negative means the window opens on padding, before the data.
-        'logical_origin': [int((logical_origin or {}).get(dim, 0)) for dim in range(len(tiling_dimension))],
-    }
+@dataclass(frozen=True)
+class TraversalStep:
+    """One loop of an ADF tiling's `tile_traversal`: `wrap` steps of `stride` elements along BUFFER axis
+    `dimension`."""
 
-    if boundary_shape is not None:
-        descriptor['boundary_dimension'] = ordered_view_shape(view, boundary_shape)
-    if io_boundary_shape is not None:
-        descriptor['io_boundary_dimension'] = ordered_view_shape(view, io_boundary_shape)
-    if io_tiling_dimension is not None:
-        descriptor['io_tiling_dimension'] = [int(x) for x in io_tiling_dimension]
-    if extras:
-        descriptor.update(dict(extras))
-    validate_staging_descriptor(descriptor)
-    return descriptor
+    dimension: int
+    stride: int
+    wrap: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class StagingDescriptor:
+    """What one kernel port's buffer holds of its tensor, and the DMA walk over it: what a variant publishes for each
+    port (`describe_*_staging`), recorded on its instance, and what transport reads of it.
+
+    Every vector is in BUFFER order. The walk is ADF's: `buffer_dimension`, `tiling_dimension` (its per-BD chunk, not
+    TensorView.tile), `offset` and `tile_traversal`, along `inner_dimension`/`outer_dimension`, its ports split along
+    `slice_dimension`. `io_tiling_dimension` is the unpadded extent of the port's share of the tensor, from
+    `logical_origin` (negative where it opens on a border), and `io_boundary_dimension` the tensor's; a read that
+    takes only the data within `boundary_dimension` zero-fills the rest. An inner-blocked frame may group its columns
+    by residue (`column_phases`), and a port may frame each inference as whole transfers (`transfer_bytes`).
+    """
+
+    access: str
+    storage_layout: str
+    buffer_dimension: Tuple[int, ...]
+    tiling_dimension: Tuple[int, ...]
+    offset: Tuple[int, ...]
+    tile_traversal: Tuple[TraversalStep, ...]
+    slice_dimension: int
+    inner_dimension: int
+    outer_dimension: int
+    logical_origin: Tuple[int, ...]
+    boundary_dimension: Optional[Tuple[int, ...]] = None
+    io_boundary_dimension: Tuple[int, ...]
+    io_tiling_dimension: Tuple[int, ...]
+    column_phases: Optional[int] = None
+    transfer_bytes: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.access not in ('read', 'write'):
+            raise ValueError(f'staging descriptor has unknown access {self.access!r}.')
+        if self.storage_layout not in STORAGE_LAYOUTS:
+            raise ValueError(f'staging descriptor has unknown storage_layout {self.storage_layout!r}.')
+        rank = len(self.buffer_dimension)
+        for key in _STAGING_VECTORS:
+            value = getattr(self, key)
+            if value is None:
+                continue
+            if not isinstance(value, tuple) or not all(isinstance(x, int) for x in value):
+                raise TypeError(f'staging descriptor {key} must be a tuple of ints, got {value!r}.')
+            if len(value) != rank:
+                raise ValueError(f'staging descriptor {key} has rank {len(value)}, expected {rank}.')
+        if not isinstance(self.tile_traversal, tuple) or not all(
+            isinstance(step, TraversalStep) for step in self.tile_traversal
+        ):
+            raise TypeError(f'staging descriptor tile_traversal must be TraversalSteps, got {self.tile_traversal!r}.')
+        if any(x <= 0 for x in self.buffer_dimension):
+            raise ValueError(f'staging descriptor buffer_dimension {self.buffer_dimension} must be positive.')
+        for dim, (chunk, extent, offset) in enumerate(zip(self.tiling_dimension, self.buffer_dimension, self.offset)):
+            if chunk <= 0 or chunk > extent:
+                raise ValueError(f'staging descriptor tiling_dimension[{dim}]={chunk} does not fit extent {extent}.')
+            if not 0 <= offset < extent:
+                raise ValueError(f'staging descriptor offset[{dim}]={offset} is outside extent {extent}.')
+        for key in ('slice_dimension', 'inner_dimension', 'outer_dimension'):
+            if not 0 <= getattr(self, key) < rank:
+                raise ValueError(f'staging descriptor {key}={getattr(self, key)} is not an axis of rank {rank}.')
+        # A column-phased frame groups its columns by residue: a fact of the inner-blocked layout, part of
+        # what two descriptors must agree on to hand a buffer over directly.
+        if self.column_phases is not None:
+            if self.column_phases < 2:
+                raise ValueError(f'staging descriptor column_phases={self.column_phases} must be at least 2.')
+            if self.storage_layout != STORAGE_LAYOUT_INNER_BLOCKED:
+                raise ValueError('staging descriptor column_phases applies only to an inner-blocked layout.')
+        # The BD walk: each axis is traversed at most once, and the window it sweeps stays inside the
+        # buffer. An axis with no traversal entry transfers its chunk once, at its offset.
+        walked = set()
+        for step in self.tile_traversal:
+            if not 0 <= step.dimension < rank:
+                raise ValueError(f'staging descriptor traversal dimension {step.dimension} is not an axis of {rank}.')
+            if step.dimension in walked:
+                raise ValueError(f'staging descriptor traverses axis {step.dimension} more than once.')
+            walked.add(step.dimension)
+            if step.stride <= 0 or step.wrap <= 0:
+                raise ValueError(f'staging descriptor traversal on axis {step.dimension} must step forward.')
+            span = self.offset[step.dimension] + step.stride * (step.wrap - 1) + self.tiling_dimension[step.dimension]
+            if span > self.buffer_dimension[step.dimension]:
+                raise ValueError(
+                    f'staging descriptor walks {span} elements along axis {step.dimension}, past its extent '
+                    f'{self.buffer_dimension[step.dimension]}.'
+                )
+        for dim in range(rank):
+            if dim not in walked and self.offset[dim] + self.tiling_dimension[dim] > self.buffer_dimension[dim]:
+                raise ValueError(
+                    f'staging descriptor transfers {self.offset[dim] + self.tiling_dimension[dim]} elements along '
+                    f'the untraversed axis {dim}, past its extent {self.buffer_dimension[dim]}.'
+                )
+
+    @property
+    def tile_shape(self) -> tuple[int, ...]:
+        """The extent its walk covers per axis."""
+        return traversed_shape(self.tiling_dimension, self.tile_traversal)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Its fields as the physical plan holds a descriptor: lists, the optional ones only where set."""
+        fields = {key: list(value) if isinstance(value, tuple) else value for key, value in asdict(self).items()}
+        fields['tile_traversal'] = list(self.tile_traversal)
+        return {key: value for key, value in fields.items() if value is not None}
 
 
 _STAGING_VECTORS = (
     'buffer_dimension',
     'tiling_dimension',
     'offset',
+    'logical_origin',
     'boundary_dimension',
     'io_boundary_dimension',
     'io_tiling_dimension',
-    'logical_origin',
 )
-
-
-def validate_staging_descriptor(desc: Mapping[str, Any]) -> None:
-    """Structural verifier for a staging descriptor, the contract every transport pass reads."""
-    missing = [
-        key
-        for key in ('access', 'storage_layout', 'buffer_dimension', 'tiling_dimension', 'offset', 'logical_origin')
-        if key not in desc
-    ]
-    if missing:
-        raise ValueError(f'staging descriptor is missing {", ".join(missing)}.')
-    if desc['access'] not in ('read', 'write'):
-        raise ValueError(f'staging descriptor has unknown access {desc["access"]!r}.')
-    if desc['storage_layout'] not in STORAGE_LAYOUTS:
-        raise ValueError(f'staging descriptor has unknown storage_layout {desc["storage_layout"]!r}.')
-    rank = len(desc['buffer_dimension'])
-    for key in _STAGING_VECTORS:
-        if key in desc and len(desc[key]) != rank:
-            raise ValueError(f'staging descriptor {key} has rank {len(desc[key])}, expected {rank}.')
-    if any(int(x) <= 0 for x in desc['buffer_dimension']):
-        raise ValueError(f'staging descriptor buffer_dimension {desc["buffer_dimension"]} must be positive.')
-    for dim, (chunk, extent, offset) in enumerate(
-        zip(desc['tiling_dimension'], desc['buffer_dimension'], desc['offset'])
-    ):
-        if int(chunk) <= 0 or int(chunk) > int(extent):
-            raise ValueError(f'staging descriptor tiling_dimension[{dim}]={chunk} does not fit extent {extent}.')
-        if not 0 <= int(offset) < int(extent):
-            raise ValueError(f'staging descriptor offset[{dim}]={offset} is outside extent {extent}.')
-    for key in ('slice_dimension', 'inner_dimension', 'outer_dimension'):
-        if key in desc and not 0 <= int(desc[key]) < rank:
-            raise ValueError(f'staging descriptor {key}={desc[key]} is not an axis of rank {rank}.')
-    # A column-phased frame groups its columns by residue: a fact of the inner-blocked layout, part of
-    # what two descriptors must agree on to hand a buffer over directly.
-    if 'column_phases' in desc:
-        phases = desc['column_phases']
-        if not isinstance(phases, int) or phases < 2:
-            raise ValueError(f'staging descriptor column_phases={phases!r} must be an integer of at least 2.')
-        if desc['storage_layout'] != STORAGE_LAYOUT_INNER_BLOCKED:
-            raise ValueError('staging descriptor column_phases applies only to an inner-blocked layout.')
-    # The BD walk: each axis is traversed at most once, and the window it sweeps stays inside the
-    # buffer. An axis with no traversal entry transfers its chunk once, at its offset.
-    walked = set()
-    for entry in desc.get('tile_traversal', ()):
-        dim, stride, wrap = int(entry['dimension']), int(entry['stride']), int(entry['wrap'])
-        if not 0 <= dim < rank:
-            raise ValueError(f'staging descriptor traversal dimension {dim} is not an axis of rank {rank}.')
-        if dim in walked:
-            raise ValueError(f'staging descriptor traverses axis {dim} more than once.')
-        walked.add(dim)
-        if stride <= 0 or wrap <= 0:
-            raise ValueError(f'staging descriptor traversal on axis {dim} must have positive stride and wrap.')
-        span = int(desc['offset'][dim]) + stride * (wrap - 1) + int(desc['tiling_dimension'][dim])
-        if span > int(desc['buffer_dimension'][dim]):
-            raise ValueError(
-                f'staging descriptor walks {span} elements along axis {dim}, past its extent '
-                f'{desc["buffer_dimension"][dim]}.'
-            )
-    for dim in range(rank):
-        if dim in walked:
-            continue
-        span = int(desc['offset'][dim]) + int(desc['tiling_dimension'][dim])
-        if span > int(desc['buffer_dimension'][dim]):
-            raise ValueError(
-                f'staging descriptor transfers {span} elements along the untraversed axis {dim}, past its '
-                f'extent {desc["buffer_dimension"][dim]}.'
-            )
 
 
 class AxisPlan(NamedTuple):
@@ -337,17 +330,18 @@ def build_staging_descriptor(
     io_tiling_base: str = 'logical',
     io_tiling_overrides: Mapping[int, int] | None = None,
     boundary_shape: str | None = None,
-    io_boundary_shape: str | None = 'logical',
     slice_dim: int | None = None,
     logical_origin: Mapping[int, int] | None = None,
-    extras: Mapping[str, Any] | None = None,
-) -> Dict[str, Any]:
-    """Single BD-staging emitter: owns the BUFFER-order arrays and the LOGICAL-order
-    io_tiling_dimension so no family hand-rolls the axis-space projection.
+    storage_layout: str | None = None,
+    column_phases: int | None = None,
+    transfer_bytes: int | None = None,
+) -> StagingDescriptor:
+    """Single BD-staging emitter: owns the BUFFER-order projection of the view, so no family hand-rolls it.
 
     `plans` maps a BUFFER axis -> AxisPlan; `order` lists all BUFFER axes in traversal
     order (axes absent from `plans` stream the whole extent, chunk 1). `io_tiling_base`
-    seeds io_tiling_dimension; `io_tiling_overrides` set per-axis raw extents.
+    seeds io_tiling_dimension; `io_tiling_overrides` set per-axis raw extents. The storage layout is the view's
+    (microtiled where it has a microtile) unless `storage_layout` names another.
     """
     buffer_dimension = ordered_view_shape(view, 'full')
     inner_dim, outer_dim, _ = canonical_buffer_axes(view)
@@ -362,26 +356,30 @@ def build_staging_descriptor(
     for dim in order:
         plan = plans.get(int(dim))
         if plan is None:
-            tile_traversal.append({'dimension': int(dim), 'stride': 1, 'wrap': int(buffer_dimension[dim])})
+            tile_traversal.append(TraversalStep(int(dim), 1, int(buffer_dimension[dim])))
             continue
         tiling_dimension[int(dim)] = int(plan.chunk)
         offset[int(dim)] = int(plan.offset)
-        tile_traversal.append({'dimension': int(dim), 'stride': int(plan.stride), 'wrap': int(plan.wrap)})
+        tile_traversal.append(TraversalStep(int(dim), int(plan.stride), int(plan.wrap)))
 
-    return make_staging_descriptor(
+    return StagingDescriptor(
         access=access,
-        view=view,
-        tiling_dimension=tiling_dimension,
-        offset=offset,
-        tile_traversal=tile_traversal,
-        inner_dim=inner_dim,
-        outer_dim=outer_dim,
-        slice_dim=slice_dim,
-        logical_origin=logical_origin,
-        boundary_shape=boundary_shape,
-        io_boundary_shape=io_boundary_shape,
-        io_tiling_dimension=io_tiling_dimension,
-        extras=extras,
+        storage_layout=storage_layout or (STORAGE_LAYOUT_MICROTILED if view.microtile else STORAGE_LAYOUT_LINEAR),
+        buffer_dimension=tuple(buffer_dimension),
+        tiling_dimension=tuple(tiling_dimension),
+        offset=tuple(offset),
+        tile_traversal=tuple(tile_traversal),
+        slice_dimension=int(inner_dim if slice_dim is None else slice_dim),
+        inner_dimension=int(inner_dim),
+        outer_dimension=int(outer_dim),
+        # Where this port's window starts in the logical tensor, per axis and signed: the op that
+        # partitions the tensor states it, because only it knows how its ports divide the work.
+        logical_origin=tuple(int((logical_origin or {}).get(dim, 0)) for dim in range(len(buffer_dimension))),
+        boundary_dimension=None if boundary_shape is None else tuple(ordered_view_shape(view, boundary_shape)),
+        io_boundary_dimension=tuple(ordered_view_shape(view, 'logical')),
+        io_tiling_dimension=tuple(io_tiling_dimension),
+        column_phases=None if column_phases is None else int(column_phases),
+        transfer_bytes=None if transfer_bytes is None else int(transfer_bytes),
     )
 
 
@@ -454,28 +452,18 @@ class MicrotileShape:
     inner: int
 
 
-def microtile_from_staging(desc: Mapping[str, Any]):
+def microtile_from_staging(staging: StagingDescriptor):
     """Decode a microtiled staging layout, or return ``None`` for linear storage.
 
     Not how an op reads its own layout -- that is `view.microtile`. This is the edge decoder: a
     TensorView never crosses, so a consumer only sees the producer's published staging contract.
     """
-    storage_layout = desc.get('storage_layout')
     # Inner-blocked splits only the inner axis and hoists the block index above the others, so it
     # carries no (outer, inner) microtile a consumer could adopt.
-    if storage_layout in (STORAGE_LAYOUT_LINEAR, STORAGE_LAYOUT_INNER_BLOCKED):
+    if staging.storage_layout != STORAGE_LAYOUT_MICROTILED:
         return None
-    if storage_layout != STORAGE_LAYOUT_MICROTILED:
-        raise ValueError(f'Unknown or missing staging storage_layout {storage_layout!r}.')
-
-    required = ('tiling_dimension', 'buffer_dimension', 'inner_dimension', 'outer_dimension')
-    missing = [field for field in required if field not in desc]
-    if missing:
-        raise ValueError(f'Microtiled staging descriptor is missing {", ".join(missing)}.')
-    tiling = desc['tiling_dimension']
-    inner = desc['inner_dimension']
-    outer = desc['outer_dimension']
-    return MicrotileShape(outer=int(tiling[int(outer)]), inner=int(tiling[int(inner)]))
+    tiling = staging.tiling_dimension
+    return MicrotileShape(outer=tiling[staging.outer_dimension], inner=tiling[staging.inner_dimension])
 
 
 def build_tensor_view(

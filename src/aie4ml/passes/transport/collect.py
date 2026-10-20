@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from ...errors import ConfigRefused
 from ...ir import ExecutionView, OpNode
+from ...op_impls.utils import StagingDescriptor
 from .model import Connection, EdgeEntry, Endpoint
 
 
@@ -162,7 +163,7 @@ class TransportCollector:
                 f'{source_tensor}: slice range [{start}, {end}) does not align exactly with producer ports.'
             )
 
-        base = tuple(int(start) if dim == axis_dim else 0 for dim in range(len(first_desc['buffer_dimension'])))
+        base = tuple(int(start) if dim == axis_dim else 0 for dim in range(len(first_desc.buffer_dimension)))
         return tuple(selected), base
 
     def _concat_connections(
@@ -234,9 +235,8 @@ class TransportCollector:
         return out
 
     @staticmethod
-    def _descriptor_axis_range(desc: Dict[str, Any], dim: int) -> Tuple[int, int]:
-        start = int(desc['offset'][dim])
-        extent = int(desc['io_tiling_dimension'][dim])
+    def _descriptor_axis_range(staging: StagingDescriptor, dim: int) -> Tuple[int, int]:
+        start, extent = staging.offset[dim], staging.io_tiling_dimension[dim]
         if extent <= 0:
             raise RuntimeError(f'invalid descriptor extent {extent} on dim{dim}.')
         return start, start + extent

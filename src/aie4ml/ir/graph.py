@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
@@ -11,6 +12,7 @@ from ..aie_types import PrecisionIntent
 
 if TYPE_CHECKING:  # pragma: no cover - runtime circular import guard
     from ..op_impls import OpImplVariant
+    from ..op_impls.utils import StagingDescriptor
 
 
 @dataclass
@@ -34,10 +36,13 @@ class TensorVar:
 
 
 def _deep_copy(value: Any) -> Any:
+    """A plain copy of the physical plan, as JSON holds it: an ADF traversal step as its fields."""
     if isinstance(value, dict):
         return {k: _deep_copy(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_deep_copy(v) for v in value]
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
     return value
 
 
@@ -334,7 +339,7 @@ class TensorContract:
     """
 
     contract: str  # one of STAGING_CONTRACTS: which axis cas_num partitions
-    port_staging: Tuple[Dict[str, Any], ...] = ()
+    port_staging: Tuple['StagingDescriptor', ...] = ()
     inner_shards: Optional[Tuple[int, int]] = None
     view: Any = None  # TensorView
 
@@ -418,7 +423,7 @@ class ExecutionInstance:
     io_route: Dict[str, Any]
     port_views: Dict[str, Any]  # the view of each value it reads or writes; config.io_views is the kernel's own
     config: Any
-    staging: Dict[str, Tuple[Dict[str, Any], ...]]  # each bound tensor's staging, port by port; read only
+    staging: Dict[str, Tuple['StagingDescriptor', ...]]  # each bound tensor's staging, port by port
     inputs: Tuple[ExecutionInput, ...] = ()
     outputs: Tuple[str, ...] = ()
     artifacts: Dict[str, Any] = field(default_factory=dict)

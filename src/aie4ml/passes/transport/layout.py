@@ -19,7 +19,7 @@ from typing import Any, Dict, Sequence, Tuple
 import numpy as np
 
 from ...errors import ConfigRefused
-from ...op_impls.utils import STORAGE_LAYOUT_INNER_BLOCKED
+from ...op_impls.utils import STORAGE_LAYOUT_INNER_BLOCKED, StagingDescriptor, TraversalStep
 
 
 @dataclass(frozen=True)
@@ -119,8 +119,8 @@ class Layout:
                 tile[loop.axis] = loop.count
                 last = loop.axis
             else:
-                traversal.append({'dimension': loop.axis, 'stride': loop.step, 'wrap': loop.count})
-        if len({step['dimension'] for step in traversal}) != len(traversal):
+                traversal.append(TraversalStep(loop.axis, loop.step, loop.count))
+        if len({step.dimension for step in traversal}) != len(traversal):
             raise ConfigRefused(
                 f'A buffer walked in the order {self.loops} steps along one axis at two strides, which one DMA '
                 'descriptor does not express.'
@@ -150,24 +150,23 @@ class Layout:
         return walk
 
 
-def port_layout(descriptor: Dict[str, Any]) -> Layout:
+def port_layout(staging: StagingDescriptor) -> Layout:
     """The memory order of a kernel port's buffer, from the staging its op publishes.
 
     A staging walks the port's part of the tensor in the order its buffer holds it: its contiguous tile, then its
     traversal from the innermost loop out. An inner-blocked buffer ([c/B][...][B], a conv frame) holds whole blocks of
     the inner axis one after another instead, and a column-phased one holds each row's columns grouped by residue.
     """
-    tile = [int(extent) for extent in descriptor['tiling_dimension']]
-    steps = reversed(descriptor.get('tile_traversal') or ())
-    loops = [Loop(int(step['dimension']), int(step['wrap']), int(step['stride'])) for step in steps]
+    tile = staging.tiling_dimension
+    loops = [Loop(step.dimension, step.wrap, step.stride) for step in reversed(staging.tile_traversal)]
     loops += [Loop(axis, tile[axis], 1) for axis in reversed(range(len(tile)))]
-    if descriptor['storage_layout'] == STORAGE_LAYOUT_INNER_BLOCKED:
-        inner = int(descriptor['inner_dimension'])
+    if staging.storage_layout == STORAGE_LAYOUT_INNER_BLOCKED:
+        inner = staging.inner_dimension
         blocks = [loop for loop in loops if loop.axis == inner and loop.step > 1]
         loops = blocks + [loop for loop in loops if not (loop.axis == inner and loop.step > 1)]
-        phases = int(descriptor.get('column_phases', 1))
+        phases = staging.column_phases or 1
         if phases > 1:
-            columns = int(descriptor['outer_dimension'])
+            columns = staging.outer_dimension
             row = max(
                 (index for index, loop in enumerate(loops) if loop.axis == columns and loop.step == 1),
                 key=lambda index: loops[index].count,
@@ -176,20 +175,20 @@ def port_layout(descriptor: Dict[str, Any]) -> Layout:
             if width % phases:
                 raise ValueError(f'A row of {width} columns does not split into {phases} column phases.')
             loops[row : row + 1] = [Loop(columns, phases, 1), Loop(columns, width // phases, phases)]
-    start = tuple(int(origin) for origin in descriptor['logical_origin'])
-    tensor = tuple((0, int(extent)) for extent in descriptor['io_boundary_dimension'])
+    start = staging.logical_origin
+    tensor = tuple((0, extent) for extent in staging.io_boundary_dimension)
     # The port holds the tensor's elements from its origin for its data extent (`io_tiling_dimension`).
     data = tuple(
-        (max(0, origin), max(0, min(last, origin + int(held))))
-        for origin, held, (_, last) in zip(start, descriptor['io_tiling_dimension'], tensor)
+        (max(0, origin), max(0, min(last, origin + held)))
+        for origin, held, (_, last) in zip(start, staging.io_tiling_dimension, tensor)
     )
     return Layout(tuple(loops), start, data, tensor)
 
 
-def host_layout(descriptor: Dict[str, Any], extent: Sequence[int] | None = None) -> Layout:
+def host_layout(staging: StagingDescriptor, extent: Sequence[int] | None = None) -> Layout:
     """A host port's share of a kernel port's tensor, as a PLIO carries it: `extent` elements per axis from the kernel
     port's origin, in the tensor's own order -- its data extent (`io_tiling_dimension`) unless the host moves more."""
-    kernel = port_layout(descriptor)
-    extent = [int(value) for value in (extent if extent is not None else descriptor['io_tiling_dimension'])]
+    kernel = port_layout(staging)
+    extent = [int(value) for value in (extent if extent is not None else staging.io_tiling_dimension)]
     loops = tuple(Loop(axis, extent[axis], 1) for axis in reversed(range(len(extent))))
     return Layout(loops, kernel.start, kernel.data, kernel.tensor)

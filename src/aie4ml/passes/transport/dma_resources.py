@@ -30,7 +30,7 @@ def tile_port_bds(
     Measured on AIE1, AIE-ML and AIE-MLv2."""
     if descriptor is None:
         return buffers
-    loops = [int(step['wrap']) for step in descriptor.get('tile_traversal') or () if int(step['wrap']) > 1]
+    loops = [step.wrap for step in descriptor.get('tile_traversal') or () if step.wrap > 1]
     walked = dma.dimensions - 1
     if (
         generation in WORD_CHUNK_FOLDS
@@ -76,30 +76,30 @@ def memtile_port_bds(descriptor: Dict[str, Any], buffers: int, generation: str, 
     """
     tile = [int(v) for v in descriptor['tiling_dimension']]
     offset = [int(v) for v in descriptor['offset']]
-    steps = [step for step in descriptor.get('tile_traversal') or () if int(step['wrap']) > 1]
+    steps = [step for step in descriptor.get('tile_traversal') or () if step.wrap > 1]
     end = [o + t for o, t in zip(offset, tile)]
     for step in steps:
-        end[int(step['dimension'])] += int(step['stride']) * (int(step['wrap']) - 1)
+        end[step.dimension] += step.stride * (step.wrap - 1)
     boundary = [int(b) for b in descriptor.get('boundary_dimension') or end]
     if descriptor.get('boundary_offset'):
         raise ConfigRefused(f'{where}: a memory-tile walk with a boundary offset has no measured BD cost.')
 
-    stride = {int(step['dimension']): int(step['stride']) for step in steps}
+    stride = {step.dimension: step.stride for step in steps}
 
     def held(axis: int, index: int) -> int:  # the data one tile holds along an axis
         start = offset[axis] + index * stride.get(axis, 0)
         return max(0, min(boundary[axis] - start, tile[axis]))
 
     shapes = []  # the stream, first step fastest; None: an all-zero tile
-    for indices in product(*(range(int(step['wrap'])) for step in reversed(steps))):
-        at = dict(zip((int(step['dimension']) for step in reversed(steps)), indices))
+    for indices in product(*(range(step.wrap) for step in reversed(steps))):
+        at = dict(zip((step.dimension for step in reversed(steps)), indices))
         shape = tuple(held(axis, at.get(axis, 0)) for axis in range(len(tile)))
         shapes.append(shape if all(shape) else None)
 
     full = tuple(tile)
     if len(tile) > 2 and any(shape != full for shape in shapes):
         raise ConfigRefused(f'{where}: a padded rank-{len(tile)} memory-tile walk has no measured BD cost.')
-    outer = prod(int(step['wrap']) for step in steps[:-1]) if len(tile) + len(steps) > MEMTILE_PAD_DIMENSIONS else 0
+    outer = prod(step.wrap for step in steps[:-1]) if len(tile) + len(steps) > MEMTILE_PAD_DIMENSIONS else 0
     # the tiles of one step of the outermost traversal step, where the BD cannot pad; 0 where it pads every step
     runs = []  # [shape, first tile, tiles]
     for index, shape in enumerate(shapes):

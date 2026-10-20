@@ -6,6 +6,7 @@ from __future__ import annotations
 from math import prod
 
 from ..ir import get_backend_context
+from ..op_impls.utils import TraversalStep
 from .base import AIEPass
 
 
@@ -102,10 +103,10 @@ class CompactBufferRank(AIEPass):
 
             if 'tile_traversal' in desc:
                 for step in desc['tile_traversal']:
-                    d = int(step['dimension'])
+                    d = step.dimension
                     if d in drop_axes:
-                        s = int(step['stride'])
-                        w = int(step['wrap'])
+                        s = step.stride
+                        w = step.wrap
                         if s != 1 or w != int(buf[d]):
                             return False
 
@@ -120,10 +121,10 @@ class CompactBufferRank(AIEPass):
         if 'boundary_dimension' in desc and int(desc['boundary_dimension'][axis]) != extent:
             return False
         tile = int(desc['tiling_dimension'][axis])
-        steps = [step for step in desc.get('tile_traversal', ()) if int(step['dimension']) == axis]
+        steps = [step for step in desc.get('tile_traversal', ()) if step.dimension == axis]
         if not steps:
             return tile == extent
-        return int(steps[0]['stride']) == tile and tile * int(steps[0]['wrap']) == extent
+        return steps[0].stride == tile and tile * steps[0].wrap == extent
 
     def _collapse_descriptor(self, desc, drop_axes, factor: int, merge_axis: int, is_graph_io: bool) -> None:
         vector_fields = (
@@ -146,12 +147,12 @@ class CompactBufferRank(AIEPass):
             traversal = desc['tile_traversal']
             compact = []
             for step in traversal:
-                d = int(step['dimension'])
-                s = int(step['stride'])
-                w = int(step['wrap'])
+                d = step.dimension
+                s = step.stride
+                w = step.wrap
                 if d in drop_axes:
                     continue
                 if d == merge_axis:
                     w = int(w) * int(factor)
-                compact.append({'dimension': d, 'stride': s, 'wrap': w})
+                compact.append(TraversalStep(d, s, w))
             desc['tile_traversal'] = compact

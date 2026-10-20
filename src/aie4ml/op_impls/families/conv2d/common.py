@@ -162,9 +162,6 @@ def describe_logical_staging(view: TensorView, access: str, *, transfer_bytes: i
             plans[dim] = AxisPlan(count, count, 1, first)
             origin[dim] = first
             io_window[dim] = count
-    extras = {'storage_layout': STORAGE_LAYOUT_LINEAR}
-    if transfer_bytes:
-        extras['transfer_bytes'] = int(transfer_bytes)
     return build_staging_descriptor(
         wire,
         access=access,
@@ -175,7 +172,8 @@ def describe_logical_staging(view: TensorView, access: str, *, transfer_bytes: i
         boundary_shape='logical' if access == 'read' else None,
         slice_dim=inner_dim,
         logical_origin=origin,
-        extras=extras,
+        storage_layout=STORAGE_LAYOUT_LINEAR,
+        transfer_bytes=transfer_bytes or None,
     )
 
 
@@ -207,11 +205,6 @@ def describe_frame_staging(
     A read wants zeros where its window leaves the image, unless the reading kernel `fills_border` itself.
     `transfer_bytes` is what one inference moves when the port's buffer holds more than its window.
     """
-    extras = {'storage_layout': STORAGE_LAYOUT_INNER_BLOCKED}
-    if column_phases > 1:
-        extras['column_phases'] = int(column_phases)
-    if transfer_bytes:
-        extras['transfer_bytes'] = int(transfer_bytes)
     inner_dim, _outer_dim, traversal_dims = canonical_buffer_axes(view)
     row_dim = view.buffer_order.index(1)
     block = min(CHANNEL_BLOCK, int(view.tile[-1]))
@@ -235,5 +228,7 @@ def describe_frame_staging(
         io_tiling_base='tile',
         logical_origin={dim: starts[dim] - int(origin[dim]) for dim in range(view.rank)},
         boundary_shape='logical' if access == 'read' and not fills_border else None,
-        extras=extras,
+        storage_layout=STORAGE_LAYOUT_INNER_BLOCKED,
+        column_phases=column_phases if column_phases > 1 else None,
+        transfer_bytes=transfer_bytes or None,
     )
