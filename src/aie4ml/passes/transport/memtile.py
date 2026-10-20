@@ -122,7 +122,7 @@ def _reader_chunks(entry, execution, writer_chunks, consumer_ports):
     inst = execution.get(consumer.node.name)
     chunks = [[] for _ in writer_chunks]
     for port in consumer_ports:
-        staging = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port)
+        staging = inst.staging[consumer.tensor][port]
         read = port_layout(staging).shifted(consumer.offset_base).data
         unit = next((index for index, windows in enumerate(written) if _covers(windows, read)), None)
         if unit is None:
@@ -140,7 +140,7 @@ def _writer_data(entry, execution, port):
         return port_layout(entry.graph_input.port_descriptors[int(port)]).data
     producer = entry.producer
     inst = execution.get(producer.node.name)
-    staging = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
+    staging = inst.staging[producer.tensor][port]
     return port_layout(staging).shifted(producer.offset_base).data
 
 

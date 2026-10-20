@@ -250,7 +250,7 @@ class _MemoryPlanMaterializer:
 
         for producer_port in producer_ports:
             endpoint = f'{producer_id}.{producer.group}[{int(producer_port)}]'
-            base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, int(producer_port))
+            base = inst.staging[producer.tensor][int(producer_port)]
             staging = _host_visible_output_staging(base, stream=stream)
             descriptor = dict(base)
             graph_port = self._next_graph_output_port
@@ -311,21 +311,21 @@ class _MemoryPlanMaterializer:
                 writers.append((port, staging, host_layout(graph_input_port_descriptor(entry, port))))
             else:
                 inst = self._kernel_inst(producer.node)
-                staging = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
+                staging = inst.staging[producer.tensor][port]
                 writers.append((port, staging, port_layout(staging).shifted(producer.offset_base)))
         readers = []  # (port, staging, layout, zero padding)
         if entry.consumers:
             consumer = entry.single_consumer()
             inst = self._kernel_inst(consumer.node)
             for port in c_ports:
-                staging = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port)
+                staging = inst.staging[consumer.tensor][port]
                 # A reader that fills its own border takes its padding as it finds it.
                 layout = port_layout(staging).shifted(consumer.offset_base)
                 readers.append((port, staging, layout, 'boundary_dimension' in staging))
         if entry.graph_output:
             inst = self._kernel_inst(producer.node)
             for port in p_ports:
-                base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
+                base = inst.staging[producer.tensor][port]
                 staging = {**self._graph_output_staging(entry, port), 'access': 'read'}
                 readers.append((port, staging, host_layout(base, staging['tiling_dimension']), True))
 
@@ -469,7 +469,7 @@ class _MemoryPlanMaterializer:
     def _graph_output_staging(self, entry: EdgeEntry, port: int) -> Dict[str, Any]:
         producer = entry.producer
         inst = self._kernel_inst(producer.node)
-        base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port)
+        base = inst.staging[producer.tensor][port]
         staging = _host_visible_output_staging(base)
         staging['tiling_dimension'] = self._whole_beats(
             entry, staging['tiling_dimension'], int(base['inner_dimension'])

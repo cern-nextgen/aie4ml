@@ -257,7 +257,7 @@ def test_a_split_port_holds_the_slice_its_weights_are_packed_for(tmp_path):
     ctx = lower(_dense_chain(24), tmp_path, {'d2': parallelism(1, cas_length=2)}, part=PART)
     inst = ctx.ir.execution.get('d2_aie')
     for port in range(2):
-        staging = inst.variant.describe_input_staging(inst.node, inst.config, inst.node.inputs[0].name, port)
+        staging = inst.staging[inst.node.inputs[0].name][port]
         assert staging['logical_origin'] == staging['offset']
 
 

@@ -52,9 +52,9 @@ def serialize_op_impl_instance(inst: ExecutionInstance) -> Dict[str, Any]:
         'ports': to_plain(inst.ports),
         'io_route': to_plain(inst.io_route),
         'port_views': to_plain(inst.port_views),
-        'graph_header': inst.graph_header,
-        'graph_name': inst.graph_name,
-        'param_template': inst.param_template,
+        'graph_header': inst.variant.graph_header,
+        'graph_name': inst.variant.graph_name,
+        'param_template': inst.variant.param_template,
         'config': to_plain(inst.config),
     }
 

@@ -26,9 +26,9 @@ def _layer(inst, placement, struct_name: str) -> dict:
     layer = {
         'struct_name': struct_name,
         'op_impl': {
-            'graph_header': inst.graph_header,
-            'graph_name': inst.graph_name,
-            'param_template': inst.param_template,
+            'graph_header': inst.variant.graph_header,
+            'graph_name': inst.variant.graph_name,
+            'param_template': inst.variant.param_template,
             'parameters': params,
         },
         'placement': placement,
@@ -41,7 +41,7 @@ def kernel_config(inst) -> str:
     """The configuration struct an instance's kernels are compiled against, rendered at one fixed anchor
     (tile 0,0) so it names the kernel, not a placement: the compiler schedules a kernel from it, whatever
     tiles and banks it is then given. Rendered for identity only, never built."""
-    template = _firmware_env().get_template(f'variants/{inst.param_template}/parameters.h.jinja')
+    template = _firmware_env().get_template(f'variants/{inst.variant.param_template}/parameters.h.jinja')
     return template.render(L=_layer(inst, {'col': 0, 'row': 0}, 'KernelCfg'))
 
 

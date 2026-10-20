@@ -478,10 +478,7 @@ class _Search:
         if key not in self._signatures:
             binding = inst.ports.outputs[tensor]
             contract = self._output_contracts(inst).get(tensor)
-            stagings = [
-                inst.variant.describe_output_staging(inst.node, inst.config, tensor, port)
-                for port in range(int(binding.count))
-            ]
+            stagings = list(inst.staging[tensor])
             self._signatures[key] = json.dumps(
                 [
                     repr(binding),

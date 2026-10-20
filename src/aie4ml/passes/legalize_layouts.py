@@ -15,7 +15,7 @@ from dataclasses import replace
 from ..ir import get_backend_context
 from ..ir.graph import ExecutionInput, ExecutionInstance, ExecutionValue, OpNode
 from .base import AIEPass
-from .resolve import output_contracts
+from .resolve import output_contracts, port_staging
 
 log = logging.getLogger(__name__)
 
@@ -32,20 +32,19 @@ def convert_inputs(inst: ExecutionInstance, sources, device) -> list[ExecutionIn
         variant.validate_config(node, config, device)
         routes = inst.io_route.get('inputs', {})
         view = inst.port_views[conversion.source]
+        ports = variant.build_ports(node, config)
         kernels.append(
             ExecutionInstance(
                 node=node,
                 variant=variant,
-                ports=variant.build_ports(node, config),
+                ports=ports,
                 io_route={
                     'inputs': {conversion.source: routes.get(conversion.source, 'auto')},
                     'outputs': {conversion.target: 'direct'},
                 },
                 port_views={conversion.source: conversion.source_view, conversion.target: view},
                 config=config,
-                graph_header=variant.graph_header,
-                graph_name=variant.graph_name,
-                param_template=variant.param_template,
+                staging=port_staging(node, variant, config, ports),
                 inputs=(source,),
                 outputs=(conversion.target,),
             )

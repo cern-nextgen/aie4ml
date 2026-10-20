@@ -130,7 +130,7 @@ def test_row_slices_write_their_pooled_rows(tmp_path):
     conv = _pooled(ctx)
     assert conv.config.parallelism.contract == 'outer' and conv.config.pool is not None
     (out,) = conv.node.outputs
-    ports = [conv.variant.describe_output_staging(conv.node, conv.config, out.name, p) for p in (0, 1)]
+    ports = [conv.staging[out.name][p] for p in (0, 1)]
     assert [d['offset'][2] for d in ports] == [0, H // 4]  # the second slice's pooled rows start 2 rows in
     params = conv.variant.build_template_params(conv.node, conv.config, {'row': 0, 'col': 0})
     assert (params['out_h'], params['out_rows']) == (H // 2, H // 4)

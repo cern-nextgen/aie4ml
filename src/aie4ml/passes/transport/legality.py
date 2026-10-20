@@ -37,14 +37,9 @@ def memtile_staging_failure(execution, endpoints) -> str | None:
         if endpoint.node is None:
             continue
         inst = execution.get(endpoint.node.name)
-        if endpoint.tensor in inst.ports.outputs:
-            ports = range(int(inst.ports.outputs[endpoint.tensor].count))
-            stagings = [
-                inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, port)
-                for port in ports
-            ]
-        else:
-            stagings = [inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0)]
+        stagings = inst.staging[endpoint.tensor]
+        if endpoint.tensor not in inst.ports.outputs:
+            stagings = stagings[:1]
         if 'transfer_bytes' in stagings[0]:
             return (
                 f'{endpoint.node.name}.{endpoint.group} frames each inference as a padded transfer, which '
@@ -97,14 +92,10 @@ def direct_pairing(
             return f'producer ports {producer_ports} exceed the published staging contract', ()
 
     def written(p_port):
-        return producer_inst.variant.describe_output_staging(
-            producer.node, producer_inst.config, producer.tensor, p_port
-        )
+        return producer_inst.staging[producer.tensor][p_port]
 
     def read(c_port):
-        return consumer_inst.variant.describe_input_staging(
-            consumer.node, consumer_inst.config, consumer.tensor, c_port
-        )
+        return consumer_inst.staging[consumer.tensor][c_port]
 
     def mismatch(p_port, c_port) -> Optional[str]:
         """Why one buffer cannot serve both ports: some position holds a different element, as data or padding."""

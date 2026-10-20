@@ -41,7 +41,7 @@ def graph_input_port_descs(entry, execution, port_base: int) -> Dict[int, Dict[s
     descs: Dict[int, Dict[str, Any]] = {}
     for local_port, port in enumerate(consumer_ports):
         graph_port = int(port_base) + int(local_port)
-        descs[graph_port] = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, int(port))
+        descs[graph_port] = copy.deepcopy(inst.staging[consumer.tensor][int(port)])
         rebase_descriptor_offset(descs[graph_port], consumer.offset_base)
         if binding.kind == PORT_KIND_STREAM:
             require_linear_stream_staging(entry.logical_tensor, descs[graph_port])

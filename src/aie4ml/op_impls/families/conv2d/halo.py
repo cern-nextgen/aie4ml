@@ -253,9 +253,6 @@ class Conv2dHaloOpImplVariant(Conv2dOpImplVariant):
         # A flattened band is one contiguous slice of the row the consuming Dense reads.
         return 'inner' if config.flags.emit_flattened else 'outer'
 
-    def output_port_count(self, node, config):
-        return int(config.parallelism.cas_num) + len(self._halo(node, config, 'output')[1])
-
     def output_inner_shards(self, _node, _config, _tensor_name):
         return None
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Sequence, Tuple
 
 from ...errors import ConfigRefused
@@ -162,10 +163,9 @@ def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
         role = inst.input(endpoint.tensor).role
         binding, element = inst.ports.inputs[endpoint.tensor], inst.variant.input_precision(inst.config, role)
     for port in endpoint.selected_ports(binding.count):
-        if output:
-            staging = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, port)
-        else:
-            staging = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, port)
+        staging = inst.staging[endpoint.tensor][port]
+        if not output:
+            staging = copy.deepcopy(staging)
             rebase_descriptor_offset(staging, endpoint.offset_base)
             inner = int(staging['inner_dimension'])
             if int(staging['io_tiling_dimension'][inner]) < staging_tile_shape(staging)[inner]:

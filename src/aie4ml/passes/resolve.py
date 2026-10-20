@@ -23,12 +23,9 @@ def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
         contract = inst.variant.output_staging_contract(inst.node, inst.config, tensor)
         if contract is None:
             continue
-        ports = range(int(inst.variant.output_port_count(inst.node, inst.config)))
         contracts[tensor] = TensorContract(
             contract=contract,
-            port_staging=tuple(
-                inst.variant.describe_output_staging(inst.node, inst.config, tensor, port) for port in ports
-            ),
+            port_staging=inst.staging[tensor],
             inner_shards=inst.variant.output_inner_shards(inst.node, inst.config, tensor),
             view=inst.port_views[tensor],
         )
@@ -60,7 +57,6 @@ def resolve_instance(node, device, input_contracts, choice=None, shared=()) -> E
     if set(shared) - {item.tensor for item in inputs}:
         raise RuntimeError(f'{node.name}: shares {sorted(shared)}, but reads {[item.tensor for item in inputs]}.')
     outputs = tuple(t.name for t in node.outputs)
-    _check_port_frames(node, config, variant, ports)
     return ExecutionInstance(
         node=node,
         variant=variant,
@@ -68,9 +64,7 @@ def resolve_instance(node, device, input_contracts, choice=None, shared=()) -> E
         io_route=dict(config.io_route),
         port_views={name: config.io_views[name] for name in (*(item.tensor for item in inputs), *outputs)},
         config=config,
-        graph_header=variant.graph_header,
-        graph_name=variant.graph_name,
-        param_template=variant.param_template,
+        staging=port_staging(node, variant, config, ports),
         inputs=inputs,
         outputs=outputs,
     )
@@ -87,23 +81,27 @@ def _check_fits_array(node, parallelism, device) -> None:
         )
 
 
-def _check_port_frames(node, config, variant, ports) -> None:
-    """Transport reads a port's staging as where its buffer sits in the op's frame (`offset`) and which element of
+def port_staging(node, variant, config, ports) -> dict[str, tuple]:
+    """Each bound tensor's staging, port by port, as the variant describes it: what transport reads of the kernel.
+
+    Transport reads a port's staging as where its buffer sits in the op's frame (`offset`) and which element of
     the tensor that is (`logical_origin`), so all the ports of one tensor place the frame at one origin."""
+    staging = {}
     for bindings, describe in (
-        (ports.inputs, lambda tensor, port: variant.describe_input_staging(node, config, tensor, port)),
-        (ports.outputs, lambda tensor, port: variant.describe_output_staging(node, config, tensor, port)),
+        (ports.inputs, variant.describe_input_staging),
+        (ports.outputs, variant.describe_output_staging),
     ):
         for tensor, binding in bindings.items():
-            origins = set()
-            for port in range(int(binding.count)):
-                staging = describe(tensor, port)
-                origins.add(tuple(int(o) - int(b) for o, b in zip(staging['logical_origin'], staging['offset'])))
+            staging[tensor] = tuple(describe(node, config, tensor, port) for port in range(int(binding.count)))
+            origins = {
+                tuple(int(o) - int(b) for o, b in zip(s['logical_origin'], s['offset'])) for s in staging[tensor]
+            }
             if len(origins) > 1:
                 raise RuntimeError(
                     f"{node.name}: the ports of {tensor!r} place its frame at {sorted(origins)}; each port's "
                     '`logical_origin` must be its `offset` from one frame origin.'
                 )
+    return staging
 
 
 def _check_transposed_views(node, config, variant) -> None:

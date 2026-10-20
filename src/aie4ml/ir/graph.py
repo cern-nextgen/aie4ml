@@ -418,9 +418,7 @@ class ExecutionInstance:
     io_route: Dict[str, Any]
     port_views: Dict[str, Any]  # the view of each value it reads or writes; config.io_views is the kernel's own
     config: Any
-    graph_header: str
-    graph_name: str
-    param_template: str
+    staging: Dict[str, Tuple[Dict[str, Any], ...]]  # each bound tensor's staging, port by port; read only
     inputs: Tuple[ExecutionInput, ...] = ()
     outputs: Tuple[str, ...] = ()
     artifacts: Dict[str, Any] = field(default_factory=dict)

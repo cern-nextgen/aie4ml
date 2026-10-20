@@ -361,8 +361,8 @@ def test_conv_partitions_channel_blocks_across_tiles(conv_model, tmp_path):
 
     # Each of c1's ports carries one channel block of the shared frame, and c2 reads them back.
     tensor = c1.node.outputs[0].name
-    write = [c1.variant.describe_output_staging(c1.node, c1.config, tensor, port) for port in range(3)]
-    read = [c2.variant.describe_input_staging(c2.node, c2.config, tensor, port) for port in range(3)]
+    write = [c1.staging[tensor][port] for port in range(3)]
+    read = [c2.staging[tensor][port] for port in range(3)]
     assert [d['tiling_dimension'][0] for d in write] == [8, 8, 8]
     assert [d['offset'][0] for d in write] == [0, 8, 16]
     assert all(w['tile_traversal'] == r['tile_traversal'] and w['offset'] == r['offset'] for w, r in zip(write, read))
@@ -574,7 +574,7 @@ def test_outer_splits_rows_into_overlapping_slices(tmp_path):
 
     view = conv.config.io_views[conv.node.inputs[0].name]
     assert view.full[1] == H + 2 and view.tile[1] == H // 2 + 2  # a slice of 4 rows plus its halo
-    ports = [conv.variant.describe_input_staging(conv.node, conv.config, conv.node.inputs[0].name, p) for p in (0, 1)]
+    ports = [conv.staging[conv.node.inputs[0].name][p] for p in (0, 1)]
     assert [d['offset'][2] for d in ports] == [0, 4]  # the second slice starts 4 frame rows in
     assert [d['logical_origin'][2] for d in ports] == [-1, 3]  # slice 0 opens on the top border
     assert all(staging_tile_shape(d)[2] == H // 2 + 2 for d in ports)
@@ -584,9 +584,7 @@ def test_outer_splits_rows_into_overlapping_slices(tmp_path):
     assert not params['fills_border']  # the host delivers each slice's window, border included
 
     # Each slice writes its own rows of the output, which the host reassembles.
-    out_ports = [
-        conv.variant.describe_output_staging(conv.node, conv.config, conv.node.outputs[0].name, p) for p in (0, 1)
-    ]
+    out_ports = [conv.staging[conv.node.outputs[0].name][p] for p in (0, 1)]
     assert [d['logical_origin'][2] for d in out_ports] == [0, H // 2]
     assert all(staging_tile_shape(d)[2] == H // 2 for d in out_ports)
 
@@ -727,7 +725,7 @@ def test_row_bands_of_a_valid_window_read_further_into_each_band(tmp_path):
         (1, 4, 2),
         (2, 2, 1),
     ]
-    reads = [d.variant.describe_input_staging(d.node, d.config, tensor, port) for port in range(3)]
+    reads = [d.staging[tensor][port] for port in range(3)]
     assert [staging['logical_origin'][2] for staging in reads] == [0, 2, 4]
     legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['target'].startswith('d_aie.')]
     assert len(legs) == 7 and {e['realization'] for e in legs} == {'shared_memory'}
@@ -769,8 +767,8 @@ def test_stream_conv_carries_the_logical_tensor(tmp_path):
 
     logical = [C2, W, H, 1]  # buffer order: channels, columns, rows, batch
     for staging in (
-        conv.variant.describe_input_staging(conv.node, conv.config, conv.node.inputs[0].name, 0),
-        conv.variant.describe_output_staging(conv.node, conv.config, conv.node.outputs[0].name, 0),
+        conv.staging[conv.node.inputs[0].name][0],
+        conv.staging[conv.node.outputs[0].name][0],
     ):
         assert staging['storage_layout'] == 'linear'
         assert staging['tiling_dimension'] == staging['buffer_dimension'] == logical
@@ -981,10 +979,10 @@ def test_strided_conv_retiles_its_producers_frame(tmp_path):
 
     # The retiler reads the producer's frame as written; only a retiler writes a column-grouped one.
     write = output_staging(ctx, 'first_aie')
-    read = retile.variant.describe_input_staging(retile.node, retile.config, 'first_relu', 0)
+    read = retile.staging['first_relu'][0]
     assert write['tile_traversal'] == read['tile_traversal'] and write['offset'] == read['offset']
     assert 'column_phases' not in write and 'transfer_bytes' not in read
-    assert second.variant.describe_input_staging(second.node, second.config, frame, 0)['column_phases'] == 2
+    assert second.staging[frame][0]['column_phases'] == 2
     assert not second.variant.build_template_params(second.node, second.config, {'row': 0, 'col': 0})['fills_border']
 
     def pinned(inst, group):
@@ -1004,7 +1002,7 @@ def test_strided_conv_retiles_its_producers_frame(tmp_path):
     assert [w.first_channel for w in retile.config.windows] == [0, 8]
     for port in range(2):
         write = output_staging(ctx, 'first_aie', port)
-        read = retile.variant.describe_input_staging(retile.node, retile.config, 'first_relu', port)
+        read = retile.staging['first_relu'][port]
         assert write['offset'] == read['offset']
     legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['tensor'] == 'first_relu']
     assert [e['realization'] for e in legs] == ['shared_memory'] * 2
@@ -1148,11 +1146,11 @@ def test_folded_row_bands_and_channel_slices_each_get_a_folder(tmp_path):
     assert conv.config.input_fold.unit == 2 and conv.config.io_views[frame].tile == (1, 6, 16, 8)  # 18 B: 3 blocks
     params = fold.variant.kernel_params(fold.node, fold.config)
     assert (params['blocks'], params['first_blocks']) == (1, [0, 1, 2, 0, 1, 2])
-    reads = [fold.variant.describe_input_staging(fold.node, fold.config, 'x_q', port) for port in (0, 3)]
+    reads = [fold.staging[fold.inputs[0].tensor][port] for port in (0, 3)]
     assert [d['logical_origin'][2] for d in reads] == [-1, 5]  # band 1's rows start one above its own
     assert all(staging_tile_shape(d)[2] == 8 for d in reads)
-    written = [fold.variant.describe_output_staging(fold.node, fold.config, frame, port) for port in range(6)]
-    read = [conv.variant.describe_input_staging(conv.node, conv.config, frame, port) for port in range(6)]
+    written = [fold.staging[fold.outputs[0]][port] for port in range(6)]
+    read = [conv.staging[conv.inputs[0].tensor][port] for port in range(6)]
     assert [w['offset'] for w in written] == [r['offset'] for r in read]
 
 
@@ -1230,8 +1228,8 @@ def test_strided_conv_splits_by_rows(tmp_path):
         RetileWindow(first_row=5, rows=7, origin_row=0, first_channel=0, channels=8, transfer_bytes=1008),
         RetileWindow(first_row=11, rows=7, origin_row=0, first_channel=0, channels=8, transfer_bytes=1008),
     )
-    reads = [conv.variant.describe_input_staging(conv.node, conv.config, conv.inputs[0].tensor, b) for b in range(3)]
-    writes = [retile.variant.describe_output_staging(retile.node, retile.config, '', b) for b in range(3)]
+    reads = [conv.staging[conv.inputs[0].tensor][b] for b in range(3)]
+    writes = [retile.staging[retile.outputs[0]][b] for b in range(3)]
     assert [d['offset'] for d in reads] == [d['offset'] for d in writes]
     assert [d['offset'][2] for d in reads] == [0, 6, 12]  # three output rows a slice, stride 2
     edges = [e for e in ctx.ir.physical.plan['direct_edges'] if e['tensor'] == conv.inputs[0].tensor]
@@ -1245,8 +1243,8 @@ def test_strided_conv_splits_by_rows(tmp_path):
     assert [(w.first_row, w.first_channel, w.channels) for w in retile.config.windows] == [
         (row, first, count) for row in (0, 5, 11) for first, count in ((0, 8), (8, 4))
     ]
-    reads = [conv.variant.describe_input_staging(conv.node, conv.config, conv.inputs[0].tensor, p) for p in range(6)]
-    writes = [retile.variant.describe_output_staging(retile.node, retile.config, '', p) for p in range(6)]
+    reads = [conv.staging[conv.inputs[0].tensor][p] for p in range(6)]
+    writes = [retile.staging[retile.outputs[0]][p] for p in range(6)]
     assert [d['offset'] for d in reads] == [d['offset'] for d in writes]
     assert not conv.inputs[0].shared_memory
 

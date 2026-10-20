@@ -102,7 +102,7 @@ def direct_edges(ctx) -> set:
 def output_staging(ctx, node: str, port: int = 0) -> dict:
     """The descriptor a node writes with. Equality across an edge is what makes it direct."""
     inst = ctx.ir.execution.get(node)
-    return inst.variant.describe_output_staging(inst.node, inst.config, inst.node.outputs[0].name, port)
+    return inst.staging[inst.node.outputs[0].name][port]
 
 
 # --------------------------------------------------------------------------- #
