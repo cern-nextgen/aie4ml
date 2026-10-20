@@ -7,7 +7,7 @@ from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
 from ...base import rom_artifact
 from ...registry import register_variant
-from ...row_wise import RowWiseOpImplVariant, TiledRowWiseMixin
+from ...row_wise import RowWiseVariantBase, TiledRowWiseMixin
 from ...utils import (
     ParallelismConfig,
     build_io_views,
@@ -60,7 +60,7 @@ def _resolve_eps_q0(node_name: str, metadata: dict, input_frac: int) -> int:
     return eps_q0
 
 
-class _LayerNormVariantBase(RowWiseOpImplVariant):
+class _LayerNormVariantBase(RowWiseVariantBase):
     """Everything the LayerNorm variants share, independent of the layout they normalise in."""
 
     #: The `layout:` directive name this variant answers to -- the sole selector between the

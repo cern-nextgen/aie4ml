@@ -10,7 +10,7 @@ from .common_types import PortBinding, PortMap, kernel_endpoints
 from .utils import MicrotileShape, describe_partition_staging, inherited_microtile
 
 
-class RowWiseOpImplVariant(OpImplVariant):
+class RowWiseVariantBase(OpImplVariant):
     """One kernel per row band, a buffer in and a buffer out each."""
 
     def describe_input_staging(self, _node, config, tensor_name, port):

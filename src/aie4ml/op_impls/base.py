@@ -120,7 +120,7 @@ class LayoutConversion:
     name: str
     source: str
     target: str
-    variant: 'KernelVariant'
+    variant: 'OpImplVariant'
     config: Any
     shared_memory: bool
     source_view: Any
@@ -143,15 +143,41 @@ def rom_artifact(
     }
 
 
-class KernelVariant(ABC):
-    """A kernel graph the compiler can build: its parameters, ports and staging, where it pins its buffers, and the
-    constants it carries. A layout converter is one; an `OpImplVariant` is one that implements a logical op."""
+class OpImplVariant(ABC):
+    """One kernel graph implementing an op: its parameters, ports and staging, where it pins its buffers, and the
+    constants it carries. A registered variant is one resolution selects (`register_variant`): it applies where
+    `matches` says, preferred by `plevel`, on its port kinds, to a node whose fusions and output view it declares. A
+    layout converter implements an execution-only op its consumer's variant asks for, and is never selected."""
 
     variant_id: ClassVar[str] = ''
     op_type: ClassVar[str] = ''
     graph_header: ClassVar[str] = ''
     graph_name: ClassVar[str] = ''
     param_template: ClassVar[str] = ''
+    plevel: ClassVar[int] = 10  # higher value = higher selection priority
+    kernel_transposes_microtile: ClassVar[bool] = False
+    input_port_kind: ClassVar[str] = PORT_KIND_BUFFER
+    output_port_kind: ClassVar[str] = PORT_KIND_BUFFER
+    # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
+    supported_directives: ClassVar[frozenset] = frozenset()
+    # What its kernels fuse ('bias', 'relu', '<kind>_pool', an absorbed 'output_scale' or 'input_scale',
+    # 'apply_alpha') and the output views they write: a node carrying another resolves to another variant.
+    supported_fusions: ClassVar[frozenset] = frozenset()
+    supported_output_views: ClassVar[frozenset] = frozenset()
+
+    def matches(self, node: OpNode, device: Any, directives: Dict[str, Any]) -> bool:
+        """Whether it implements `node` on `device` under `directives`; required of a registered variant."""
+        raise NotImplementedError
+
+    def resolve(self, node: OpNode, device: Any, directives: Dict[str, Any], input_contracts: Dict[str, Any]) -> Any:
+        """Its config for `node`, given the contracts its inputs arrive in; required of a registered variant."""
+        raise NotImplementedError
+
+    def input_conversions(
+        self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]
+    ) -> Tuple['LayoutConversion', ...]:
+        """Conversions for inputs whose `sources` (execution values) arrive in a layout the op cannot read."""
+        return ()
 
     @abstractmethod
     def kernel_params(self, node: OpNode, config: Any) -> Dict[str, Any]:
@@ -236,33 +262,3 @@ class KernelVariant(ABC):
                     f'{node.name}: {self.variant_id} needs {len(streams)} {direction} stream ports per kernel '
                     f'({", ".join(streams)}) but {device.platform} cores have {budget}.'
                 )
-
-
-class OpImplVariant(KernelVariant):
-    """A kernel variant implementing one logical op type, chosen by resolution: it applies where `matches` says,
-    preferred by `plevel`, on its port kinds, to a node whose fusions and output view it declares."""
-
-    plevel: ClassVar[int] = 10  # higher value = higher selection priority
-    kernel_transposes_microtile: ClassVar[bool] = False
-    input_port_kind: ClassVar[str] = PORT_KIND_BUFFER
-    output_port_kind: ClassVar[str] = PORT_KIND_BUFFER
-    # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
-    supported_directives: ClassVar[frozenset] = frozenset()
-    # What its kernels fuse ('bias', 'relu', '<kind>_pool', an absorbed 'output_scale' or 'input_scale',
-    # 'apply_alpha') and the output views they write: a node carrying another resolves to another variant.
-    supported_fusions: ClassVar[frozenset] = frozenset()
-    supported_output_views: ClassVar[frozenset] = frozenset()
-
-    @abstractmethod
-    def matches(self, node: OpNode, device: Any, directives: Dict[str, Any]) -> bool:
-        """Whether it implements `node` on `device` under `directives`."""
-
-    @abstractmethod
-    def resolve(self, node: OpNode, device: Any, directives: Dict[str, Any], input_contracts: Dict[str, Any]) -> Any:
-        """Its config for `node`, given the contracts its inputs arrive in."""
-
-    def input_conversions(
-        self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]
-    ) -> Tuple['LayoutConversion', ...]:
-        """Conversions for inputs whose `sources` (execution values) arrive in a layout the op cannot read."""
-        return ()

@@ -24,11 +24,11 @@ from .common import (
     requested_contract,
 )
 from .config import MatmulConfig, MatmulFlags
-from .dense import _BaseDenseMatmulVariant
+from .dense import _MatmulFamilyVariantBase
 from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg
 
 
-class _MatmulVariantBase(_BaseDenseMatmulVariant):
+class _MatmulVariantBase(_MatmulFamilyVariantBase):
     """Everything the matmul variants share, independent of which contract they implement."""
 
     op_type = 'matmul'

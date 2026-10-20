@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Dict
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpNode, input_tensor_for_role
 from ...registry import register_variant
-from ...row_wise import RowWiseOpImplVariant, TiledRowWiseMixin
+from ...row_wise import RowWiseVariantBase, TiledRowWiseMixin
 from ...utils import (
     ParallelismConfig,
     build_io_views,
@@ -50,7 +50,7 @@ def _parse_hccs_directives(node_name: str, directives) -> dict:
     return hccs
 
 
-class _SoftmaxVariantBase(RowWiseOpImplVariant):
+class _SoftmaxVariantBase(RowWiseVariantBase):
     """Everything Softmax variants share, independent of approximation and layout.
 
     The kernel is picked on two axes: `approximation` ('hccs' calibrated clipped-linear surrogate,

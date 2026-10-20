@@ -10,7 +10,7 @@ import numpy as np
 from ..aie_types import PrecisionIntent
 
 if TYPE_CHECKING:  # pragma: no cover - runtime circular import guard
-    from ..op_impls import KernelVariant
+    from ..op_impls import OpImplVariant
 
 
 @dataclass
@@ -413,7 +413,7 @@ class ExecutionInstance:
     execution-only node for a kernel a lowering pass inserted. Connectivity is `inputs`/`outputs`."""
 
     node: OpNode
-    variant: 'KernelVariant'
+    variant: 'OpImplVariant'
     ports: Any
     io_route: Dict[str, Any]
     port_views: Dict[str, Any]  # the view of each value it reads or writes; config.io_views is the kernel's own

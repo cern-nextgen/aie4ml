@@ -6,10 +6,10 @@ import numpy as np
 
 from .common import describe_frame_staging
 from .config import FrameFoldConfig
-from .frame_retile import FrameRetileVariant
+from .frame_retile import FrameRetileOpImplVariant
 
 
-class FrameFoldVariant(FrameRetileVariant):
+class FrameFoldOpImplVariant(FrameRetileOpImplVariant):
     """Reads the input window the boundary carries, its channels padded to a power of two, and writes the frame a
     folded conv reads: per output pixel its whole window, as the channels of a 1x1 conv. One kernel per window, on
     consecutive rows: the whole frame, or one per tile the conv splits it into -- a row slice ('outer' chains), a

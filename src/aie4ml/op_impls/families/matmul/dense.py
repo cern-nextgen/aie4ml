@@ -46,7 +46,7 @@ from .config import DenseConfig, DenseFlags
 from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg
 
 
-class _BaseDenseMatmulVariant(OpImplVariant):
+class _MatmulFamilyVariantBase(OpImplVariant):
     """Unregistered shared base for Dense and Matmul variants."""
 
     contract: ClassVar[str]
@@ -102,7 +102,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
         return str(config.parallelism.contract)
 
 
-class _DenseVariantBase(_BaseDenseMatmulVariant):
+class _DenseVariantBase(_MatmulFamilyVariantBase):
     """Everything the dense variants share, independent of which contract they implement."""
 
     op_type = 'dense'

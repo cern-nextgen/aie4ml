@@ -29,6 +29,9 @@ def get_op_impl_registry() -> OpImplRegistry:
 
 
 def register_variant(cls):
+    missing = [hook for hook in ('matches', 'resolve') if getattr(cls, hook) is getattr(OpImplVariant, hook)]
+    if missing:
+        raise TypeError(f'{cls.__name__}: registered for resolution to select, it must implement {missing}.')
     if cls.param_template:
         expected = _TEMPLATE_ROOT / cls.param_template / 'parameters.h.jinja'
         if not expected.exists():
