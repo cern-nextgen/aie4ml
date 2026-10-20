@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
@@ -119,7 +120,7 @@ class LayoutConversion:
     name: str
     source: str
     target: str
-    variant: 'OpImplVariant'
+    variant: 'KernelVariant'
     config: Any
     shared_memory: bool
     source_view: Any
@@ -142,56 +143,40 @@ def rom_artifact(
     }
 
 
-class OpImplVariant:
-    """Self-contained compilation unit for one op variant.
-
-    Each subclass owns the full lifecycle: selection (matches + plevel),
-    configuration (resolve), verification (validate_config), and code
-    generation (build_template_params, build_ports, pack, get_artifacts).
-    """
+class KernelVariant(ABC):
+    """A kernel graph the compiler can build: its parameters, ports and staging, where it pins its buffers, and the
+    constants it carries. A layout converter is one; an `OpImplVariant` is one that implements a logical op."""
 
     variant_id: ClassVar[str] = ''
     op_type: ClassVar[str] = ''
     graph_header: ClassVar[str] = ''
     graph_name: ClassVar[str] = ''
     param_template: ClassVar[str] = ''
-    plevel: ClassVar[int] = 10  # higher value = higher selection priority
-    kernel_transposes_microtile: ClassVar[bool] = False
-    input_port_kind: ClassVar[str] = PORT_KIND_BUFFER
-    output_port_kind: ClassVar[str] = PORT_KIND_BUFFER
-    # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
-    supported_directives: ClassVar[frozenset] = frozenset()
-    # What its kernels fuse ('bias', 'relu', '<kind>_pool', an absorbed 'output_scale' or 'input_scale',
-    # 'apply_alpha') and the output views they write: a node carrying another resolves to another variant.
-    supported_fusions: ClassVar[frozenset] = frozenset()
-    supported_output_views: ClassVar[frozenset] = frozenset()
 
-    def matches(self, _node: OpNode, _device: Any, _directives: Dict[str, Any]) -> bool:
-        raise NotImplementedError
+    @abstractmethod
+    def kernel_params(self, node: OpNode, config: Any) -> Dict[str, Any]:
+        """What the kernel's configuration struct is generated from, placement aside: everything the compiler
+        schedules the kernel from."""
 
-    def resolve(
-        self, _node: OpNode, _device: Any, _directives: Dict[str, Any], _input_contracts: Dict[str, Any]
-    ) -> Any:
-        raise NotImplementedError
+    @abstractmethod
+    def build_ports(self, node: OpNode, config: Any) -> PortMap:
+        """Each tensor it reads or writes, bound to a port group of `count` ports."""
+
+    @abstractmethod
+    def describe_input_staging(self, node: OpNode, config: Any, tensor_name: str, port: int) -> Dict[str, Any]:
+        """What one input port's buffer holds of the tensor, and how (`op_impls.utils.tensor_view`)."""
+
+    @abstractmethod
+    def describe_output_staging(self, node: OpNode, config: Any, tensor_name: str, port: int) -> Dict[str, Any]:
+        """What one output port's buffer holds of the tensor, and how."""
 
     def validate_config(self, _node: OpNode, _config: Any, _device: Any) -> None:
         """Post-lowering attribute verifier. Override to enforce kernel ABI rules."""
-
-    def kernel_params(self, _node: OpNode, _config: Any) -> Dict[str, Any]:
-        """What the kernel's configuration struct is generated from, placement aside: everything the compiler
-        schedules the kernel from."""
-        raise NotImplementedError(f'{self.variant_id} does not separate its kernel parameters from its placement.')
 
     def build_template_params(self, node: OpNode, config: Any, placement: Dict[str, int]) -> Dict[str, Any]:
         """The kernel parameters, then where placement puts its buffers."""
         locations = self.buffer_locations(node, config, int(placement['row']))
         return {**self.kernel_params(node, config), 'buffer_locations': locations}
-
-    def input_conversions(
-        self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]
-    ) -> Tuple['LayoutConversion', ...]:
-        """Conversions for inputs whose `sources` (execution values) arrive in a layout the op cannot read."""
-        return ()
 
     def buffer_locations(self, _node: OpNode, _config: Any, _anchor_row: int) -> Tuple[BufferLocation, ...]:
         """Return transport-visible buffers relative to an op anchor.
@@ -232,27 +217,11 @@ class OpImplVariant:
     def output_precision(self, config: Any) -> Any:
         return config.precision['output']
 
-    def describe_output_staging(self, _node: OpNode, _config: Any, _tensor_name: str, _port: int) -> Any:
-        return None
-
-    def describe_input_staging(
-        self,
-        _consumer: OpNode,
-        _config: Any,
-        _tensor_name: str,
-        _port: int,
-    ) -> Any:
-        return None
-
     def work(self, node: OpNode, config: Any) -> Optional[int]:
         """Multiply-accumulates one tile computes per call, padding included: the size of this stage by which designs
         are compared (`estimate.kernel_cycles`). A proxy for time, not a measure of it. None for a variant that only
         moves data, which its loads alone estimate."""
         return None
-
-    def build_ports(self, _node: OpNode, _config: Any) -> PortMap:
-        """Assemble the PortMap for this variant.  Must be overridden."""
-        raise NotImplementedError
 
     def validate_ports(self, node: OpNode, ports: PortMap, device: Any) -> None:
         """Every kernel of an op sees at most one port per group, so the stream groups must fit
@@ -267,3 +236,33 @@ class OpImplVariant:
                     f'{node.name}: {self.variant_id} needs {len(streams)} {direction} stream ports per kernel '
                     f'({", ".join(streams)}) but {device.platform} cores have {budget}.'
                 )
+
+
+class OpImplVariant(KernelVariant):
+    """A kernel variant implementing one logical op type, chosen by resolution: it applies where `matches` says,
+    preferred by `plevel`, on its port kinds, to a node whose fusions and output view it declares."""
+
+    plevel: ClassVar[int] = 10  # higher value = higher selection priority
+    kernel_transposes_microtile: ClassVar[bool] = False
+    input_port_kind: ClassVar[str] = PORT_KIND_BUFFER
+    output_port_kind: ClassVar[str] = PORT_KIND_BUFFER
+    # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
+    supported_directives: ClassVar[frozenset] = frozenset()
+    # What its kernels fuse ('bias', 'relu', '<kind>_pool', an absorbed 'output_scale' or 'input_scale',
+    # 'apply_alpha') and the output views they write: a node carrying another resolves to another variant.
+    supported_fusions: ClassVar[frozenset] = frozenset()
+    supported_output_views: ClassVar[frozenset] = frozenset()
+
+    @abstractmethod
+    def matches(self, node: OpNode, device: Any, directives: Dict[str, Any]) -> bool:
+        """Whether it implements `node` on `device` under `directives`."""
+
+    @abstractmethod
+    def resolve(self, node: OpNode, device: Any, directives: Dict[str, Any], input_contracts: Dict[str, Any]) -> Any:
+        """Its config for `node`, given the contracts its inputs arrive in."""
+
+    def input_conversions(
+        self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]
+    ) -> Tuple['LayoutConversion', ...]:
+        """Conversions for inputs whose `sources` (execution values) arrive in a layout the op cannot read."""
+        return ()

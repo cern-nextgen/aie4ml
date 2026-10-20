@@ -10,13 +10,13 @@ from dataclasses import asdict
 
 import numpy as np
 
-from ...base import PING_PONG_BANKS, BufferLocation, OpImplVariant, row_flow
+from ...base import PING_PONG_BANKS, BufferLocation, KernelVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PortBinding, PortMap
 from .common import describe_frame_staging, describe_logical_staging
 from .config import FrameRetileConfig
 
 
-class FrameRetileOpImplVariant(OpImplVariant):
+class FrameRetileVariant(KernelVariant):
     """Reads the tensor the boundary carries, or the frame a producer wrote, and writes the frame a
     strided conv reads: its columns grouped by residue, the image inside a zero border it clears
     every inference. One kernel per window, on consecutive rows: the whole frame, or one per tile the

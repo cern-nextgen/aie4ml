@@ -63,8 +63,8 @@ from .common import (
     spatial_access_of,
 )
 from .config import FOLD_STEP_PIXELS, Conv2dConfig, Conv2dFlags, FrameFoldConfig, FrameRetileConfig, InputFold
-from .frame_fold import FrameFoldOpImplVariant
-from .frame_retile import FrameRetileOpImplVariant
+from .frame_fold import FrameFoldVariant
+from .frame_retile import FrameRetileVariant
 
 STREAM_BAND_ROWS = 4
 """Output rows a streamed kernel computes per core call: the band it keeps in local memory.
@@ -569,7 +569,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         frame = self.retiled_frame(node)
         fold = config.input_fold
         if fold is not None:
-            name, variant = f'{node.name}_fold', FrameFoldOpImplVariant()
+            name, variant = f'{node.name}_fold', FrameFoldVariant()
             converter = FrameFoldConfig.for_frame(
                 config.precision['lhs'],
                 lhs.shape,
@@ -589,7 +589,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                     f'{node.name}: its strided input arrives from {source.producer} split by rows; a retiler reads a '
                     "producer's frame whole."
                 )
-            name, variant = f'{node.name}_retile', FrameRetileOpImplVariant()
+            name, variant = f'{node.name}_retile', FrameRetileVariant()
             converter = FrameRetileConfig.for_frame(
                 config.precision['lhs'],
                 view,

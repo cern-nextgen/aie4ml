@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 from ..errors import ConfigRefused
@@ -26,7 +27,7 @@ def fusions_of(node: Any) -> frozenset:
     return frozenset(fused)
 
 
-class FamilyResolver:
+class FamilyResolver(ABC):
     """Structural validator, variant dispatcher and capability record for one op type; passes ask
     capabilities instead of naming op types. Its capabilities are those some variant declares."""
 
@@ -74,8 +75,9 @@ class FamilyResolver:
             'assume the original row order.'
         )
 
-    def validate_structure(self, _node: Any, _device: Any) -> None:
-        raise NotImplementedError
+    @abstractmethod
+    def validate_structure(self, node: Any, device: Any) -> None:
+        """Refuse a node whose inputs, shapes or attributes no variant of the family implements."""
 
     def _check_output_view(self, node: Any) -> None:
         """A folded output view must be one this family writes; its shape is the output tensor's."""
