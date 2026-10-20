@@ -6,7 +6,6 @@ struct {{L.struct_name}} {
   using weight_t = {{P.precision.rhs.c_type}};
   using result_t = {{P.precision.output.c_type}};
   using bias_t = {{P.precision.bias.c_type}};
-  static constexpr int IN_FEAT = {{L.n_in}}; static constexpr int OUT_FEAT = {{L.n_out}};
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
   static constexpr bool PARALLELISM_CONTRACT_OUTER = {{ 'true' if P.parallelism.contract == 'outer' else 'false' }};
   static constexpr bool STREAM_IN = {{ 'true' if P.stream_in else 'false' }};

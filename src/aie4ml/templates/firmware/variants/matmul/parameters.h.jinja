@@ -8,7 +8,6 @@ struct {{L.struct_name}} {
   using a_t = data_t;
   using b_t = rhs_t;
   using c_t = result_t;
-  static constexpr int IN_FEAT = {{L.n_in}}; static constexpr int OUT_FEAT = {{L.n_out}};
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
   static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};
 {{ buffer_locations('INA_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'inA') | list) }}

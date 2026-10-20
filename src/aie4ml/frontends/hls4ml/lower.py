@@ -166,16 +166,6 @@ class LowerToAieIr(ModelOptimizerPass):
         meta: Dict[str, Any] = {}
 
         if layer.class_name == 'Dense' or is_pointwise_dense(layer):
-            if layer.class_name == 'Dense':
-                n_in = layer.get_attr('n_in')
-                n_out = layer.get_attr('n_out')
-            else:
-                n_in = layer.get_attr('n_chan')
-                n_out = layer.get_attr('n_filt')
-            if n_in is None or n_out is None:
-                raise ValueError(f'{layer.name}: missing n_in/n_out for {layer.class_name}.')
-            meta['n_in'] = int(n_in)
-            meta['n_out'] = int(n_out)
             has_bias = layer.get_attr('bias_data') is not None
             meta['input_roles'] = ['lhs', 'rhs'] + (['bias'] if has_bias else [])
 

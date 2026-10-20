@@ -54,16 +54,13 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
         if bias_name is not None:
             raise ValueError(f'{node_name}: dynamic MatMul does not support fused bias.')
         rhs_tensor = ctx.canonical_source(rhs_name, node_name)
-        rhs_shape = ctx.output_shape(rhs_name, node_name)
-        n_in = int(rhs_shape[0] if len(rhs_shape) == 1 else rhs_shape[-2])
-        n_out = int(1 if len(rhs_shape) == 1 else rhs_shape[-1])
         ctx.emit(
             'matmul',
             node_name,
             inputs=[lhs_tensor, rhs_tensor],
             outputs=[(out_name, out_shape, out_precision)],
             roles=['lhs', 'rhs'],
-            metadata=_matmul_meta('MatMul', n_in, n_out, node_name),
+            metadata=_meta('MatMul', 'MatMul', node_name),
             directives=directives,
         )
         return
@@ -78,8 +75,6 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
     if rhs_data.ndim != 2:
         if op_type == 'Gemm':
             raise ValueError(f'{node_name}: ONNX Gemm weight matrix must be rank-2.')
-        n_in = int(rhs_data.shape[0] if rhs_data.ndim == 1 else rhs_data.shape[-2])
-        n_out = int(1 if rhs_data.ndim == 1 else rhs_data.shape[-1])
         rhs_param = ctx.param_tensor(f'{node_name}_rhs', rhs_data, rhs_tensor.precision)
         ctx.emit(
             'matmul',
@@ -87,12 +82,12 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
             inputs=[lhs_tensor, rhs_param],
             outputs=[(out_name, out_shape, out_precision)],
             roles=['lhs', 'rhs'],
-            metadata=_matmul_meta('MatMul', n_in, n_out, node_name),
+            metadata=_meta('MatMul', 'MatMul', node_name),
             directives=directives,
         )
         return
 
-    n_in, n_out = int(rhs_data.shape[0]), int(rhs_data.shape[1])
+    n_out = int(rhs_data.shape[1])
     rhs_param = ctx.param_tensor(f'{node_name}_weight', rhs_data, rhs_tensor.precision)
 
     ctx.emit_with_bias(
@@ -101,7 +96,7 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
         inputs=[lhs_tensor, rhs_param],
         roles=['lhs', 'rhs'],
         output=(out_name, out_shape, out_precision),
-        metadata=_dense_meta(op_type, n_in, n_out, node_name),
+        metadata=_meta('Dense', op_type, node_name),
         directives=directives,
         bias_name=bias_name,
         channels=n_out,
@@ -109,21 +104,5 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
     )
 
 
-def _matmul_meta(source_class: str, n_in: int, n_out: int, node_name: str) -> dict:
-    return {
-        'n_in': n_in,
-        'n_out': n_out,
-        'layer_class': 'MatMul',
-        'source_class': source_class,
-        'source_layer': node_name,
-    }
-
-
-def _dense_meta(source_class: str, n_in: int, n_out: int, node_name: str) -> dict:
-    return {
-        'n_in': n_in,
-        'n_out': n_out,
-        'layer_class': 'Dense',
-        'source_class': source_class,
-        'source_layer': node_name,
-    }
+def _meta(layer_class: str, source_class: str, node_name: str) -> dict:
+    return {'layer_class': layer_class, 'source_class': source_class, 'source_layer': node_name}

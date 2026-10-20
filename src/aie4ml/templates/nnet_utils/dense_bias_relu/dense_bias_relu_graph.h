@@ -44,8 +44,6 @@ struct dense_buffer_kernels<ConfigT, 4> {
 template<typename ConfigT>
 class dense_bias_relu_graph : public graph {
 public:
-  static constexpr unsigned IN_FEAT  = ConfigT::IN_FEAT;
-  static constexpr unsigned OUT_FEAT = ConfigT::OUT_FEAT;
   static constexpr unsigned CAS_NUM  = ConfigT::CAS_NUM;
   static constexpr unsigned CAS_LENGTH = ConfigT::CAS_LENGTH;
   static constexpr unsigned IN_FEAT_SLICE  = ConfigT::IN_FEAT_SLICE;

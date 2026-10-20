@@ -33,7 +33,6 @@ def _layer(inst, placement, struct_name: str) -> dict:
         },
         'placement': placement,
     }
-    layer.update({k: inst.node.metadata[k] for k in ('n_in', 'n_out') if k in inst.node.metadata})
     return layer
 
 
