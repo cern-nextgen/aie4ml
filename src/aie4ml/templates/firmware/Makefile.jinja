@@ -111,7 +111,7 @@ XPFM_GUARD :=
 .PHONY: hw hw_emu aiecom kernels xsa_hw xsa_hw_emu host package_hw package_hw_emu run_emu
 {% endif %}
 
-.PHONY: help clean compile all ps x86all x86com x86sim sim profile trace analyze
+.PHONY: help clean compile all ps x86all x86com x86sim aiesim profile trace analyze
 
 help::
 	@echo "Makefile Usage:"
@@ -232,12 +232,12 @@ clean:
 	rm -rf x86simulator_output* x86simulator*.log
 	rm -rf log log*
 	rm -f stamp_*.marker
-	rm -rf *.xpe *.elf *.db *.soln Map_* xnw* *.lp *.log .xil .Xil *.lp *.db *.log *.exe *.vcd *.json
+	rm -rf *.xpe *.elf *.db *.soln Map_* xnw* *.lp *.log .xil .Xil *.lp *.db *.log *.exe *.vcd
 	rm -rf vitis_analyzer* pl_sample_counts* pl_sample_count_*
 	rm -rf temp ISS_RPC_SERVER_PORT .crashReporter .AIE_SIM_CMD_LINE_OPTIONS
 	rm -rf trdata.aiesim function_wdb_dir .wsdata vfs_work _ide .ipynb_checkpoints
-	# Remove generated system* build artifacts but keep the template-authored system.cfg.
-	find . -maxdepth 1 -name 'system*.*' ! -name 'system.cfg' -exec rm -rf {} +
+	# Keep what the generator wrote: system.cfg, and aie_pipeline.json, which the report reads.
+	find . -maxdepth 1 \( -name 'system*.*' ! -name 'system.cfg' -o -name '*.json' ! -name 'aie_pipeline.json' \) -exec rm -rf {} +
 {% if is_hardware %}
 	rm -rf $(OUTPUT_DIR) *.xsa *.xsa.* *.xclbin* *$(PFM)* _x v++_*
 {% for k in pl_plan.kernels %}
