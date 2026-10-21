@@ -18,7 +18,6 @@ from ...base import OpImplVariant, StreamLocation, cascade_locations, cascade_po
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
-from ...utils.io import view_shape
 from ...utils.precision import (
     aie_rounding_token,
     element_bytes,
@@ -43,7 +42,7 @@ from .common import (
     requested_contract,
 )
 from .config import DenseConfig, DenseFlags
-from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg
+from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg, matmul_dims
 
 
 class _MatmulFamilyVariantBase(OpImplVariant):
@@ -364,8 +363,8 @@ class DenseVectorOpImplVariant(DenseOpImplVariant):
         block = _resolve_tile_cfg(
             node, device, precision['lhs'], precision['rhs'], directives.get('microtiling'), fewest_rows=True
         )
-        rows = int(np.prod(view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')[:-1]))
-        return rows <= block.microtile_m
+        dims = matmul_dims(node)
+        return dims.outer * dims.rows <= block.microtile_m
 
 
 @register_variant

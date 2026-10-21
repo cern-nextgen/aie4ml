@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 from aie4ml.report import _aie_clock_ghz, _analyze_aie_out_interval
 from aie4ml.report_layout import format_svg_layout, format_terminal_layout, layout_from_pipeline
+from aie4ml.serialization import serialize_logical_node
+from helpers import TensorProto, helper, lower, make_model, numpy_helper, qdq, qparams
 
 
 def _pipeline(elements: int) -> dict:
@@ -310,3 +313,23 @@ def test_a_kernel_inlined_into_its_tile_loop_is_estimated_from_its_instructions(
     kernels = {k['op']: k for k in _kernel_cycles(tmp_path, {'aie_tile_row_start': 3})}
     assert (kernels['c1_aie']['cycles_per_call'], kernels['c1_aie'].get('estimated')) == (1229, None)
     assert (kernels['add_aie']['cycles_per_call'], kernels['add_aie']['estimated']) == (round((936 - 48) / 5), True)
+
+
+def test_a_dense_reading_its_input_transposed_is_rated_by_its_reduction(tmp_path):
+    """Rows x K x N of the LHS as the Dense reads it: a (8, 16) value read transposed has 16 rows of K = 8."""
+    nodes, inits = [], [*qparams('x'), *qparams('w'), *qparams('y')]
+    nodes.append(helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x']))
+    nodes.append(helper.make_node('Transpose', ['x'], ['xt'], perm=[1, 0]))
+    inits.append(numpy_helper.from_array(np.ones((8, 4), np.int8), 'w_q'))
+    nodes.append(helper.make_node('DequantizeLinear', ['w_q', 'w_scale', 'w_zp'], ['w']))
+    nodes.append(helper.make_node('MatMul', ['xt', 'w'], ['mm'], name='fc'))
+    qdq(nodes, 'mm', 'y', 'y')
+    model = make_model(
+        'transposed',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [8, 16])],
+        outputs=[('y', TensorProto.FLOAT, [16, 4])],
+        initializers=inits,
+    )
+    ctx = lower(model, tmp_path, part='xc2ve3858-ssva2112-2MP-e-S')
+    assert serialize_logical_node(ctx.ir.execution.get('fc_aie').node)['macs'] == 16 * 8 * 4
