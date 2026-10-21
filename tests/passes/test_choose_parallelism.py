@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -300,10 +301,8 @@ def test_dense_offers_splits_its_tiling_pads(tmp_path):
     assert inst.config.io_views[node.outputs[0].name].tile[-1] * 3 > 40
 
 
-def test_the_program_finds_the_design_every_combination_ranks_best(tmp_path):
-    """Two layers' outputs concatenated into a third: the constraint program's design ranks as the best of every
-    combination of an alternative per layer and an arrival per tensor it reads, of a layout its producer's
-    alternative publishes, within the tile budget and the room."""
+def _concat_search(tmp_path):
+    """The search of two layers' outputs concatenated into a third, and its alternatives."""
     from aie4ml.pipeline import DEFAULT_PIPELINE
 
     model = from_onnx(
@@ -318,7 +317,14 @@ def test_the_program_finds_the_design_every_combination_ranks_best(tmp_path):
     )
     shared = choose_parallelism._Shared(logical_values(ctx.ir.logical))
     search = choose_parallelism._Search(ctx, 'latency', 16, shared)
-    alternatives = search._alternatives()
+    return search, search._alternatives()
+
+
+def test_the_program_finds_the_design_every_combination_ranks_best(tmp_path):
+    """Two layers' outputs concatenated into a third: the constraint program's design ranks as the best of every
+    combination of an alternative per layer and an arrival per tensor it reads, of a layout its producer's
+    alternative publishes, within the tile budget and the room."""
+    search, alternatives = _concat_search(tmp_path)
     assert any(len(alt.arrivals) == 2 for alt in alternatives['tail_aie'])
 
     def designs():
@@ -341,6 +347,28 @@ def test_the_program_finds_the_design_every_combination_ranks_best(tmp_path):
 
     best = min(search.rank(design) for design in designs())
     assert search.rank(search._design(alternatives, search._solve(alternatives, []))) == best
+
+
+def test_a_design_built_cuts_every_design_placed_alike_that_costs_no_less(tmp_path):
+    """Once a design is built, the search builds none placed alike that costs no less in every layer: whatever
+    placement makes of it, it ranks no better. An alternative of one kernel slower is cut with the one built; one of
+    a kernel faster is still to build."""
+    search, alternatives = _concat_search(tmp_path)
+    picks = search._solve(alternatives, [])
+    built = choose_parallelism._keys(alternatives, picks, choose_parallelism._alike)
+    i = picks['tail_aie'][0]
+    alt = alternatives['tail_aie'][i]
+    for change in (1, -1):
+        alternatives['tail_aie'].append(replace(alt, cycles=tuple(cc + change for cc in alt.cycles)))
+    cut = choose_parallelism._groups(alternatives, built, choose_parallelism._alike, choose_parallelism._no_better)
+    (cut_alts,) = (indices for name, tensor, indices in cut if name == 'tail_aie' and tensor is None)
+    slower, faster = len(alternatives['tail_aie']) - 2, len(alternatives['tail_aie']) - 1
+    assert {i, slower} <= cut_alts and faster not in cut_alts
+    with_slower = choose_parallelism._keys(
+        alternatives, {**picks, 'tail_aie': (slower, picks['tail_aie'][1])}, choose_parallelism._alike
+    )
+    assert choose_parallelism._ranks_no_better(with_slower, built)
+    assert not choose_parallelism._ranks_no_better(built, with_slower)
 
 
 def test_latency_mode_ranks_latency_before_interval():

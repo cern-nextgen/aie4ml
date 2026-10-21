@@ -32,6 +32,7 @@ import itertools
 import json
 import logging
 import math
+import operator
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -123,7 +124,8 @@ class _Arrival(NamedTuple):
 
     @property
     def alike(self) -> tuple:
-        return self.placed, self.facts
+        """As `_Alternative.alike`: its legs' facts are what it costs."""
+        return (self.placed, self.facts), ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -142,6 +144,7 @@ class _Alternative:
     reserved: int  # at fewest (`_reserved_tiles`): each input port some placement shares excused
     memtile: int  # its own legs through a memory tile
     copies: int  # its own port pairs a tile DMA copies at best (`_LegFacts.unshared`)
+    legs: Tuple[int, ...]  # each own leg's latency and interval copied, then shared (`_LegFacts.own`, `.shared`)
     slowest: int  # the slowest of its kernels and own legs
     delays: Tuple[Tuple[str, int], ...]  # per output the graph's inputs reach, the cycles from them to it
     departure: int  # its slowest leg's latency to the graph's outputs
@@ -149,9 +152,22 @@ class _Alternative:
 
     @property
     def alike(self) -> tuple:
-        """What placement sees of it and what it costs: alternatives alike in it place and cost alike."""
-        costs = (self.tiles, self.cycles, self.reserved, self.memtile, self.copies, self.slowest, self.delays)
-        return self.placed, (*costs, self.departure)
+        """What placement sees of it, and each of its costs the criteria of every ranking grow with: alternatives
+        alike in it place and cost alike, and of two placed alike, the one costing no less ranks no better
+        (`_no_better`)."""
+        costs = (
+            self.tiles,
+            int(bool(_kernel(self.option))),  # a fallback kernel
+            *self.cycles,
+            *self.legs,
+            self.reserved,
+            self.memtile,
+            self.copies,
+            self.slowest,
+            *(cc for _, cc in self.delays),
+            self.departure,
+        )
+        return (self.placed, tuple(tensor for tensor, _ in self.delays)), costs
 
     def arriving(self, tensor: str) -> Tuple[_Arrival, ...]:
         return dict(self.arrivals)[tensor]
@@ -193,6 +209,23 @@ def _alike(item) -> tuple:
     return item.alike
 
 
+def _no_better(key, than) -> bool:
+    """Whether an alternative or arrival of `alike` key `key` places as one of `than` and costs no less: a design
+    taking it in the other's place ranks no better."""
+    (placed, costs), (placed_than, costs_than) = key, than
+    return placed == placed_than and all(cc >= other for cc, other in zip(costs, costs_than, strict=True))
+
+
+def _ranks_no_better(keys: Dict[str, tuple], than: Dict[str, tuple]) -> bool:
+    """Whether the design of `keys` (`_keys` of `_alike`) takes, layer by layer, what ranks no better than what the
+    design of `than` takes (`_no_better`)."""
+    return all(
+        _no_better(alt_key, than[name][0])
+        and all(_no_better(key, than[name][1][tensor]) for tensor, key in arrival_keys.items())
+        for name, (alt_key, arrival_keys) in keys.items()
+    )
+
+
 def _keys(alternatives: Dict[str, List[_Alternative]], picks: Dict[str, tuple], key) -> Dict[str, tuple]:
     """Per layer, the `key` of the alternative picked (`_Search._solve`) and, by tensor, of the arrivals picked."""
     keys = {}
@@ -202,19 +235,22 @@ def _keys(alternatives: Dict[str, List[_Alternative]], picks: Dict[str, tuple], 
     return keys
 
 
-def _groups(alternatives: Dict[str, List[_Alternative]], keys: Dict[str, tuple], key) -> List[tuple]:
-    """A cut (`_Search._solve`) of every design whose alternatives and arrivals have the `key`s of `keys` (`_keys`):
-    per layer, its alternatives of the key, and per tensor they read, their arrivals of the key."""
+def _groups(
+    alternatives: Dict[str, List[_Alternative]], keys: Dict[str, tuple], key, within=operator.eq
+) -> List[tuple]:
+    """A cut (`_Search._solve`) of every design whose alternatives and arrivals have a `key` `within` the one of
+    `keys` (`_keys`): per layer, its alternatives of such a key, and per tensor they read, their arrivals of such a
+    key."""
     groups = []
     for name, (alt_key, arrival_keys) in keys.items():
-        same = [j for j, alt in enumerate(alternatives[name]) if key(alt) == alt_key]
+        same = [j for j, alt in enumerate(alternatives[name]) if within(key(alt), alt_key)]
         groups.append((name, None, frozenset(same)))
         for tensor, wanted in arrival_keys.items():
             pairs = frozenset(
                 (j, c)
                 for j in same
                 for c, arrival in enumerate(alternatives[name][j].arriving(tensor))
-                if key(arrival) == wanted
+                if within(key(arrival), wanted)
             )
             groups.append((name, tensor, pairs))
     return groups
@@ -361,7 +397,7 @@ class ChooseParallelism(AIEPass):
 class _Shared:
     """What a layer, its legs and its refusals resolve to, and the designs built and refused, which no microtile height
     changes: the searches of one pass share it, so each resolves an option it meets again only once, and none builds a
-    design alike to one built, or that placement sees alike to one it refused."""
+    design ranking no better than one built, or that placement sees alike to one it refused."""
 
     values: Dict[str, Any]
     resolved: Dict[Any, Any] = field(default_factory=dict)
@@ -373,8 +409,8 @@ class _Shared:
     signatures: Dict[Tuple[int, str], str] = field(default_factory=dict)
     refusals: Dict[str, Dict[str, int]] = field(default_factory=lambda: defaultdict(lambda: defaultdict(int)))
     # what the designs built or outranked are alike in (`_keys` of `_Alternative.alike`), and what placement sees of
-    # those it refused (`_keys` of `_Placed`): no design alike in all of either is built, whichever microtile height its
-    # search is of
+    # those it refused (`_keys` of `_Placed`): no design ranking no better than one of the first (`_ranks_no_better`),
+    # or alike in all of the second, is built, whichever microtile height its search is of
     cut: List[Dict[str, tuple]] = field(default_factory=list)
     unplaced: List[Dict[str, tuple]] = field(default_factory=list)
     unbuilt: Dict[str, int] = field(default_factory=lambda: defaultdict(int))  # the designs not built, by why
@@ -782,8 +818,9 @@ class _Search:
             return None
         into, leaving = own
         legs = [(position, leg, facts) for position, kernel_legs in enumerate(into) for leg, facts in kernel_legs]
+        every = (*itertools.chain.from_iterable(into), *leaving)  # (leg, facts) of each of its own legs
         streams = defaultdict(dict)  # kernel -> its own streams from or to below, at (0, 0)
-        for _, facts in (*itertools.chain.from_iterable(into), *leaving):
+        for _, facts in every:
             for name, port, stream in facts.streams:
                 streams[name][port] = stream
         if self._overflows(node, streams):
@@ -823,6 +860,7 @@ class _Search:
             reserved=sum(_reserved_tiles(kernel, may_share[kernel.name]) for kernel in kernels),
             memtile=sum(facts.memtile for _, _, facts in legs) + sum(facts.memtile for _, facts in leaving),
             copies=sum(facts.unshared for _, _, facts in legs),
+            legs=tuple(cc for _, facts in every for cost in (facts.own, facts.shared or facts.own) for cc in cost[1:]),
             slowest=max((*cycles, *(cc for kernel in costs for *_, cc in kernel), *(cc for _, cc in departure))),
             delays=_delays(kernels, cycles, [[cost[:2] for cost in kernel] for kernel in costs], None),
             departure=max((cc for cc, _ in departure), default=0),
@@ -1093,7 +1131,7 @@ class _Search:
         alternatives, shared = self.alternatives, self.shared
         cuts = [
             *self.cuts,
-            *(_groups(alternatives, keys, _alike) for keys in shared.cut),
+            *(_groups(alternatives, keys, _alike, _no_better) for keys in shared.cut),
             *(_groups(alternatives, keys, _placed) for keys in shared.unplaced),
         ]
         picks = self._solve(alternatives, cuts)
@@ -1111,21 +1149,22 @@ class _Search:
         design, picks = found
         return (
             design.tiles + design.reserved <= now
-            and _keys(self.alternatives, picks, _alike) not in self.shared.cut
+            and not any(_ranks_no_better(_keys(self.alternatives, picks, _alike), cut) for cut in self.shared.cut)
             and _keys(self.alternatives, picks, _placed) not in self.shared.unplaced
         )
 
     def build(self, bound: _Design, picks: Dict[str, tuple], best: Optional[tuple]) -> Optional[Tuple[_Design, Any]]:
         """The design `picks` make, whose bound is `bound`, built (`_build`): as placed (`_as_placed`) and the
-        context it was built in, or None where it is not. It is cut with every design alike (`_Alternative.alike`),
-        as is one whose placement cannot rank it better than `best` (`PlacementOutranked`), which placement then
-        spares ranking; a design placement proves it cannot place with every design placement sees alike (`_Placed`);
-        both in every search (`_Shared`). One placement finds no placement for in its time halves the fills tried
-        (`_fill`), which leaves the design found not proven the best; any other refusal is cut alone."""
+        context it was built in, or None where it is not. It is cut with every design ranking no better
+        (`_ranks_no_better`), as is one whose placement cannot rank it better than `best` (`PlacementOutranked`),
+        which placement then spares ranking; a design placement proves it cannot place with every design placement
+        sees alike (`_Placed`); both in every search (`_Shared`). One placement finds no placement for in its time
+        halves the fills tried (`_fill`), which leaves the design found not proven the best; any other refusal is cut
+        alone."""
         alternatives, shared = self.alternatives, self.shared
         built = self._build(bound, best)
         shared.built += 1
-        if isinstance(built, PlacementOutranked):  # ranks no better than the best, as every design alike does
+        if isinstance(built, PlacementOutranked):  # no better than the best, nor is any design ranking no better
             shared.cut.append(_keys(alternatives, picks, _alike))
             if not built.proven:
                 shared.doubts.append('a design was not shown to beat the best within AIEConfig PlacerTime')
@@ -1142,7 +1181,7 @@ class _Search:
             self.cuts.append(_groups(alternatives, _keys(alternatives, picks, id), id))
             shared.unbuilt[str(built)] += 1
             return None
-        # every design alike in each layer places as this one: of them, the search took the best ranked first
+        # every design placed alike in each layer and costing no less places no better than this one
         shared.cut.append(_keys(alternatives, picks, _alike))
         shared.placed_fill = max(shared.placed_fill, bound.tiles + bound.reserved)
         return self._as_placed(bound, built), built
@@ -1285,7 +1324,6 @@ def _program(alternatives: Dict[str, List[_Alternative]]) -> Dict[str, list]:
             (
                 alt.alike,
                 alt.published,
-                bool(_kernel(alt.option)),
                 [(tensor, [(arrival.layouts, arrival.alike) for arrival in found]) for tensor, found in alt.arrivals],
             )
             for alt in alts
