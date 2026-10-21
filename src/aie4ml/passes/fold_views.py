@@ -1,25 +1,8 @@
 from __future__ import annotations
 
-import numpy as np
-
 from ..ir import TraitInstance, get_backend_context
-from ..op_impls.family_registry import fuses, get_family_resolver_registry
 from ..op_impls.utils.io import view_layout
 from .base import AIEPass
-from .utils import keeps_values
-
-
-def _row_permutation(shape, axis_order):
-    """Canonical row -> the row the view's own order put it at, or None when the two agree."""
-    shape = [int(d) for d in shape]
-    axis_order = [int(a) for a in axis_order]
-    if axis_order == sorted(axis_order):
-        return None
-    view_shape = [shape[axis] for axis in axis_order]
-    rows = np.arange(int(np.prod(view_shape[1:]))).reshape(view_shape[1:])
-    canonical_axes = [axis_order.index(axis) - 1 for axis in range(1, len(shape))]
-    return rows.transpose(canonical_axes).reshape(-1)
-
 
 _VIEW_OPS = ('concat', 'slice', 'split')
 
@@ -42,8 +25,6 @@ class FoldViewOps(AIEPass):
                 changed = self._fold_concat(node) or changed
             elif node.op_type in ('slice', 'split'):
                 changed = self._fold_slice(node) or changed
-            elif node.op_type == 'reshape':
-                changed = self._fold_reshape(graph, node) or changed
 
         return changed
 
@@ -101,43 +82,6 @@ class FoldViewOps(AIEPass):
                 consumer.roles[in_tv.name] = consumer.roles.pop(out_tv.name)
 
         graph.remove_node(node, mode='bypass')
-        return True
-
-    def _fold_reshape(self, graph, node) -> bool:
-        """Fold a view of an output into the producing op: it writes the view directly.
-
-        The producing family states which views it can emit, so nothing here names an op type.
-        A view may also change the order of the rows a consumer reduces over; the consuming
-        family adopts that order into its constants.
-        """
-        source, out_tv = node.inputs[0], node.outputs[0]
-        producer = source.producer
-        kind = node.metadata['view']
-        if not fuses(producer, kind):
-            raise NotImplementedError(
-                f'{node.name}: {kind} must be written by its producer, but '
-                f'{producer.op_type if producer else "the graph input"} does not emit that view.'
-            )
-        if len(source.consumers) != 1:
-            raise NotImplementedError(
-                f'{node.name}: {source.name!r} has {len(source.consumers)} consumers, so its producer '
-                f'cannot write {kind} for all of them.'
-            )
-
-        if not keeps_values(source.precision, out_tv.precision):
-            raise NotImplementedError(
-                f'{node.name}: {kind} only rearranges values, but {out_tv.name!r} is quantized {out_tv.precision}, '
-                f'not {source.precision}.'
-            )
-        out_tv.precision = source.precision  # the producer's rounding is what the view carries
-
-        order = _row_permutation(source.shape, node.metadata['axis_order'])
-        if order is not None:
-            for consumer in list(out_tv.consumers):
-                get_family_resolver_registry().get(consumer.op_type).reorder_reduction_rows(consumer, out_tv, order)
-
-        producer.add_trait(TraitInstance('output_view', {'kind': kind}))
-        graph.remove_node(node, mode='contract')
         return True
 
     def _fold_concat(self, node) -> bool:

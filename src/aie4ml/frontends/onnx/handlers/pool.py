@@ -1,7 +1,7 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pooling: ONNX NCHW MaxPool onto a canonical NHWC pool2d, which a producing conv fuses (FusePool)."""
+"""Pooling: ONNX NCHW MaxPool onto a canonical NHWC pool, which a producing conv fuses (FuseOps)."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ def _max_pool(ctx: OnnxImportContext, node, node_name: str, directives: dict) ->
     kernel, strides, dilations, pads = (window[k] for k in ('kernel_shape', 'strides', 'dilations', 'pads'))
     out_name = node.output[0]
     batch, channels, out_h, out_w = (int(d) for d in ctx.output_shape(out_name, node_name))
-    # pool2d rounds its output extent down; ceil_mode is accepted where it does not change it.
+    # A pool rounds its output extent down; ceil_mode is accepted where it does not change it.
     floor = tuple(
         (int(x.shape[1 + a]) + pads[a] + pads[2 + a] - dilations[a] * (kernel[a] - 1) - 1) // strides[a] + 1
         for a in (0, 1)
@@ -44,7 +44,7 @@ def _max_pool(ctx: OnnxImportContext, node, node_name: str, directives: dict) ->
     }
     ctx.mirror_precision(out_name, x_name)
     ctx.emit(
-        'pool2d',
+        'pool',
         node_name,
         inputs=[x],
         outputs=[(out_name, (batch, out_h, out_w, channels), x.precision)],

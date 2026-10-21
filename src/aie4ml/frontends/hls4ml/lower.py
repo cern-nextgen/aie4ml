@@ -181,8 +181,8 @@ class LowerToAieIr(ModelOptimizerPass):
             )
             meta['input_roles'] = ['lhs', 'rhs'] + (['bias'] if layer.get_attr('bias_data') is not None else [])
 
-        if node.op_type == 'pool2d':
-            # The canonical pool2d the ONNX MaxPool lowers to; hls4ml gives Keras 'same' pads explicitly.
+        if node.op_type == 'pool':
+            # The canonical pool the ONNX MaxPool lowers to; hls4ml gives Keras 'same' pads explicitly.
             meta.update(
                 kind=str(layer.get_attr('pool_op')).lower(),
                 kernel_shape=(int(layer.get_attr('pool_height')), int(layer.get_attr('pool_width'))),
@@ -279,7 +279,7 @@ class LowerToAieIr(ModelOptimizerPass):
                 'fold it in the model, e.g. with QKeras QConv2DBatchnorm.'
             )
         if layer.class_name == 'Pooling2D':
-            return 'pool2d'
+            return 'pool'
         if layer.class_name in ('Reshape', 'Flatten'):
             return 'reshape'
         if layer.class_name == 'Transpose':

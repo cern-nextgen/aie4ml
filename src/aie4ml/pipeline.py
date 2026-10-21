@@ -10,8 +10,7 @@ from .passes import (
     FoldScale,
     FoldViewOps,
     ForceFloatMode,
-    FuseActivationCasts,
-    FusePool,
+    FuseOps,
     LegalizeFanoutEntries,
     LegalizeLayouts,
     LegalizeMemtilePortLimits,
@@ -27,9 +26,7 @@ HLS4ML_FLOW_SPEC = (
     ('fold_apply_alpha', FoldApplyAlpha),
     ('fold_bias', FoldBias),
     ('fold_scale', FoldScale),
-    ('fuse', FuseActivationCasts),
-    ('fuse_pool', FusePool),
-    ('fuse_pooled', FuseActivationCasts),  # a ReLU after a fused pool: max and ReLU commute
+    ('fuse', FuseOps),
     ('fold_views', FoldViewOps),
     ('choose_parallelism', ChooseParallelism),  # AIEConfig Optimize
     ('resolve', Resolve),

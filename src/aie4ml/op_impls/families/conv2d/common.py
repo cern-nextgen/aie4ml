@@ -43,7 +43,7 @@ def reads_neighbour_rows(spatial: SpatialAccess2D) -> bool:
 
 
 def fused_pool_of(node: OpNode) -> Optional[Pool2DConfig]:
-    """The pool a conv2d node fuses into its epilogue, if any, from the trait FusePool left."""
+    """The pool a conv2d node fuses into its epilogue, if any, from the trait FuseOps left."""
     fused = node.traits.get('fused_pool')
     if fused is None:
         return None

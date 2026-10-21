@@ -234,13 +234,13 @@ def _pooled_model(tmp_path, part, relu_after_pool=False):
 
 @pytest.mark.parametrize('relu_after_pool', [False, True], ids=['relu-pool', 'pool-relu'])
 def test_hls4ml_max_pool_fuses_into_the_conv(tmp_path, relu_after_pool):
-    """The same canonical pool2d the ONNX MaxPool lowers to, so the conv fuses it and the ReLU either side."""
+    """The same canonical pool the ONNX MaxPool lowers to, so the conv fuses it and the ReLU either side."""
     import aie4ml
 
     _, hls_model = _pooled_model(tmp_path, PART, relu_after_pool)
     logical = aie4ml.from_hls4ml(hls_model).context.ir.logical
     (conv,) = [n for n in logical if n.op_type == 'conv2d']
-    assert not [n for n in logical if n.op_type == 'pool2d']
+    assert not [n for n in logical if n.op_type == 'pool']
     assert {'fused_pool', 'fused_activation', 'output_view'} <= set(conv.traits)
 
 
@@ -352,6 +352,40 @@ def test_a_transpose_into_a_conv_is_refused(tmp_path):
     config = hls4ml.utils.config_from_keras_model(model, granularity='name')
     config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
     with pytest.raises(NotImplementedError, match='io_view perm'):
+        hls4ml.converters.convert_from_keras_model(
+            model,
+            backend='AIE',
+            io_type='io_parallel',
+            output_dir=str(tmp_path / 'proj'),
+            part=PART,
+            hls_config=config,
+            project_name='proj',
+            batch_size=1,
+        )
+
+
+def test_a_transpose_into_a_flatten_is_refused(tmp_path):
+    """A Keras Permute before a Flatten reorders the flattened row, which the conv writing the flatten view cannot:
+    refused, not written in the conv's own order."""
+    hls4ml = pytest.importorskip('hls4ml')
+    pytest.importorskip('qkeras')
+    from keras.models import Sequential
+    from qkeras import QActivation, QConv2D, QDense, quantized_bits, quantized_relu
+
+    q_w = quantized_bits(BITS, 2, alpha=1)
+    model = Sequential(
+        [
+            keras.Input(shape=(H, W, CIN)),
+            QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
+            QActivation(quantized_relu(BITS, 2), name='relu'),
+            keras.layers.Permute((3, 1, 2), name='permute'),
+            keras.layers.Flatten(name='flatten'),
+            QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
+    with pytest.raises(NotImplementedError, match='flatten_aie: flatten_2d must be written .* but transpose'):
         hls4ml.converters.convert_from_keras_model(
             model,
             backend='AIE',
