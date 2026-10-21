@@ -146,11 +146,12 @@ def solve_ranked(
     optimal; with no `order`, any solution. `criteria` maps each name to its expression and an upper bound; the
     solution holds the value of each of `decisions` and of each criterion. `hint` (by variable index, which may name
     some of the decisions) hints the first solve, the whole solution before each later one, which its bounds keep. A
-    stepped criterion is solved alone, then bounded to the end of its best value's step; the others several at once,
-    weighted so they still rank in turn, as many as MAX_WEIGHT keeps apart. The bounds stay in `model`, so a later
-    call ranks among its best solutions. `floors` holds a value no solution goes below for some criteria: a stage
-    whose criteria all have one ends, proven, at the first solution reaching them, which spares the solver proving
-    it, and takes no solve where the solution before reaches them.
+    stepped criterion is solved alone, ending proven once the solver's bound reaches its best solution's step, and
+    then bounded to the end of that step; the others several at once, weighted so they still rank in turn, as many as
+    MAX_WEIGHT keeps apart. The bounds stay in `model`, so a later call ranks among its best solutions. `floors`
+    holds a value no solution goes below for some criteria: a stage whose criteria all have one ends, proven, at the
+    first solution reaching them, which spares the solver proving it, and takes no solve where the solution before
+    reaches them.
 
     None where no solution was found: the model is infeasible where the second is True, else the first solve ran out
     of time. A later solve that runs out of time without a solution leaves the one before it, not proven."""
@@ -174,8 +175,7 @@ def solve_ranked(
             else:  # the whole solution before, which the bounds since keep: a complete hint, the solve's first solution
                 model.Proto().solution_hint.vars.extend(range(len(assignment)))
                 model.Proto().solution_hint.values.extend(assignment)
-            reached = _Reached(floor) if stage and floor is not None else None
-            status = solver.Solve(model, reached)
+            status, reached = _solve(model, solver, floor if stage else None, stepped)
             if solution is not None and (
                 status not in (cp_model.OPTIMAL, cp_model.FEASIBLE) or solver.ObjectiveValue() > value
             ):
@@ -183,8 +183,7 @@ def solve_ranked(
                 # beats on this stage's objective -- and the stage then found none as good in its time. Solved again
                 # keeping every feasible solution, a weaker presolve the hint survives as its first solution.
                 solver.parameters.keep_all_feasible_solutions_in_presolve = True
-                reached = _Reached(floor) if stage and floor is not None else None
-                status = solver.Solve(model, reached)
+                status, reached = _solve(model, solver, floor if stage else None, stepped)
                 solver.parameters.keep_all_feasible_solutions_in_presolve = False
             if status == cp_model.INFEASIBLE:
                 if solution is not None:  # each stage keeps the solution before it: a solver fault, not the model's
@@ -192,7 +191,7 @@ def solve_ranked(
                 return None, True
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 return solution, False
-            proven = proven and (status == cp_model.OPTIMAL or (reached is not None and reached.reached))
+            proven = proven and (status == cp_model.OPTIMAL or reached)
             assignment = list(solver.ResponseProto().solution)
             solution = Solution(
                 {variable.Index(): solver.Value(variable) for variable in decisions},
@@ -211,17 +210,43 @@ def solve_ranked(
     return solution, proven
 
 
-class _Reached(cp_model.CpSolverSolutionCallback):
-    """Stops a solve at its first solution whose objective reaches `floor`, below which none goes."""
+def _solve(model: cp_model.CpModel, solver: cp_model.CpSolver, floor: Optional[int], stepped: bool) -> Tuple[int, bool]:
+    """The status of a solve of `model`, and whether it stopped at a solution all its stage needs (`_Reached`)."""
+    if floor is None and not stepped:
+        return solver.Solve(model), False
+    reached = _Reached(solver, floor, stepped)
+    if stepped:
+        solver.best_bound_callback = reached.bound
+    try:
+        status = solver.Solve(model, reached)
+    finally:
+        solver.best_bound_callback = None
+    return status, reached.reached
 
-    def __init__(self, floor: int):
+
+class _Reached(cp_model.CpSolverSolutionCallback):
+    """Stops a solve once its best solution is all its stage needs: its objective reaching `floor`, below which none
+    goes; or, `stepped`, the solver's bound reaching the solution's step, every value of which ranks alike."""
+
+    def __init__(self, solver: cp_model.CpSolver, floor: Optional[int], stepped: bool):
         super().__init__()
-        self.floor, self.reached = floor, False
+        self.solver, self.floor, self.stepped = solver, floor, stepped
+        self.best: Optional[int] = None
+        self.reached = False
 
     def on_solution_callback(self):
-        if self.ObjectiveValue() <= self.floor:
+        self.best = round(self.ObjectiveValue())
+        self.bound(self.BestObjectiveBound())
+
+    def bound(self, bound: float) -> None:
+        """The solver's bound rose to `bound` (`CpSolver.best_bound_callback`), or a solution came."""
+        if self.best is None:
+            return
+        if (self.floor is not None and self.best <= self.floor) or (
+            self.stepped and step(math.ceil(bound)) >= step(self.best)
+        ):
             self.reached = True
-            self.StopSearch()
+            self.solver.stop_search()
 
 
 def _stages(order, criteria):

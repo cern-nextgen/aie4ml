@@ -1,5 +1,7 @@
 """The constraint-solver placer: its rules, and the hand-overs it shares by the design's ranking."""
 
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip('ortools')
@@ -14,7 +16,7 @@ from aie4ml.passes.placement import (  # noqa: E402
     Rect,
 )
 from aie4ml.passes.placement_solver import solve_placement, tidy_placement  # noqa: E402
-from aie4ml.passes.ranking import RANKING, step, to_beat  # noqa: E402
+from aie4ml.passes.ranking import RANKING, _least, _Reached, step, to_beat  # noqa: E402
 from passes.test_placement import _crossing_graph, _tail_graph, _three_branch_graph  # noqa: E402
 
 PORTS = {'North': 6, 'South': 4, 'East': 4, 'West': 4}
@@ -98,3 +100,17 @@ def test_the_solver_ranks_only_a_placement_that_beats_the_best():
         solve_placement(graph, 8, 4, 5, LATENCY, 2, beat=((step(190),), True))
     tie = ((step(190), step(100), 1), False)
     assert solve_placement(graph, 8, 4, 5, LATENCY, 2, beat=tie)[1:] == best
+
+
+def test_a_stepped_solve_stops_once_its_bound_reaches_its_best_solutions_step():
+    """Every value on one step ranks alike, so a stepped stage needs no proof within its best solution's step: it
+    stops once the solver's bound reaches that step, never while a lower step may hold a solution."""
+    stops = []
+    reached = _Reached(SimpleNamespace(stop_search=lambda: stops.append(True)), None, True)
+    reached.bound(0.0)  # no solution yet
+    reached.best = 7166
+    first = _least(step(7166))  # the least cycles on its step
+    reached.bound(first - 1)
+    assert not (reached.reached or stops)
+    reached.bound(first - 0.5)  # an integer objective: the bound rounds up
+    assert reached.reached and stops
