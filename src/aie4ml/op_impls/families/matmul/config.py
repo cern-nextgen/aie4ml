@@ -33,6 +33,17 @@ class MatmulFlags:
 
 
 @dataclass(frozen=True)
+class DensePoolConfig:
+    """A pool fused into the Dense (dense_pool.cpp): its LHS rows come in `groups` runs of `rows`, and each run's
+    codes, summed exactly, convert once, at `shift`, into an output row; `extent` output rows, in whole microtiles."""
+
+    rows: int
+    groups: int
+    extent: int
+    shift: int
+
+
+@dataclass(frozen=True)
 class DenseConfig:
     precision: Dict[str, Any]
     parallelism: ParallelismConfig

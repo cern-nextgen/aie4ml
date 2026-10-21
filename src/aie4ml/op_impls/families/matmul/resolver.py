@@ -9,7 +9,7 @@ import numpy as np
 from ....aie_types import AIEDataType, legality_format
 from ....errors import ConfigRefused
 from ....ir import input_role, input_tensor_for_role
-from ....ir.graph import STAGING_CONTRACTS
+from ....ir.graph import STAGING_CONTRACTS, VIEW_REGROUP_ROWS
 from ...base import STACK_BANK_RESERVED_BYTES
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
@@ -45,29 +45,43 @@ class MatmulTiling:
 @dataclass(frozen=True)
 class MatmulDims:
     """A matmul-family node's iteration space, from its tensors as viewed: `outer` runs of `rows` LHS rows (its leading
-    axes, then the axis the kernels pad to whole steps), the reduction `k` and the output columns `n`."""
+    axes, then the axis the kernels pad to whole steps), the reduction `k` and the output columns `n`. Each output row
+    is one LHS row, or, where a pool is fused, the pool of `pooled_rows` consecutive ones."""
 
     outer: int
     rows: int
     k: int
     n: int
+    pooled_rows: int = 1
 
     def lhs_rows(self, step: int) -> int:
         """The LHS rows the kernels store: each run padded to whole steps of `step` rows."""
         return self.outer * align_up(self.rows, step)
 
-    def output_rows(self, step: int) -> int:
-        """The output rows the kernels store, a row for each LHS row."""
-        return self.lhs_rows(step)
+    def fits_steps(self, step: int) -> bool:
+        """Whether steps of `step` LHS rows lie whole in each pooled run: always, where nothing is pooled."""
+        return self.pooled_rows == 1 or self.pooled_rows % step == 0
+
+    def output_step(self, step: int, microtile_m: int) -> int:
+        """The output rows a step of `step` LHS rows writes, in whole microtiles."""
+        return align_up(-(-step // self.pooled_rows), microtile_m)
+
+    def output_rows(self, step: int, microtile_m: int) -> int:
+        """The output rows the kernels store: one per LHS row, or, pooled, a single run in whole output steps."""
+        if self.pooled_rows == 1:
+            return self.lhs_rows(step)
+        return align_up(self.outer * self.rows // self.pooled_rows, self.output_step(step, microtile_m))
 
 
 def matmul_dims(node) -> MatmulDims:
     lhs = [int(d) for d in view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')]
+    pool = node.traits.get('fused_pool')
     return MatmulDims(
         outer=math.prod(lhs[:-2]),
         rows=lhs[-2] if len(lhs) > 1 else 1,
         k=lhs[-1],
         n=int(view_shape(node, node.outputs[0], 'outputs')[-1]),
+        pooled_rows=1 if pool is None else math.prod(int(k) for k in pool.data['kernel_shape']),
     )
 
 
@@ -120,7 +134,8 @@ def _resolve_tile_cfg(
 ) -> MatmulMicrotileConfig:
     """The microtile a `microtiling` directive pins, else one the producer's must match (`required_lhs_microtile`),
     else the producer's where the part offers it (`preferred_lhs_microtile`), else the first -- or, `fewest_rows`, the
-    fewest rows among those whose output a Dense of the same microtile reads directly (K == N).
+    fewest rows among those whose output a Dense of the same microtile reads directly (K == N); of them, where a pool
+    is fused, those whose steps of two row microtiles lie whole in its runs, where any do.
 
     The first is the generation's default; others can be slower (int8 Dense on AIE-ML at 64x64x64: 8x8x4 took 2234
     cc against 4x8x8's 1122). Operands are read in whole microtiles, and a hand-over whose producer writes other
@@ -164,6 +179,8 @@ def _resolve_tile_cfg(
     if preferred_lhs_microtile is not None:
         preferred = (int(preferred_lhs_microtile.outer), int(preferred_lhs_microtile.inner))
         options = [option for option in options if option[:2] == preferred] or options
+    dims = matmul_dims(node)
+    options = [option for option in options if dims.fits_steps(2 * option[0])] or options
     if fewest_rows:
         chaining = [option for option in options if option[1] == option[2]] or options
         default_m, default_k, default_n = min(chaining, key=lambda option: option[0])
@@ -217,7 +234,7 @@ def _parallelism_candidate(
         lhs_bytes=lhs_bytes,
         rhs_bytes=rhs_bytes,
         output_bytes=output_bytes,
-        output_outer=tile_outer if row_wise else dims.output_rows(outer_granularity),
+        output_outer=tile_outer if row_wise else dims.output_rows(outer_granularity, microtile_m),
     )
     if int(bank_usage['max_bank_tile_bytes']) > int(bank_usage['bank_capacity_bytes']):
         return None
@@ -304,7 +321,8 @@ def _resolve_parallelism(
 ) -> MatmulTiling:
     """The tiling `parallel_cfg` asks for, its rows aligned to `row_blocks` row microtiles; or, with
     `one_block_chains`, to one where only a kernel computing one row block a step can split them so. A kernel that can
-    also take `widest_row_blocks(tiling)` a step takes them where the rows align to them with no more padding."""
+    also take `widest_row_blocks(tiling)` a step takes them where the rows align to them with no more padding and the
+    steps stay within the runs a fused pool reduces."""
     dims = matmul_dims(node)
     cas_num, cas_length = int(parallel_cfg.get('cas_num', 1)), int(parallel_cfg.get('cas_length', 1))
     if contract == 'outer' and dims.outer > 1:
@@ -340,7 +358,8 @@ def _resolve_parallelism(
         # rows the two-block kernel cannot split this many ways, as one row block a step
         tiling = candidate(1)
     widest = widest_row_blocks(tiling) if tiling is not None and widest_row_blocks else row_blocks
-    if tiling is not None and tiling.row_blocks == row_blocks < widest:
+    microtile_m = int(microtiling.microtile_m)
+    if tiling is not None and tiling.row_blocks == row_blocks < widest and dims.fits_steps(widest * microtile_m):
         wider = candidate(widest)
         if wider is not None and (wider.tile_outer, wider.tile_outer_raw) == (tiling.tile_outer, tiling.tile_outer_raw):
             tiling = wider
@@ -418,7 +437,7 @@ def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: Mat
             full_inner=full_inner_out,
             tile_inner=tiling.tile_inner_rhs,
             tile_inner_raw=tiling.tile_inner_rhs_raw,
-            full_outer=align_up(last_outer, outer_granularity),
+            full_outer=align_up(last_outer, dims.output_step(outer_granularity, microtiling.microtile_m)),
             tile_outer=tiling.tile_outer if row_wise else None,
             tile_outer_raw=tiling.tile_outer_raw if row_wise else None,
             microtile=out_microtile,
@@ -453,6 +472,41 @@ def _validate_matmul_family_rank_contract(node) -> None:
         )
 
 
+def _validate_dense_pool(node) -> None:
+    """A Dense pools runs of consecutive rows: a window over one axis, strided by itself, unpadded and undilated, each
+    run of its LHS rows one output row, the output's rows one run of their own. It regroups its rows only for one."""
+    pool = node.traits.get('fused_pool')
+    if pool is None:
+        view = node.traits.get('output_view')
+        if view is not None and view.data['kind'] == VIEW_REGROUP_ROWS:
+            raise NotImplementedError(f'{node.name}: a Dense writes its rows regrouped only into a pool it fuses.')
+        return
+    window = pool.data
+    kernel = tuple(int(k) for k in window['kernel_shape'])
+    if (
+        len(kernel) != 1
+        or tuple(window['strides']) != kernel
+        or any(window['pads'])
+        or tuple(window['dilations']) != (1,)
+    ):
+        raise NotImplementedError(
+            f'{node.name}: a Dense pools runs of its rows -- a window over one axis, strided by itself, unpadded and '
+            f'undilated -- not {window["kind"]} pool {kernel}, strides {tuple(window["strides"])}.'
+        )
+    dims = matmul_dims(node)
+    out = view_shape(node, node.outputs[0], 'outputs')
+    if dims.outer * dims.rows != dims.pooled_rows * math.prod(out[:-1]):
+        raise ValueError(
+            f'{node.name}: its {dims.outer * dims.rows} rows do not pool {dims.pooled_rows} apiece into its '
+            f'{math.prod(out[:-1])} output rows.'
+        )
+    if math.prod(out[:-2]) != 1:
+        raise NotImplementedError(
+            f'{node.name}: a pooled Dense writes its rows as one run, (rows, C), not {tuple(out)}, which would pad '
+            'each leading axis apart.'
+        )
+
+
 class _MatmulFamilyBase(FamilyResolver):
     """Shared capabilities of the GEMM families: both reduce over their LHS rows."""
 
@@ -463,7 +517,7 @@ class _MatmulFamilyBase(FamilyResolver):
         return matmul_microtiling_candidates(node, device)
 
     def macs(self, node) -> int:
-        """One per element of the reduction, for each output element."""
+        """One per element of the reduction, for each LHS row and output column."""
         dims = matmul_dims(node)
         return dims.outer * dims.rows * dims.k * dims.n
 
@@ -488,6 +542,7 @@ class DenseFamilyResolver(_MatmulFamilyBase):
 
     def validate_structure(self, node, _device) -> None:
         _validate_matmul_family_rank_contract(node)
+        _validate_dense_pool(node)
 
 
 @family_resolver('matmul')

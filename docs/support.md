@@ -74,6 +74,12 @@ the same model with them builds that design again, place for place.
   costs core cycles at 32 bits per cycle, so buffers stay faster where they fit.
 - **Batch**: the leading axis of the model's input (ONNX: its input shape; hls4ml: `batch_size`, default 1). Its
   rows are padded to whole microtiles; the host pads the input and trims the output.
+- **Pooling over sets**: a ReduceMean or ReduceSum over the axes between the first and the last -- `(G, T, C)` over
+  `T`, or a Reshape `(G*T, C) -> (G, T, C)` of 2-D rows -- runs in the int8 Dense producing the rows, which writes one
+  row per group. It rounds each row into its 8-bit lane, sums a group's codes and converts the sum once into the
+  pooled lane, as the model's QuantizeLinear does: an average needs `T` a power of two, and both lanes the same sign,
+  rounding and saturation. Each group is whole kernel steps (8 to 32 rows); the Dense splits K and N only, on buffer
+  ports. Not on AIE1.
 
 ## Conv2D
 
@@ -146,11 +152,13 @@ These never become kernels of their own:
 
 - **ReLU** folds into the Dense or Conv2D before it; a constant power-of-two scale folds into its output shift.
 - **MaxPool** folds into the Conv2D before it, as above.
+- **ReduceMean / ReduceSum** over a set's rows fold into the Dense before them (see Dense and MatMul).
 - **BatchNormalization** must already be folded into the preceding Conv2D or Dense: QKeras `QConv2DBatchnorm`, a
   float Dense followed by BatchNormalization (hls4ml folds both), or an ONNX export that folds Conv +
   BatchNormalization (PyTorch in eval mode, onnxruntime `quant_pre_process`). An unfolded BatchNormalization is
   refused, because its per-channel scale folds exactly only into float weights.
-- **Flatten / Reshape** of one sample to `[1, K]` between a Conv2D and a Dense.
+- **Flatten / Reshape** of one sample to `[1, K]` between a Conv2D and a Dense, and a Reshape regrouping the rows a
+  fused pool reads.
 - **Transpose** of the last two axes, into a Dense or MatMul (see above); not on AIE1.
 - **Slice, Split and Concat** along the boundaries of the producing layer's tiles. A slice that cuts through a tile,
   or chained slices, are refused.

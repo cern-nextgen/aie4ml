@@ -47,7 +47,7 @@ def fused_pool_of(node: OpNode) -> Optional[Pool2DConfig]:
     fused = node.traits.get('fused_pool')
     if fused is None:
         return None
-    if set(fused.data) != {'kind', 'kernel_shape', 'strides', 'dilations', 'pads'}:
+    if set(fused.data) != {'kind', 'kernel_shape', 'strides', 'dilations', 'pads', 'input_precision'}:
         raise ValueError(f'{node.name}: a fused_pool trait holds its kind and window, got {sorted(fused.data)}.')
     window = SpatialAccess2D(
         kernel=tuple(int(x) for x in fused.data['kernel_shape']),

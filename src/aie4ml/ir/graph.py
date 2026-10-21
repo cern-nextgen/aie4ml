@@ -318,6 +318,10 @@ ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'auto'})
 VIEW_FLATTEN_2D = 'flatten_2d'
 """Output view: the producer writes its result as one `[1, K]` row instead of its natural shape."""
 
+VIEW_REGROUP_ROWS = 'regroup_rows'
+"""Output view: the producer writes its rows, the last axis kept, grouped by other leading axes -- `(G*T, C)` as
+`(G, T, C)`, say."""
+
 TENSOR_LAYOUTS: frozenset = frozenset({'linear', 'tiled'})
 """Valid `layout:` directive names. Only a variant selector -- the layout itself is the
 staging descriptor, not a name."""

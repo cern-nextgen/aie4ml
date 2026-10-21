@@ -4,9 +4,10 @@ from typing import Any, ClassVar, Dict
 
 import numpy as np
 
-from ....aie_types import FloatIntent
+from ....aie_types import FloatIntent, QuantIntent
 from ....errors import ConfigRefused
 from ....ir.graph import (
+    VIEW_REGROUP_ROWS,
     ExecutionInstance,
     OpNode,
     has_input_role,
@@ -41,8 +42,10 @@ from .common import (
     pack_vector_by_n_slice,
     requested_contract,
 )
-from .config import DenseConfig, DenseFlags
+from .config import DenseConfig, DenseFlags, DensePoolConfig
 from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg, matmul_dims
+
+POOL_SELECTOR_ROWS = 8  # code rows one selector product sums (dense_pool.cpp): the K of its M x 8 x N mmul
 
 
 class _MatmulFamilyVariantBase(OpImplVariant):
@@ -184,10 +187,13 @@ class _DenseVariantBase(_MatmulFamilyVariantBase):
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
 
+        # the accumulators convert to the rows' lane: the output's, or the one a fused pool reads them in
+        pool = node.traits.get('fused_pool')
+        rows_precision = node.outputs[0].precision if pool is None else pool.data['input_precision']
         shift = (
             0
             if is_float
-            else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
+            else resolve_accumulator_output_shift(lhs_tensor.precision, rows_precision, rhs_tensor.precision)
         )
         shift += resolve_output_scale_shift(node, is_float=is_float)
 
@@ -368,6 +374,47 @@ class DenseVectorOpImplVariant(DenseOpImplVariant):
 
 
 @register_variant
+class DensePoolOpImplVariant(DenseOpImplVariant):
+    """Dense fused with a pool over runs of its rows (dense_pool.cpp): each output row the average or the sum of a run,
+    as a model over sets pools each set's elements. A step computes whole row microtiles as dense_bias_relu.cpp does,
+    and the chain's last kernel sums their codes; the rows may arrive regrouped (VIEW_REGROUP_ROWS)."""
+
+    variant_id = 'dense.b.r.pool.v1'
+    supported_fusions = DenseOpImplVariant.supported_fusions | {'average_pool', 'sum_pool'}
+    supported_output_views = frozenset({VIEW_REGROUP_ROWS})
+    graph_name = 'dense_pool_graph'
+
+    def matches(self, node: OpNode, device, directives) -> bool:
+        return (
+            super().matches(node, device, directives)
+            and node.traits.get('fused_pool') is not None
+            and device.generation in ('AIE-ML', 'AIE-MLV2')
+        )
+
+    def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
+        """Lanes that define the pool exactly, and steps whose rows lie in one run, which a selector product sums
+        POOL_SELECTOR_ROWS code rows at a time."""
+        super().validate_config(node, config, device)
+        _pool_shift(node)
+        step = int(config.row_blocks) * int(config.microtiling.microtile_m)
+        if not matmul_dims(node).fits_steps(step) or step % POOL_SELECTOR_ROWS:
+            raise ConfigRefused(
+                f'{node.name}: its fused pool sums whole kernel steps of one run, {POOL_SELECTOR_ROWS} rows at a '
+                f'time, but a run holds {matmul_dims(node).pooled_rows} rows and a step {step}.'
+            )
+
+    def kernel_params(self, node, config):
+        dims = matmul_dims(node)
+        pool = DensePoolConfig(
+            rows=dims.pooled_rows,
+            groups=dims.outer * dims.rows // dims.pooled_rows,
+            extent=int(config.io_views[node.outputs[0].name].compacted_full_outer),
+            shift=_pool_shift(node),
+        )
+        return {**super().kernel_params(node, config), 'pool': pool}
+
+
+@register_variant
 class DenseRowWiseOpImplVariant(_DenseVariantBase):
     """Dense with the rows partitioned across cascade chains ('outer' contract)."""
 
@@ -418,6 +465,36 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
             )
             packed_B = np.repeat(packed_B, cas_num, axis=0)
         return {'packed_weights': packed_W, 'packed_bias': packed_B}
+
+
+def _pool_shift(node) -> int:
+    """The right shift converting a run's sum of row codes into its output row's codes: log2(rows) for an average, and
+    the two lanes' fraction bits apart. The rows round into their own lane first, as the model quantizes them before
+    the pool; refused by name where 8-bit codes cannot compute the pool exactly."""
+    pool, rows = node.traits['fused_pool'].data, matmul_dims(node).pooled_rows
+    kind, row, out = pool['kind'], pool['input_precision'], node.outputs[0].precision
+    for name, lane in (('rows', row), ('pooled rows', out)):
+        if not isinstance(lane, QuantIntent) or int(lane.width) != 8:
+            raise NotImplementedError(
+                f'{node.name}: its fused {kind} pool sums 8-bit codes, but its {name} are {lane}.'
+            )
+    if (row.signed, row.rounding, row.saturation) != (out.signed, out.rounding, out.saturation):
+        raise NotImplementedError(
+            f'{node.name}: its rows ({row}) and pooled rows ({out}) differ in sign, rounding or saturation; its fused '
+            'pool writes codes of one kind.'
+        )
+    if kind == 'average' and rows & (rows - 1):
+        raise NotImplementedError(
+            f'{node.name}: an average of {rows} rows divides by {rows}, which is no power of two; a sum pool, the '
+            f'1/{rows} folded into the next layer, takes any count.'
+        )
+    shift = (rows.bit_length() - 1 if kind == 'average' else 0) + int(row.frac) - int(out.frac)
+    if shift < 0:
+        raise NotImplementedError(
+            f'{node.name}: its pooled rows have {int(out.frac)} fraction bits, more than the {kind} of codes with '
+            f'{int(row.frac)} holds; give them at most {int(out.frac) + shift}.'
+        )
+    return shift
 
 
 def _check_stream_rows(node, config: DenseConfig, axes) -> None:

@@ -25,14 +25,15 @@ def _pin_if_unset(tensor, intent: QuantIntent, *, force_signed: bool) -> None:
 
 
 def _pin_back(tensor, intent: QuantIntent, *, force_signed: bool = False) -> None:
-    """Pin the un-quantized tensors a Quantize reaches back through a Relu, a scale or a bias add -- a Dense's
-    accumulator behind MatMul -> Add -> Relu, say -- to its intent; signed behind a Relu, which clips the sign."""
+    """Pin the un-quantized tensors a Quantize reaches back through a Relu, a scale, a bias add or a reshape -- a
+    Dense's accumulator behind MatMul -> Add -> Relu, say -- to its intent; signed behind a Relu, which clips the
+    sign."""
     producer = tensor.producer
     if producer is None:
         return
     if producer.op_type == 'activation' and producer.metadata.get('activation') == 'relu':
         behind, force_signed = producer.inputs[:1], True
-    elif producer.op_type in ('scale', 'add'):
+    elif producer.op_type in ('scale', 'add', 'reshape'):
         behind = producer.inputs if producer.op_type == 'add' else producer.inputs[:1]
         if producer.op_type == 'scale':
             producer.metadata['before_quantizer'] = True  # it belongs to its producer's requantization

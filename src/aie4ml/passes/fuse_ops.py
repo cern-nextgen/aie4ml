@@ -28,8 +28,8 @@ class FuseOps(AIEPass):
     goes.
 
     One walk in graph order, so each producer is final by the time its consumer is reached and a chain folds whole in
-    any order: a ReLU, a pool, a ReLU, a flatten, say. A ReLU nothing fuses stays, and is refused before the design
-    search; a pool or a reshape nothing fuses is refused here.
+    any order: a ReLU, a pool, a ReLU, a flatten; or a reshape regrouping rows, then the pool over them. A ReLU nothing
+    fuses stays, and is refused before the design search; a pool or a reshape nothing fuses is refused here.
     """
 
     def __init__(self):
@@ -59,11 +59,16 @@ class FuseOps(AIEPass):
         producer = node.inputs[0].producer
         if activation != 'relu' or producer is None or len(producer.outputs) != 1 or not fuses(producer, 'relu'):
             return False
+        pool = producer.traits.get('fused_pool')
+        if pool is not None and pool.data['kind'] != 'max':  # its ReLU runs before the pool: commutes with a max only
+            return False
         producer.add_trait(TraitInstance('fused_activation', {'activation': 'relu'}))
         graph.remove_node(node, mode='contract')
         return True
 
     def _fuse_pool(self, graph, pool) -> bool:
+        """The fused_pool trait holds the window and the precision the pool reads its input in: a max selects one of
+        those values, so its output keeps that precision; an average or a sum rounds a new value into its own."""
         source, pooled = pool.inputs[0], pool.outputs[0]
         producer = source.producer
         kind = pool.metadata['kind']
@@ -83,14 +88,17 @@ class FuseOps(AIEPass):
             )
         if 'fused_pool' in producer.traits:
             raise NotImplementedError(f'{pool.name}: {producer.name} fuses one pool, and already has one.')
-        if not keeps_values(source.precision, pooled.precision):
-            raise NotImplementedError(
-                f'{pool.name}: a fused pool keeps its input quantization, but its output is quantized '
-                f'{pooled.precision}, not {source.precision}.'
-            )
-        pooled.precision = source.precision  # the producer rounds and saturates what the pool then selects
+        if kind == 'max':
+            if not keeps_values(source.precision, pooled.precision):
+                raise NotImplementedError(
+                    f'{pool.name}: a fused max pool keeps its input quantization, but its output is quantized '
+                    f'{pooled.precision}, not {source.precision}.'
+                )
+            pooled.precision = source.precision  # the producer rounds and saturates what the pool then selects
         window = {k: pool.metadata[k] for k in ('kernel_shape', 'strides', 'dilations', 'pads')}
-        producer.add_trait(TraitInstance('fused_pool', {'kind': kind, **window}))
+        producer.add_trait(
+            TraitInstance('fused_pool', {'kind': kind, **window, 'input_precision': source.precision})
+        )
         graph.remove_node(pool, mode='contract')
         return True
 

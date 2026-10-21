@@ -21,6 +21,14 @@ struct {{L.struct_name}} {
   static constexpr int M = {{P.microtiling.microtile_m}}, K = {{P.microtiling.microtile_k}}, N = {{P.microtiling.microtile_n}};
   // Row microtiles per kernel step: 4 (dense_block4x2.cpp), 2 (dense_bias_relu.cpp) or 1 (dense_vector.cpp).
   static constexpr int ROW_BLOCKS = {{P.row_blocks}};
+{% if P.pool %}
+  // A fused pool (dense_pool.cpp): POOL_GROUPS runs of POOL_ROWS LHS rows in, each run's code sum converted at
+  // POOL_SHIFT into one output row, POOL_EXTENT output rows in all.
+  static constexpr int POOL_ROWS = {{P.pool.rows}};
+  static constexpr int POOL_GROUPS = {{P.pool.groups}};
+  static constexpr int POOL_EXTENT = {{P.pool.extent}};
+  static constexpr int POOL_SHIFT = {{P.pool.shift}};
+{% endif %}
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};
   static constexpr int padded_independent_extent = {{P.full_outer}};

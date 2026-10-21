@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 from ..errors import ConfigRefused
-from ..ir.graph import VIEW_FLATTEN_2D, has_input_role
+from ..ir.graph import VIEW_FLATTEN_2D, VIEW_REGROUP_ROWS, has_input_role
 from .utils import requested_port_kinds
 
 if TYPE_CHECKING:
@@ -12,8 +12,10 @@ if TYPE_CHECKING:
 
 COMMON_DIRECTIVES = frozenset({'placement', 'io_route', 'ports'})
 # What a kernel may fuse, as the passes ask (`fuses`) and `fusions_of` names a node's: a variant declares from these.
-FUSIONS = frozenset({'bias', 'relu', 'max_pool', 'output_scale', 'input_scale', 'apply_alpha'})
-OUTPUT_VIEWS = frozenset({VIEW_FLATTEN_2D})
+FUSIONS = frozenset(
+    {'bias', 'relu', 'max_pool', 'average_pool', 'sum_pool', 'output_scale', 'input_scale', 'apply_alpha'}
+)
+OUTPUT_VIEWS = frozenset({VIEW_FLATTEN_2D, VIEW_REGROUP_ROWS})
 
 
 def fusions_of(node: Any) -> frozenset:
@@ -43,7 +45,7 @@ class FamilyResolver(ABC):
 
     @property
     def supported_output_views(self) -> frozenset:
-        """The output views (VIEW_FLATTEN_2D) some variant writes directly."""
+        """The output views (VIEW_FLATTEN_2D, VIEW_REGROUP_ROWS) some variant writes directly."""
         return frozenset().union(*(variant.supported_output_views for variant in self._variants()))
 
     def _variants(self):

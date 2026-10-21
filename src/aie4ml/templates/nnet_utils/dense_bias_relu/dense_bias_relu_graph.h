@@ -7,13 +7,15 @@
 #include "dense_bias_relu.h"
 #include "dense_bias_relu_stream.h"
 #include "dense_block4x2.h"
+#include "dense_pool.h"
 #include "dense_vector.h"
 #include "buffer_location.h"
 #include "parameters.h"
 
 using namespace adf;
 
-// The buffer kernels by row microtiles per step: 2 (dense_bias_relu.cpp), 1 (dense_vector.cpp) or 4 (dense_block4x2.cpp).
+// The buffer kernels by row microtiles per step: 2 (dense_bias_relu.cpp), 1 (dense_vector.cpp) or 4 (dense_block4x2.cpp),
+// and the rows each writes.
 template<typename ConfigT, int ROW_BLOCKS>
 struct dense_buffer_kernels {
   using single = dense_single<ConfigT>;
@@ -21,6 +23,7 @@ struct dense_buffer_kernels {
   using middle = dense_middle<ConfigT>;
   using last = dense_last<ConfigT>;
   static constexpr const char* source = "dense_bias_relu.cpp";
+  static constexpr unsigned OUT_ROWS = ConfigT::padded_independent_extent;
 };
 
 template<typename ConfigT>
@@ -30,6 +33,7 @@ struct dense_buffer_kernels<ConfigT, 1> {
   using middle = dense_vector_middle<ConfigT>;
   using last = dense_vector_last<ConfigT>;
   static constexpr const char* source = "dense_vector.cpp";
+  static constexpr unsigned OUT_ROWS = ConfigT::padded_independent_extent;
 };
 
 template<typename ConfigT>
@@ -39,9 +43,21 @@ struct dense_buffer_kernels<ConfigT, 4> {
   using middle = dense_block4x2_middle<ConfigT>;
   using last = dense_block4x2_last<ConfigT>;
   static constexpr const char* source = "dense_block4x2.cpp";
+  static constexpr unsigned OUT_ROWS = ConfigT::padded_independent_extent;
 };
 
+// A Dense fused with a pool: one output row per run of POOL_ROWS rows, whatever its row microtiles per step.
 template<typename ConfigT>
+struct dense_pool_kernels {
+  using single = dense_pool_single<ConfigT>;
+  using first = dense_pool_first<ConfigT>;
+  using middle = dense_pool_middle<ConfigT>;
+  using last = dense_pool_last<ConfigT>;
+  static constexpr const char* source = "dense_pool.cpp";
+  static constexpr unsigned OUT_ROWS = ConfigT::POOL_EXTENT;
+};
+
+template<typename ConfigT, typename BufferKernels = dense_buffer_kernels<ConfigT, ConfigT::ROW_BLOCKS>>
 class dense_bias_relu_graph : public graph {
 public:
   static constexpr unsigned CAS_NUM  = ConfigT::CAS_NUM;
@@ -60,7 +76,6 @@ public:
   // The LHS arrives, and the output leaves, on a stream (in row order) or in a buffer (in microtiles).
   static constexpr bool STREAM_IN = ConfigT::STREAM_IN;
   static constexpr bool STREAM_OUT = ConfigT::STREAM_OUT;
-  using BufferKernels = dense_buffer_kernels<ConfigT, ConfigT::ROW_BLOCKS>;
 
   input_port  in1[LHS_PORTS];
   adf::port<adf::direction::in> wts[CAS_NUM * CAS_LENGTH];
@@ -175,7 +190,7 @@ void place_graph(int COL_START, int ROW_START)
         const int last_idx = chain * CAS_LENGTH + (CAS_LENGTH - 1);
         connect<>( kk[last_idx].out[0], out1[chain] );
         if constexpr (!STREAM_OUT) {
-          dimensions( kk[last_idx].out[0] ) = { padded_independent_extent * OUT_FEAT_SLICE };
+          dimensions( kk[last_idx].out[0] ) = { BufferKernels::OUT_ROWS * OUT_FEAT_SLICE };
         }
     }
 
@@ -193,3 +208,6 @@ void place_graph(int COL_START, int ROW_START)
   }
 
 };
+
+template<typename ConfigT>
+using dense_pool_graph = dense_bias_relu_graph<ConfigT, dense_pool_kernels<ConfigT>>;

@@ -1,14 +1,21 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pooling: ONNX NCHW MaxPool onto a canonical NHWC pool, which a producing conv fuses (FuseOps)."""
+"""Pooling: ONNX NCHW MaxPool onto a canonical NHWC pool, which a producing conv fuses; ReduceMean and ReduceSum
+over the axes between the first and the last onto a pool spanning them, which a producing Dense fuses (FuseOps).
+"""
 
 from __future__ import annotations
 
+import numpy as np
+
 from ..context import OnnxImportContext
 from ..registry import onnx_handler
-from ..utils import window_attributes
+from ..shapes import normalize_axis
+from ..utils import attr, window_attributes
 from .conv import NCHW_OVER_NHWC
+
+REDUCTION_POOLS = {'ReduceMean': 'average', 'ReduceSum': 'sum'}
 
 
 @onnx_handler('MaxPool')
@@ -53,3 +60,51 @@ def _max_pool(ctx: OnnxImportContext, node, node_name: str, directives: dict) ->
         directives=directives,
     )
     ctx.set_order(out_name, NCHW_OVER_NHWC, node_name)
+
+
+def _reduced_axes(ctx: OnnxImportContext, node, node_name: str, rank: int) -> list:
+    """The axes a reduction names, from its attribute or its constant second input (ReduceSum from opset 13,
+    ReduceMean from opset 18); every axis when it names none."""
+    if len(node.input) > 1 and node.input[1]:
+        if node.input[1] not in ctx.initializers:
+            raise NotImplementedError(f'{node_name}: {node.op_type} axes must be a constant initializer.')
+        axes = np.asarray(ctx.initializers[node.input[1]]).reshape(-1).tolist()
+    else:
+        axes = attr(node, 'axes', None)
+    if not axes and int(attr(node, 'noop_with_empty_axes', 0)):
+        raise NotImplementedError(f'{node_name}: {node.op_type} names no axes, so it is an identity; remove it.')
+    return sorted({normalize_axis(int(a), rank, node_name, node.op_type) for a in (axes or range(rank))})
+
+
+@onnx_handler('ReduceMean', 'ReduceSum')
+def _reduce_pool(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
+    """A mean or a sum over the axes between the first and the last, as a pool whose window spans them: (N, T, C)
+    over T, say, as Keras' GlobalAveragePooling1D. It computes new values, quantized by the QuantizeLinear after it."""
+    x_name, out_name = node.input[0], node.output[0]
+    shape = tuple(int(d) for d in ctx.output_shape(x_name, node_name))
+    ctx.require_order(x_name, range(len(shape)), node_name)
+    axes = _reduced_axes(ctx, node, node_name, len(shape))
+    spatial = list(range(1, len(shape) - 1))
+    if not spatial or axes != spatial:
+        raise NotImplementedError(
+            f'{node_name}: {node.op_type} over axes {axes} of {shape}: a pool reduces the axes between the first and '
+            f'the last, {spatial}.'
+        )
+    window = tuple(shape[axis] for axis in spatial)
+    ctx.emit(
+        'pool',
+        node_name,
+        inputs=[ctx.source_for(x_name, node_name)],
+        outputs=[(out_name, ctx.output_shape(out_name, node_name), None)],
+        roles=['lhs'],
+        metadata={
+            'kind': REDUCTION_POOLS[node.op_type],
+            'kernel_shape': window,
+            'strides': window,
+            'dilations': (1,) * len(window),
+            'pads': (0,) * (2 * len(window)),
+            'layer_class': node.op_type,
+            'source_layer': node_name,
+        },
+        directives=directives,
+    )

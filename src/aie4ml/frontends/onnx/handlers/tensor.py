@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ....ir.graph import VIEW_FLATTEN_2D
+from ....ir.graph import VIEW_FLATTEN_2D, VIEW_REGROUP_ROWS
 from ..context import OnnxImportContext
 from ..registry import onnx_handler
 from ..shapes import normalize_axis
@@ -37,16 +37,24 @@ def _transpose(ctx: OnnxImportContext, node, node_name: str, directives: dict) -
 
 @onnx_handler('Flatten', 'Reshape')
 def _flatten(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
-    """Flatten one sample to [1, K]. The canonical tensor is unchanged, so the op only records
-    which row order the ONNX value implies -- a consumer's weight rows follow that order.
+    """Flatten one sample to [1, K], or regroup the rows, the last axis kept: (G*T, C) as (G, T, C), say. The
+    canonical tensor is unchanged, so the op only records which row order the ONNX value implies -- a consumer's
+    weight rows follow that order.
     """
     src_name = node.input[0]
     src = ctx.source_for(src_name, node_name)
     out_name = node.output[0]
     out_shape = tuple(int(d) for d in ctx.output_shape(out_name, node_name))
     logical = tuple(int(d) for d in src.shape)
-    if len(out_shape) != 2 or int(out_shape[0]) != 1 or int(np.prod(logical[1:])) != int(out_shape[1]):
-        raise NotImplementedError(f'{node_name}: only a flatten of one sample to [1, K] is supported, got {out_shape}.')
+    if len(out_shape) == 2 and int(out_shape[0]) == 1 and int(np.prod(logical[1:])) == int(out_shape[1]):
+        view = VIEW_FLATTEN_2D
+    elif out_shape[-1] == logical[-1] and ctx.order_of(src_name) is None:
+        view = VIEW_REGROUP_ROWS
+    else:
+        raise NotImplementedError(
+            f'{node_name}: a {node.op_type} to {out_shape} neither flattens one sample to [1, K] nor regroups the '
+            f'rows of {logical}, its last axis kept.'
+        )
     # The flattened row is canonical; `axis_order` records how the view ravelled the axes, so
     # the fold can hand that order to whoever reduces over the row.
     ctx.set_order(out_name, None, node_name)
@@ -58,7 +66,7 @@ def _flatten(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> 
         outputs=[(out_name, out_shape, src.precision)],
         roles=['lhs'],
         metadata={
-            'view': VIEW_FLATTEN_2D,
+            'view': view,
             'axis_order': ctx.order_of(src_name) or tuple(range(len(logical))),
             'layer_class': node.op_type,
             'source_layer': node_name,

@@ -28,7 +28,8 @@ The full constraints are in [docs/support.md](docs/support.md).
 | Add | ✅ | ✅ | ✅ | Both inputs and the output of one type | Same shapes; no broadcasting. |
 | LayerNorm | ✅ | ✅ | ✅ | int8 | Last axis. |
 | Softmax | ✅ | ✅ | ✅ | int8 in, uint8 or int16 out | Last axis. Accurate exponential (beta), or a faster surrogate for models trained with it. |
-| Flatten / Reshape | ✅ | ✅ | ✅ | — | One sample to `[1, K]`, from a Conv2D into a Dense; no data is copied. |
+| ReduceMean, ReduceSum | ✖️ | ✅ | ✅ | int8 | Pooling over sets: over the axes between the first and the last, fused into the Dense before it. |
+| Flatten / Reshape | ✅ | ✅ | ✅ | — | One sample to `[1, K]`, from a Conv2D into a Dense; or rows regrouped, the last axis kept, into a fused pool. No data is copied. |
 | Transpose | ✖️ | ✅ | ✅ | — | Of the last two axes. |
 | Slice, Split, Concat | ✅ | ✅ | ✅ | — | Along the boundaries of the producing layer's tiles; no data is copied. |
 
