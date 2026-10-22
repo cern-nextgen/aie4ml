@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
 from ..errors import ConfigRefused
-from ..ir.graph import VIEW_FLATTEN_2D, VIEW_REGROUP_ROWS, has_input_role
+from ..ir.attributes import POOL_KINDS
+from ..ir.graph import has_input_role
 from .utils import requested_port_kinds
 
 if TYPE_CHECKING:
@@ -13,22 +14,21 @@ if TYPE_CHECKING:
 COMMON_DIRECTIVES = frozenset({'placement', 'io_route', 'ports'})
 # What a kernel may fuse, as the passes ask (`fuses`) and `fusions_of` names a node's: a variant declares from these.
 FUSIONS = frozenset(
-    {'bias', 'relu', 'max_pool', 'average_pool', 'sum_pool', 'output_scale', 'input_scale', 'apply_alpha'}
+    {'bias', 'relu', 'output_scale', 'input_scale', 'apply_alpha', *(f'{kind}_pool' for kind in POOL_KINDS)}
 )
-OUTPUT_VIEWS = frozenset({VIEW_FLATTEN_2D, VIEW_REGROUP_ROWS})
 
 
 def fusions_of(node: Any) -> frozenset:
     """What `node` carries that its kernel must implement, named as variants declare it (`supported_fusions`)."""
-    fused = {scale for scale in ('output_scale', 'input_scale') if node.traits.get(scale) is not None}
+    fused = {scale for scale in ('output_scale', 'input_scale') if scale in node.attributes}
     if has_input_role(node, 'bias'):
         fused.add('bias')
-    activation = node.traits.get('fused_activation')
+    activation = node.attributes.get('fused_activation')
     if activation is not None:
-        fused.add(activation.data['activation'])
-    pool = node.traits.get('fused_pool')
+        fused.add(activation.activation)
+    pool = node.attributes.get('fused_pool')
     if pool is not None:
-        fused.add(f"{pool.data['kind']}_pool")
+        fused.add(f'{pool.kind}_pool')
     return frozenset(fused)
 
 
@@ -91,20 +91,14 @@ class FamilyResolver(ABC):
 
     def _check_output_view(self, node: Any) -> None:
         """A folded output view must be one this family writes; its shape is the output tensor's."""
-        view = node.traits.get('output_view')
-        if view is None:
-            return
-        if set(view.data) != {'kind'}:
-            raise ValueError(f'{node.name}: an output_view holds exactly its kind, got {sorted(view.data)}.')
-        if view.data['kind'] not in self.supported_output_views:
-            raise ValueError(f"{node.name}: {self.op_type} does not write the output view {view.data['kind']!r}.")
+        view = node.attributes.get('output_view')
+        if view is not None and view.kind not in self.supported_output_views:
+            raise ValueError(f'{node.name}: {self.op_type} does not write the output view {view.kind!r}.')
 
     def _check_fused_activation(self, node: Any) -> None:
-        fused = node.traits.get('fused_activation')
-        if fused is None:
-            return
-        if set(fused.data) != {'activation'} or fused.data['activation'] not in self.supported_fusions:
-            raise ValueError(f'{node.name}: {self.op_type} cannot fuse the activation {fused.data}.')
+        fused = node.attributes.get('fused_activation')
+        if fused is not None and fused.activation not in self.supported_fusions:
+            raise ValueError(f'{node.name}: {self.op_type} cannot fuse the activation {fused.activation!r}.')
 
     def resolve(
         self, node: Any, device: Any, directives: Dict[str, Any], input_contracts: Dict[str, Any]
@@ -122,8 +116,8 @@ class FamilyResolver(ABC):
             for variant in get_op_impl_registry().candidates(self.op_type)
             if (variant.input_port_kind, variant.output_port_kind) == ports
         ]
-        view = node.traits.get('output_view')
-        needed = fusions_of(node) | ({view.data['kind']} if view is not None else set())
+        view = node.attributes.get('output_view')
+        needed = fusions_of(node) | ({view.kind} if view is not None else set())
         capable = [v for v in on_ports if needed <= v.supported_fusions | v.supported_output_views]
         if on_ports and not capable:
             offered = frozenset().union(*(v.supported_fusions | v.supported_output_views for v in on_ports))

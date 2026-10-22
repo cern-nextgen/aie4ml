@@ -9,7 +9,7 @@ import pytest
 from aie4ml.device_catalog import resolve_device
 from aie4ml.errors import ConfigRefused
 from aie4ml.frontends.onnx import from_onnx, lower_onnx_model
-from aie4ml.ir import TraitInstance
+from aie4ml.ir.attributes import OutputView
 from aie4ml.op_impls.common_types import PortBinding, kernel_endpoints, to_plain
 from aie4ml.op_impls.families.matmul.matmul import MatmulOpImplVariant, MatmulRowWiseOpImplVariant
 from aie4ml.op_impls.utils import TraversalStep
@@ -452,20 +452,19 @@ def test_a_directive_the_variant_does_not_read_is_refused(tmp_path):
         _resolve_dense(_dense_model(), tmp_path, directives={'layout': 'tiled'})
 
 
-@pytest.mark.parametrize(
-    ('view', 'match'),
-    [({'kind': 'flatten_2d'}, 'does not write the output view'), ({'kind': 'flatten_2d', 'shape': (8, 8)}, 'exactly')],
-)
-def test_an_output_view_the_family_cannot_write_is_refused(tmp_path, view, match):
+def test_an_output_view_the_family_cannot_write_is_refused(tmp_path):
     ctx = lower_onnx_model(
         _dense_model(),
         {'Part': AIE1_PART, 'AIEConfig': {'Iterations': 1}},
         output_dir=tmp_path,
         project_name='aie1_dense',
     )
-    next(node for node in ctx.ir.logical if node.name == 'dense_aie').add_trait(TraitInstance('output_view', view))
-    with pytest.raises(ValueError, match=match):
+    dense = next(node for node in ctx.ir.logical if node.name == 'dense_aie')
+    dense.attributes['output_view'] = OutputView('flatten_2d')
+    with pytest.raises(ValueError, match='does not write the output view'):
         Resolve().transform(ctx)
+    with pytest.raises(ValueError, match='unknown output view'):
+        OutputView('transposed')
 
 
 def test_resolving_again_repacks_the_current_weights(tmp_path):

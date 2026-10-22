@@ -73,7 +73,7 @@ def test_quantizers_behind_a_bias_relu_and_scale_fold_into_the_dense_kernels(tmp
     assert [node.op_type for node in ctx.ir.logical if not node.is_folded_view] == ['dense', 'dense', 'softmax']
     fc1, fc2, softmax = (ctx.ir.execution.get(name) for name in ('fc1_aie', 'fc2_aie', 'softmax_aie'))
     assert fc1.config.flags.use_bias and fc1.config.flags.use_relu
-    assert 'output_scale' in fc2.node.traits and 'input_scale' not in softmax.node.traits
+    assert 'output_scale' in fc2.node.attributes and 'input_scale' not in softmax.node.attributes
 
 
 @pytest.mark.requires_vitis

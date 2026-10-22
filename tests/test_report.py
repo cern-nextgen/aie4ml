@@ -254,7 +254,13 @@ def test_a_kernel_without_a_profile_is_named_not_dropped(tmp_path):
     (tmp_path / 'aie_pipeline.json').write_text(
         json.dumps(
             {
-                'physical': {'placements': {'c1_aie': {'col': 7, 'row': 0}, 'fc_aie': {'col': 8, 'row': 0}}},
+                'physical': {
+                    'placements': {
+                        'c1_aie': {'col': 7, 'row': 0, 'width': 1, 'height': 1},
+                        'fc_aie': {'col': 8, 'row': 0, 'width': 1, 'height': 1},
+                    },
+                    'plan': {},
+                },
                 'execution': [
                     {'node': name, 'config': {'parallelism': {'cas_num': 1, 'cas_length': 1}}}
                     for name in ('c1_aie', 'fc_aie')

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from ..ir import TraitInstance, get_backend_context
-from ..op_impls.utils.io import view_layout
+from ..ir import get_backend_context
+from ..ir.attributes import FoldedView, IOView
+from ..ir.graph import FOLDED_VIEWS, ViewPart
+from ..op_impls.utils.io import view_perm
 from .base import AIEPass
-
-_VIEW_OPS = ('concat', 'slice', 'split')
 
 
 class FoldViewOps(AIEPass):
-    """Lower semantic view ops into explicit tensor view traits."""
+    """Lower semantic view ops into explicit tensor view attributes."""
 
     def __init__(self):
         self.name = 'fold_view_ops'
@@ -27,15 +27,6 @@ class FoldViewOps(AIEPass):
                 changed = self._fold_slice(node) or changed
 
         return changed
-
-    def _io_view_data(self, node):
-        trait = node.traits.get('io_view')
-        if trait is None:
-            trait = TraitInstance('io_view', {'inputs': {}, 'outputs': {}})
-            node.add_trait(trait)
-        trait.data.setdefault('inputs', {})
-        trait.data.setdefault('outputs', {})
-        return trait.data
 
     def _fold_transpose(self, graph, node) -> bool:
         in_tv = node.inputs[0]
@@ -61,7 +52,7 @@ class FoldViewOps(AIEPass):
         if (node.metadata.get('data_format') or 'channels_last').lower() != 'channels_last':  # unset: channels-last
             raise ValueError(f'{node.name}: only channels_last transpose is supported.')
 
-        views = [c.name for c in out_tv.consumers if c.op_type in _VIEW_OPS]
+        views = [c.name for c in out_tv.consumers if c.op_type in FOLDED_VIEWS]
         if views:
             raise NotImplementedError(
                 f'{node.name}: transpose feeds the view op(s) {views}, whose axes would then name the untransposed '
@@ -69,15 +60,16 @@ class FoldViewOps(AIEPass):
             )
 
         # A transpose folded into this one already permutes its input: its consumers read the two composed.
-        upstream = view_layout(node, in_tv, 'inputs').get('perm')
+        upstream = view_perm(node, in_tv, 'inputs')
         if upstream is not None:
             perm = [int(upstream[axis]) for axis in perm]
 
         for consumer in out_tv.consumers:
-            cons_view = self._io_view_data(consumer)
-            cons_view['inputs'].pop(out_tv.name, None)
+            view = consumer.attributes.get('io_view', IOView())
+            inputs = {name: order for name, order in view.inputs.items() if name != out_tv.name}
             if perm != sorted(perm):  # one keeping every axis in place is no view; buffer_order is derived
-                cons_view['inputs'][in_tv.name] = {'perm': list(perm)}
+                inputs[in_tv.name] = tuple(perm)
+            consumer.attributes['io_view'] = IOView(inputs, dict(view.outputs))
             if out_tv.name in consumer.roles:
                 consumer.roles[in_tv.name] = consumer.roles.pop(out_tv.name)
 
@@ -99,12 +91,12 @@ class FoldViewOps(AIEPass):
             raise ValueError(f'{node.name}: concat axis {node.metadata.get("axis")} is out of range for rank {rank}.')
 
         offset = 0
-        slices = []
+        parts = []
         for tensor in node.inputs:
             if len(tensor.shape) != rank:
                 raise ValueError(f'{node.name}: concat input {tensor.name!r} rank does not match output rank.')
             extent = int(tensor.shape[axis])
-            slices.append({'input': tensor.name, 'start': int(offset), 'extent': extent})
+            parts.append(ViewPart(tensor.name, int(offset), extent))
             offset += extent
 
         if int(output.shape[axis]) != int(offset):
@@ -112,17 +104,7 @@ class FoldViewOps(AIEPass):
                 f'{node.name}: concat output axis extent {output.shape[axis]} does not match input sum {offset}.'
             )
 
-        node.add_trait(
-            TraitInstance(
-                'concat_view',
-                {
-                    'kind': 'concat',
-                    'axis': axis,
-                    'output': output.name,
-                    'slices': slices,
-                },
-            )
-        )
+        node.attributes['folded_view'] = FoldedView('concat', axis, {output.name: tuple(parts)})
         return True
 
     def _fold_slice(self, node) -> bool:
@@ -142,7 +124,7 @@ class FoldViewOps(AIEPass):
         slices = list(node.metadata.get('slices', ()))
         if len(slices) != len(node.outputs):
             raise ValueError(f'{node.name}: {node.op_type} slice metadata does not match output count.')
-        normalized = []
+        outputs = {}
         for output, item in zip(node.outputs, slices):
             start = int(item['start'])
             extent = int(item['extent'])
@@ -150,17 +132,7 @@ class FoldViewOps(AIEPass):
                 raise ValueError(f'{node.name}: invalid {node.op_type} range [{start}, {start + extent}).')
             if int(output.shape[axis]) != extent:
                 raise ValueError(f'{node.name}: {node.op_type} output {output.name!r} extent mismatch.')
-            normalized.append({'output': output.name, 'start': start, 'extent': extent})
+            outputs[output.name] = (ViewPart(source.name, start, extent),)
 
-        node.add_trait(
-            TraitInstance(
-                'slice_view',
-                {
-                    'kind': node.op_type,
-                    'axis': axis,
-                    'source': source.name,
-                    'slices': normalized,
-                },
-            )
-        )
+        node.attributes['folded_view'] = FoldedView(node.op_type, axis, outputs)
         return True

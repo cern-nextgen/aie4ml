@@ -1,30 +1,25 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def check_io_view(node, generation: str) -> None:
-    """Check the tensors' ranks and the node's `io_view` trait. A tensor with no entry is viewed in its
-    logical order; an entry holds only a `perm`, and buffer_order is derived (see TensorView)."""
+    """Check the tensors' ranks and the node's `io_view`: each tensor it names is one the node reads or writes, its
+    permutation of that tensor's rank. A tensor not named is viewed in its logical order."""
     max_rank = 5 if 'AIE-MLV2' in (generation or '').upper() else 4
     tensors = {'inputs': node.inputs, 'outputs': node.outputs}
     for tensor in (*node.inputs, *node.outputs):
         if len(tensor.shape) > max_rank:
             raise ValueError(f'{node.name}: tensor rank {len(tensor.shape)} exceeds max {max_rank} for {generation}.')
-    trait = node.traits.get('io_view')
-    if trait is None:
+    view = node.attributes.get('io_view')
+    if view is None:
         return
-    if not set(trait.data) <= set(tensors):
-        raise ValueError(f'{node.name}: io_view holds {sorted(trait.data)}, not inputs/outputs.')
-    for direction, entries in trait.data.items():
+    for direction, perms in (('inputs', view.inputs), ('outputs', view.outputs)):
         by_name = {tensor.name: tensor for tensor in tensors[direction]}
-        for name, entry in entries.items():
+        for name, perm in perms.items():
             if name not in by_name:
                 raise ValueError(f'{node.name}: io_view {direction} names {name!r}, which is not one of them.')
-            if not set(entry) <= {'perm'}:
-                raise ValueError(f'{node.name}: io_view entry for {name!r} holds {sorted(entry)}, not perm.')
-            perm = entry.get('perm')
-            if perm is not None and sorted(perm) != list(range(len(by_name[name].shape))):
+            if len(perm) != len(by_name[name].shape):
                 raise ValueError(f'{node.name}: io_view perm {perm} is not a permutation of {name!r}.')
 
 
@@ -48,14 +43,13 @@ def resolve_io_route(node) -> Dict[str, Any]:
 
 def view_shape(node, tensor, direction: str) -> List[int]:
     logical = [int(x) for x in tensor.shape]
-    view = view_layout(node, tensor, direction)
-    perm = view.get('perm')
+    perm = view_perm(node, tensor, direction)
     if perm is None:
         return logical
     return [int(logical[i]) for i in perm]
 
 
-def view_layout(node, tensor, direction: str) -> Dict[str, Any]:
-    """The tensor's `io_view` entry, checked by `check_io_view`; none means its logical order."""
-    trait = node.traits.get('io_view')
-    return {} if trait is None else trait.data.get(direction, {}).get(tensor.name, {})
+def view_perm(node, tensor, direction: str) -> Optional[Tuple[int, ...]]:
+    """The axis order the node's `io_view` reads or writes the tensor in; None for its logical order."""
+    view = node.attributes.get('io_view')
+    return None if view is None else getattr(view, direction).get(tensor.name)

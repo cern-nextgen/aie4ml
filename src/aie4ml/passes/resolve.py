@@ -12,11 +12,10 @@ from ..ir.graph import (
     ExecutionView,
     OpNode,
     TensorContract,
-    ViewPart,
     input_role,
 )
 from ..op_impls.family_registry import get_family_resolver_registry
-from ..op_impls.utils.io import check_io_view, resolve_io_route, view_layout
+from ..op_impls.utils.io import check_io_view, resolve_io_route, view_perm
 from .base import AIEPass
 
 log = logging.getLogger(__name__)
@@ -108,9 +107,9 @@ def _check_views(node, config, variant) -> None:
     """
     for direction, tensors in (('inputs', node.inputs), ('outputs', node.outputs)):
         for tensor in tensors:
-            perm = view_layout(node, tensor, direction).get('perm')
+            perm = view_perm(node, tensor, direction)
             view = config.io_views.get(tensor.name)
-            if perm is not None and (view is None or view.perm != tuple(perm)):
+            if perm is not None and (view is None or view.perm != perm):
                 raise NotImplementedError(
                     f'{node.name}: {variant.variant_id} does not read {tensor.name!r} through the io_view perm '
                     f'{perm} a folded transpose gave it.'
@@ -131,24 +130,11 @@ def _check_views(node, config, variant) -> None:
 
 
 def _folded_views(node):
-    """(value, view) for each output of a folded slice, split or concat, checked against the trait's schema."""
-
-    def trait(name, keys, part_keys):
-        data = node.traits[name].data
-        if set(data) != keys or any(set(item) != part_keys for item in data['slices']):
-            raise ValueError(f'{node.name}: malformed {name} {data}.')
-        return data
-
-    if 'concat_view' in node.traits:
-        data = trait('concat_view', {'kind', 'axis', 'output', 'slices'}, {'input', 'start', 'extent'})
-        parts = tuple(ViewPart(str(s['input']), int(s['start']), int(s['extent'])) for s in data['slices'])
-        views = [(str(data['output']), ExecutionView('concat', node.name, int(data['axis']), parts))]
-    else:
-        data = trait('slice_view', {'kind', 'axis', 'source', 'slices'}, {'output', 'start', 'extent'})
-        views = []
-        for s in data['slices']:
-            part = ViewPart(str(data['source']), int(s['start']), int(s['extent']))
-            views.append((str(s['output']), ExecutionView(node.op_type, node.name, int(data['axis']), (part,))))
+    """(value, view) for each output of a folded slice, split or concat."""
+    folded = node.attributes['folded_view']
+    views = [
+        (name, ExecutionView(folded.kind, node.name, folded.axis, parts)) for name, parts in folded.outputs.items()
+    ]
     if sorted(name for name, _ in views) != sorted(tensor.name for tensor in node.outputs):
         raise ValueError(f'{node.name}: its view names {sorted(name for name, _ in views)}, not its outputs.')
     return views

@@ -196,10 +196,10 @@ def resolve_bias_dtype(node, precision: Dict[str, AIEDataType]) -> AIEDataType:
 
 
 def resolve_output_scale_shift(node, *, is_float: bool) -> int:
-    trait = node.traits.get('output_scale')
-    if trait is None:
+    folded = node.attributes.get('output_scale')
+    if folded is None:
         return 0
-    scale = float(trait.data['scale'])
+    scale = float(folded.scale)
     if is_float:
         raise NotImplementedError(f'{node.name}: fused output scaling is not implemented for float MatMul-family ops.')
     if scale <= 0.0 or scale > 1.0:

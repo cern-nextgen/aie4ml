@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-import subprocess
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -268,23 +268,44 @@ def _window_slices(port: IOPortLayout, tensor_shape):
     return tuple(tensor_slices), tuple(tile_slices)
 
 
+_TIMESTAMP = re.compile(r'^T\s+([\d.]+)\s*(ps|ns|us|ms|s)', re.IGNORECASE)
+
+
+def to_ns(value: float, unit: str) -> float:
+    if unit == 'ps':
+        return value / 1000
+    if unit == 'ns':
+        return value
+    if unit == 'us':
+        return value * 1000
+    if unit == 'ms':
+        return value * 1_000_000
+    if unit == 's':
+        return value * 1_000_000_000
+    raise ValueError(f'Unknown time unit: {unit}')
+
+
+def read_aiesim_output(path: Path) -> List[Tuple[Optional[float], List[str], bool]]:
+    """A simulator output file as its beats: when each arrived in ns (None for values no timestamp precedes, as the
+    x86 simulator writes them), the values it carries, and whether a TLAST ends it."""
+    beats: List[Tuple[Optional[float], List[str], bool]] = [(None, [], False)]
+    for line in path.read_text().splitlines():
+        stamp = _TIMESTAMP.match(line.strip())
+        if stamp:
+            beats.append((to_ns(float(stamp.group(1)), stamp.group(2).lower()), [], False))
+            continue
+        tokens = line.split()
+        time, values, tlast = beats[-1]
+        values.extend(token for token in tokens if token.upper() != 'TLAST')
+        beats[-1] = (time, values, tlast or any(token.upper() == 'TLAST' for token in tokens))
+    return [beat for beat in beats if beat[0] is not None or beat[1]]
+
+
 def _read_output_file(path: Path, port: IOPortLayout) -> np.ndarray:
     if not path.exists():
         raise FileNotFoundError(f'Expected simulator output {path} not found.')
 
-    tokens = path.read_text().split()
-    clean: List[str] = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if tok.upper() == 'TLAST':
-            i += 1
-            continue
-        if tok.upper() == 'T' and i + 2 < len(tokens):
-            i += 3
-            continue
-        clean.append(tok)
-        i += 1
+    clean = [value for _, values, _ in read_aiesim_output(path) for value in values]
 
     if _is_float_format(port.dtype.format):
         values = np.array([float(t) for t in clean], dtype=np.float64)
@@ -294,10 +315,3 @@ def _read_output_file(path: Path, port: IOPortLayout) -> np.ndarray:
     iters = values.size // per_iter
     values = values[: iters * per_iter]
     return values.reshape(iters, *port.numpy_tile_shape)
-
-
-def run_simulation_target(output_dir, make_target):
-    cmd = ['make', make_target]
-    result = subprocess.run(cmd, cwd=Path(output_dir), text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f'Make target "{make_target}" failed in {output_dir}.')

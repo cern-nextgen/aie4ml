@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from ..ir import TraitInstance, get_backend_context
+from ..ir import get_backend_context
+from ..ir.attributes import Scale
 from ..op_impls.family_registry import fuses
 from .base import AIEPass
 
@@ -62,7 +63,6 @@ class FoldScale(AIEPass):
         return changed
 
 
-def _accumulate_scale(node, trait_name, scale):
-    existing = node.traits.get(trait_name)
-    combined = scale * float(existing.data['scale']) if existing is not None else scale
-    node.add_trait(TraitInstance(trait_name, {'scale': combined}))
+def _accumulate_scale(node, name, scale):
+    existing = node.attributes.get(name)
+    node.attributes[name] = Scale(scale * existing.scale if existing is not None else scale)

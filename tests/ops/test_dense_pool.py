@@ -185,10 +185,10 @@ def test_the_average_fuses_into_the_last_phi_dense(tmp_path, form):
     assert {node.op_type for node in ctx.ir.logical} == {'dense'}
     pooled = ctx.ir.execution.get('phi2_aie')
     assert pooled.variant.variant_id == 'dense.b.r.pool.v1'
-    trait = pooled.node.traits.get('fused_pool').data
-    assert (trait['kind'], trait['kernel_shape']) == ('average', (64,))
+    pool = pooled.node.attributes['fused_pool']
+    assert (pool.kind, pool.kernel_shape) == ('average', (64,))
     assert tuple(pooled.node.outputs[0].shape) == (4, 32)
-    row_frac = trait['input_precision'].frac
+    row_frac = pool.input_precision.frac
     text = kernel_config(pooled)
     assert [_constant(text, n) for n in ('POOL_ROWS', 'POOL_GROUPS', 'POOL_EXTENT', 'POOL_SHIFT')] == [
         64,
@@ -207,9 +207,9 @@ def test_the_average_fuses_into_the_last_phi_dense(tmp_path, form):
 def test_a_sum_shifts_by_the_lanes_only(tmp_path):
     model, _, _ = _set_model(4, 16, (32, 32), (32, 16), reduce='ReduceSum')
     pooled = lower(model, tmp_path, part=MLV2_PART).ir.execution.get('phi1_aie')
-    trait = pooled.node.traits.get('fused_pool').data
-    assert trait['kind'] == 'sum'
-    shift = trait['input_precision'].frac - pooled.node.outputs[0].precision.frac
+    pool = pooled.node.attributes['fused_pool']
+    assert pool.kind == 'sum'
+    shift = pool.input_precision.frac - pooled.node.outputs[0].precision.frac
     assert _constant(kernel_config(pooled), 'POOL_SHIFT') == shift
 
 

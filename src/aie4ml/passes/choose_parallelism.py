@@ -684,7 +684,6 @@ class _Search:
                     (
                         rect.w,
                         rect.h,
-                        repr((rect.input_face, rect.output_face)),
                         tuple(rect.locations_at(row) for row in rows),
                         tuple(tuple(rect.stream_locations(row)) if rect.stream_locations else () for row in rows),
                         frozenset(binding.group for binding in inst.ports.outputs.values()),

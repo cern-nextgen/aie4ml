@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from aie4ml.errors import ConfigRefused
-from aie4ml.op_impls import get_family_resolver_registry
+from aie4ml.ir.attributes import FusedPool
 from helpers import TensorProto, assert_x86_matches_onnx, helper, lower, make_model, qdq, qparams
 from ops.test_conv2d import CIN, CLASSES, FRAC, _conv, _head, _start
 
@@ -177,13 +177,14 @@ def test_directives_for_a_fused_pool_are_refused(tmp_path):
         lower(_model('pool_directed'), tmp_path, {'p1_pool': {'parallelism': {'cas_num': 1}}}, part=PARTS['aie1'])
 
 
-def test_a_malformed_fused_pool_trait_is_refused(tmp_path):
-    """The conv checks the trait's exact contract, so a key its kernel would ignore cannot slip through."""
-    ctx = lower(_model('pooled'), tmp_path, part=PARTS['aie1'])
-    conv = _pooled(ctx).node
-    conv.traits['fused_pool'].data['ceil_mode'] = 1
-    with pytest.raises(ValueError, match='holds its kind and window'):
-        get_family_resolver_registry().get('conv2d').resolve(conv, ctx.device, dict(conv.directives), {})
+def test_a_malformed_fused_pool_is_refused_when_made():
+    """A fused pool is an attribute that checks itself, so no reader sees one its kernel would misread."""
+    with pytest.raises(ValueError, match='unknown pool kind'):
+        FusedPool('min', (2, 2), (2, 2), (1, 1), (0, 0, 0, 0), None)
+    with pytest.raises(ValueError, match='per axis'):
+        FusedPool('max', (2, 2), (2,), (1, 1), (0, 0, 0, 0), None)
+    with pytest.raises(TypeError):
+        FusedPool('max', (2, 2), (2, 2), (1, 1), (0, 0, 0, 0), None, ceil_mode=1)
 
 
 @pytest.mark.parametrize(

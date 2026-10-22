@@ -19,11 +19,10 @@ import numpy as np
 from .ir import get_backend_context
 from .utils import sanitize_identifier
 
-# Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
-# This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is
-# independent of the element dtype (int8/int16/int32 just change how many elements fit
-# per word, not the word size).
-_DDR_WORD_BYTES = 64
+# Bits in one DDR/AXI word -- the unit the PL data mover transfers (the kernels' ap_uint<512> m_axi word),
+# whatever the element type.
+_DDR_WORD_BITS = 512
+_DDR_WORD_BYTES = _DDR_WORD_BITS // 8
 
 # The data mover runs iterations in fixed-size groups, so the usable iteration count must
 # be a whole multiple of this
@@ -50,8 +49,8 @@ def _max_preloadable_iterations(
     avail_blocks, depth, width, _ = _pl_pool(ctx, pl_memory)
 
     def _blocks(n_iter: int) -> int:
-        return _onchip_blocks(512, ifm_per_stream * n_iter, n_ifm, depth, width, copies=1) + _onchip_blocks(
-            512, ofm_per_stream * n_iter, n_ofm, depth, width, copies=1
+        return _onchip_blocks(ifm_per_stream * n_iter, n_ifm, depth, width, copies=1) + _onchip_blocks(
+            ofm_per_stream * n_iter, n_ofm, depth, width, copies=1
         )
 
     # Grow by whole groups while they still fit (block count is monotonic in n_iter).
@@ -83,13 +82,10 @@ def _pl_pool(ctx, pl_memory: str):
     return int(pool.blocks * _PL_USABLE_FRACTION), pool.depth, pool.width_bits, label
 
 
-def _onchip_blocks(
-    word_bits: int, rows: int, n_banks: int, block_depth: int, block_width_bits: int, copies: int = 2
-) -> int:
-    """RAM blocks for `copies` ping-pong buffers, each `n_banks` independent banks of `rows`
-    deep x `word_bits` wide. Width-pinned: ceil(word_bits/block_width_bits) blocks per bank,
-    depth rounded up to block_depth."""
-    width_blocks = math.ceil(int(word_bits) / int(block_width_bits))
+def _onchip_blocks(rows: int, n_banks: int, block_depth: int, block_width_bits: int, copies: int = 2) -> int:
+    """RAM blocks for `copies` ping-pong buffers, each `n_banks` independent banks of `rows` DDR words deep.
+    Width-pinned: ceil(_DDR_WORD_BITS/block_width_bits) blocks per bank, depth rounded up to block_depth."""
+    width_blocks = math.ceil(_DDR_WORD_BITS / int(block_width_bits))
     depth_blocks = math.ceil(int(rows) / int(block_depth))
     return int(copies) * int(n_banks) * width_blocks * depth_blocks
 
@@ -98,9 +94,7 @@ def _stream_buffer_blocks(ctx, pl_memory: str, n_ifm: int, n_ofm: int, ifm_per_s
     """Total URAM/BRAM blocks the memory_stream ping-pong buffers occupy (mm2s + s2mm) in the
     pool PLMemory selects. mm2s = n_ifm banks x ifm_per_stream rows; s2mm = n_ofm x ofm_per_stream."""
     _, depth, width, _ = _pl_pool(ctx, pl_memory)
-    return _onchip_blocks(512, ifm_per_stream, n_ifm, depth, width) + _onchip_blocks(
-        512, ofm_per_stream, n_ofm, depth, width
-    )
+    return _onchip_blocks(ifm_per_stream, n_ifm, depth, width) + _onchip_blocks(ofm_per_stream, n_ofm, depth, width)
 
 
 def _check_memory_stream_fits(
@@ -121,7 +115,7 @@ def _check_memory_stream_fits(
         raise RuntimeError(
             f'memory_stream buffers need {needed} {label} blocks but only {avail} are '
             f'available (2 ping-pong x [{n_ifm} ifm + {n_ofm} ofm] banks; each 512-bit word '
-            f'pins {math.ceil(512 / width)} blocks/bank).' + hint
+            f'pins {math.ceil(_DDR_WORD_BITS / width)} blocks/bank).' + hint
         )
     return needed
 
@@ -176,14 +170,9 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int) -> in
     return total // int(batch)
 
 
-def port_transfer_bytes(port) -> int:
-    """Bytes one port moves per iteration: its transfer, whatever the layout behind it."""
-    return port.transfer_bytes
-
-
 def _stream_words_512(port, direction: str) -> int:
     """512-bit words one PLIO stream carries per iteration, which must be word-aligned."""
-    stream_bytes = port_transfer_bytes(port)
+    stream_bytes = port.transfer_bytes
     if stream_bytes % _DDR_WORD_BYTES != 0:
         raise NotImplementedError(
             f'graph {direction}: {stream_bytes} bytes per stream is not a multiple of '
@@ -508,7 +497,7 @@ def pack_host_data(model_or_ctx, X=None):
 
     # What the graph actually emits, port by port -- the same transfer the PL movers carry, which
     # is not the logical tensor when a port's tile is padded.
-    out_total_bytes = sum(port_transfer_bytes(port) for ports in layout.outputs.values() for port in ports)
+    out_total_bytes = sum(port.transfer_bytes for ports in layout.outputs.values() for port in ports)
     if out_total_bytes % 4 != 0:
         raise NotImplementedError(f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).')
     ofm_size_words = out_total_bytes // 4

@@ -25,7 +25,7 @@ def dump_pipeline_ir(ctx, destination: Path) -> None:
             {'name': v.name, 'producer': v.producer, 'view': v.view.node if v.view else None}
             for v in ctx.ir.execution.values.values()
         ],
-        'physical': serialize_physical_ir(ctx.ir.physical),
+        'physical': ctx.ir.physical.to_dict(),
         'optimizer': ctx.ir.optimizer,
     }
 
@@ -39,7 +39,7 @@ def serialize_logical_node(node: OpNode) -> Dict[str, Any]:
         'op_type': node.op_type,
         'inputs': [t.name for t in node.inputs],
         'outputs': [t.name for t in node.outputs],
-        'traits': {name: to_plain(trait.data) for name, trait in node.traits.items()},
+        'attributes': {name: to_plain(attribute) for name, attribute in node.attributes.items()},
         'metadata': dict(node.metadata),
         'schedule': to_plain(node.schedule),
         'macs': family.macs(node) if family is not None else 0,
@@ -61,10 +61,6 @@ def serialize_op_impl_instance(inst: ExecutionInstance) -> Dict[str, Any]:
         'param_template': inst.variant.param_template,
         'config': to_plain(inst.config),
     }
-
-
-def serialize_physical_ir(physical_ir) -> Dict[str, Any]:
-    return physical_ir.to_dict()
 
 
 __all__ = ['dump_pipeline_ir']

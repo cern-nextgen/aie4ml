@@ -283,7 +283,7 @@ def _transposed_concat_model(*, second_transposed: bool = True):
 
 def _view(ctx, op_type):
     node = next(n for n in ctx.ir.logical if n.op_type == op_type)
-    return node.traits['concat_view' if op_type == 'concat' else 'slice_view'].data
+    return node.attributes['folded_view']
 
 
 def test_slice_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):
@@ -295,7 +295,7 @@ def test_slice_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):
         part=AIE1_PART,
         directives={'root': _parallelism(2), 'tail': _parallelism(1)},
     )
-    assert _view(ctx, 'slice')['axis'] == 0
+    assert _view(ctx, 'slice').axis == 0
     assert ('root_aie.out1[0]', 'tail_aie.in1[0]') in {
         (e['source'], e['target']) for e in ctx.ir.physical.plan['direct_edges']
     }
@@ -308,7 +308,7 @@ def test_split_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):
         part=AIE1_PART,
         directives={'root': _parallelism(2), 'left': _parallelism(1), 'right': _parallelism(1)},
     )
-    assert _view(ctx, 'split')['axis'] == 0
+    assert _view(ctx, 'split').axis == 0
     edges = {(e['source'], e['target']) for e in ctx.ir.physical.plan['direct_edges']}
     assert {('root_aie.out1[0]', 'left_aie.in1[0]'), ('root_aie.out1[1]', 'right_aie.in1[0]')} <= edges
 
@@ -320,7 +320,7 @@ def test_concat_of_transposed_values_joins_the_canonical_axis(tmp_path):
         part=AIE1_PART,
         directives={'first': _parallelism(1), 'second': _parallelism(1), 'tail': _parallelism(2)},
     )
-    assert _view(ctx, 'concat')['axis'] == 0
+    assert _view(ctx, 'concat').axis == 0
     edges = {(e['source'], e['target']) for e in ctx.ir.physical.plan['direct_edges']}
     assert {('first_aie.out1[0]', 'tail_aie.in1[0]'), ('second_aie.out1[0]', 'tail_aie.in1[1]')} <= edges
 

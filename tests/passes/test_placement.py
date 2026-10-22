@@ -11,7 +11,6 @@ from aie4ml.passes.placement import (
     GraphSpec,
     NodeSpec,
     PlacementInfeasibleError,
-    PortFace,
     Rect,
     pair_offsets,
 )
@@ -29,7 +28,7 @@ def _place(graph: GraphSpec, W: int, H: int):
 
 
 def _one_tile(name, locations, anchor=None, outputs=frozenset()):
-    rect = Rect(1, 1, PortFace('left', 0, 0), PortFace('right', 0, 0), buffer_locations=lambda _row: locations)
+    rect = Rect(1, 1, buffer_locations=lambda _row: locations)
     return NodeSpec(name, rect, anchor, outputs=outputs)
 
 
@@ -91,8 +90,7 @@ def _column_op(name, rows):
             for location in (BufferLocation('in1', row, -1, row, (0, 3)), BufferLocation('out1', row, 0, row, (0, 3)))
         )
 
-    face = PortFace('left', 0, rows - 1), PortFace('right', 0, rows - 1)
-    return NodeSpec(name, Rect(1, rows, *face, buffer_locations=locations), outputs=frozenset({'out1'}))
+    return NodeSpec(name, Rect(1, rows, buffer_locations=locations), outputs=frozenset({'out1'}))
 
 
 def _tail_graph(tail_shared: bool = True):

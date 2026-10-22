@@ -144,8 +144,8 @@ class _DenseVariantBase(_MatmulFamilyVariantBase):
             parallel_cfg['cas_length'] = required_cas_length
             required_microtile = inherited_microtile(node, input_contracts)
 
-        fused_act = node.traits.get('fused_activation')
-        use_relu = fused_act is not None and fused_act.data['activation'] == 'relu'
+        fused_act = node.attributes.get('fused_activation')
+        use_relu = fused_act is not None and fused_act.activation == 'relu'
         # A kernel of one row block pays for every row of its microtile, so it takes the fewest rows the part
         # offers -- unless its producer writes a microtile the part also offers, which keeps the hand-off direct.
         one_block = self.row_blocks == 1
@@ -188,8 +188,8 @@ class _DenseVariantBase(_MatmulFamilyVariantBase):
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
 
         # the accumulators convert to the rows' lane: the output's, or the one a fused pool reads them in
-        pool = node.traits.get('fused_pool')
-        rows_precision = node.outputs[0].precision if pool is None else pool.data['input_precision']
+        pool = node.attributes.get('fused_pool')
+        rows_precision = node.outputs[0].precision if pool is None else pool.input_precision
         shift = (
             0
             if is_float
@@ -386,7 +386,7 @@ class DensePoolOpImplVariant(DenseOpImplVariant):
     def matches(self, node: OpNode, device, directives) -> bool:
         return (
             super().matches(node, device, directives)
-            and node.traits.get('fused_pool') is not None
+            and 'fused_pool' in node.attributes
             and device.generation in ('AIE-ML', 'AIE-MLV2')
         )
 
@@ -470,8 +470,8 @@ def _pool_shift(node) -> int:
     """The right shift converting a run's sum of row codes into its output row's codes: log2(rows) for an average, and
     the two lanes' fraction bits apart. The rows round into their own lane first, as the model quantizes them before
     the pool; refused by name where 8-bit codes cannot compute the pool exactly."""
-    pool, rows = node.traits['fused_pool'].data, matmul_dims(node).pooled_rows
-    kind, row, out = pool['kind'], pool['input_precision'], node.outputs[0].precision
+    pool, rows = node.attributes['fused_pool'], matmul_dims(node).pooled_rows
+    kind, row, out = pool.kind, pool.input_precision, node.outputs[0].precision
     for name, lane in (('rows', row), ('pooled rows', out)):
         if not isinstance(lane, QuantIntent) or int(lane.width) != 8:
             raise NotImplementedError(

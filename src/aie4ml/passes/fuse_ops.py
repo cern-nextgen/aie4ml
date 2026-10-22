@@ -5,7 +5,8 @@ from __future__ import annotations
 import numpy as np
 
 from ..aie_types import QuantIntent
-from ..ir import TraitInstance, get_backend_context
+from ..ir import get_backend_context
+from ..ir.attributes import FusedActivation, FusedPool, OutputView
 from ..op_impls.family_registry import fuses, get_family_resolver_registry
 from .base import AIEPass
 
@@ -24,7 +25,7 @@ def _row_permutation(shape, axis_order):
 
 class FuseOps(AIEPass):
     """Fuse each op into the op producing its input, where that op's family fuses it: a ReLU (the fused_activation
-    trait), a pool (fused_pool) and a reshape the producer writes as a view (output_view); a linear activation, a cast,
+    attribute), a pool (fused_pool) and a reshape the producer writes as a view (output_view); a linear activation, a cast,
     goes.
 
     One walk in graph order, so each producer is final by the time its consumer is reached and a chain folds whole in
@@ -59,15 +60,15 @@ class FuseOps(AIEPass):
         producer = node.inputs[0].producer
         if activation != 'relu' or producer is None or len(producer.outputs) != 1 or not fuses(producer, 'relu'):
             return False
-        pool = producer.traits.get('fused_pool')
-        if pool is not None and pool.data['kind'] != 'max':  # its ReLU runs before the pool: commutes with a max only
+        pool = producer.attributes.get('fused_pool')
+        if pool is not None and pool.kind != 'max':  # its ReLU runs before the pool: commutes with a max only
             return False
-        producer.add_trait(TraitInstance('fused_activation', {'activation': 'relu'}))
+        producer.attributes['fused_activation'] = FusedActivation('relu')
         graph.remove_node(node, mode='contract')
         return True
 
     def _fuse_pool(self, graph, pool) -> bool:
-        """The fused_pool trait holds the window and the precision the pool reads its input in: a max selects one of
+        """The fused_pool attribute holds the window and the precision the pool reads its input in: a max selects one of
         those values, so its output keeps that precision; an average or a sum rounds a new value into its own."""
         source, pooled = pool.inputs[0], pool.outputs[0]
         producer = source.producer
@@ -86,7 +87,7 @@ class FuseOps(AIEPass):
             raise ValueError(
                 f'{pool.name}: a fused pool runs inside {producer.name}; direct that layer instead, not the pool.'
             )
-        if 'fused_pool' in producer.traits:
+        if 'fused_pool' in producer.attributes:
             raise NotImplementedError(f'{pool.name}: {producer.name} fuses one pool, and already has one.')
         if kind == 'max':
             if not keeps_values(source.precision, pooled.precision):
@@ -95,10 +96,8 @@ class FuseOps(AIEPass):
                     f'{pooled.precision}, not {source.precision}.'
                 )
             pooled.precision = source.precision  # the producer rounds and saturates what the pool then selects
-        window = {k: pool.metadata[k] for k in ('kernel_shape', 'strides', 'dilations', 'pads')}
-        producer.add_trait(
-            TraitInstance('fused_pool', {'kind': kind, **window, 'input_precision': source.precision})
-        )
+        window = {k: tuple(int(v) for v in pool.metadata[k]) for k in ('kernel_shape', 'strides', 'dilations', 'pads')}
+        producer.attributes['fused_pool'] = FusedPool(kind=kind, **window, input_precision=source.precision)
         graph.remove_node(pool, mode='contract')
         return True
 
@@ -135,7 +134,7 @@ class FuseOps(AIEPass):
             for consumer in list(out_tv.consumers):
                 get_family_resolver_registry().get(consumer.op_type).reorder_reduction_rows(consumer, out_tv, order)
 
-        producer.add_trait(TraitInstance('output_view', {'kind': kind}))
+        producer.attributes['output_view'] = OutputView(kind)
         graph.remove_node(node, mode='contract')
         return True
 

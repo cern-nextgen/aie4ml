@@ -75,8 +75,8 @@ class Conv2dFamilyResolver(FamilyResolver):
             out_h, out_w = pool.window.output_extent(out_h, out_w)
             if min(out_h, out_w) < 1:
                 raise ValueError(f'{node.name}: the fused pool {pool.window} leaves no output.')
-        view = node.traits.get('output_view')
-        flatten = view is not None and view.data['kind'] == VIEW_FLATTEN_2D
+        view = node.attributes.get('output_view')
+        flatten = view is not None and view.kind == VIEW_FLATTEN_2D
         expected = (batch, out_h * out_w * cout) if flatten else (batch, out_h, out_w, cout)
         if tuple(int(d) for d in out.shape) != expected:
             raise ValueError(f'{node.name}: conv2d output {tuple(out.shape)} does not match {expected}.')

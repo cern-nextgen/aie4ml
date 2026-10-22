@@ -25,7 +25,6 @@ from .placement import (
     Placed,
     PlacementInfeasibleError,
     PlacementOutranked,
-    _face_abs_box,
     _places,
     pair_offsets,
 )
@@ -382,8 +381,8 @@ class _Model:
         cost = [round(_SCALE * mu) * row[name] for name in places]
         for edge in graph.edges:
             src, dst = graph.specs[edge.src].rect, graph.specs[edge.dst].rect
-            a = _face_abs_box(Placed(edge.src, 0, 0, src), src.output_face)
-            b = _face_abs_box(Placed(edge.dst, 0, 0, dst), dst.input_face)
+            a = (src.w - 1, src.w - 1, 0, src.h - 1)  # the source's east column (x0, x1, y0, y1)
+            b = (0, 0, 0, dst.h - 1)  # the destination's west column
             dx, dy = model.NewIntVar(0, W, ''), model.NewIntVar(0, H, '')
             model.AddMaxEquality(
                 dx,

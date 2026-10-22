@@ -43,19 +43,14 @@ def reads_neighbour_rows(spatial: SpatialAccess2D) -> bool:
 
 
 def fused_pool_of(node: OpNode) -> Optional[Pool2DConfig]:
-    """The pool a conv2d node fuses into its epilogue, if any, from the trait FuseOps left."""
-    fused = node.traits.get('fused_pool')
+    """The pool a conv2d node fuses into its epilogue, if any, from the attribute FuseOps left."""
+    fused = node.attributes.get('fused_pool')
     if fused is None:
         return None
-    if set(fused.data) != {'kind', 'kernel_shape', 'strides', 'dilations', 'pads', 'input_precision'}:
-        raise ValueError(f'{node.name}: a fused_pool trait holds its kind and window, got {sorted(fused.data)}.')
     window = SpatialAccess2D(
-        kernel=tuple(int(x) for x in fused.data['kernel_shape']),
-        pads=tuple(int(p) for p in fused.data['pads']),
-        strides=tuple(int(s) for s in fused.data['strides']),
-        dilations=tuple(int(d) for d in fused.data['dilations']),
+        kernel=fused.kernel_shape, pads=fused.pads, strides=fused.strides, dilations=fused.dilations
     )
-    return Pool2DConfig(kind=str(fused.data['kind']), window=window)
+    return Pool2DConfig(kind=fused.kind, window=window)
 
 
 def frame_view(

@@ -212,8 +212,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         out_w = spatial.output_extent(in_shape[1], in_shape[2])[1]
         spatial_blocks = min(_SPATIAL_BLOCKS[generation], key=lambda blocks: align_up(out_w, blocks * m))
 
-        view = node.traits.get('output_view')
-        flatten = view is not None and view.data['kind'] == VIEW_FLATTEN_2D
+        view = node.attributes.get('output_view')
+        flatten = view is not None and view.kind == VIEW_FLATTEN_2D
         parallelism = self._resolve_parallelism(
             node, parallel_cfg, input_contracts, flatten=flatten, kernel_input=(in_shape, spatial)
         )
@@ -278,8 +278,8 @@ class Conv2dOpImplVariant(OpImplVariant):
             io_views[out.name] = self._output_frame(node, parallelism, column_block=block, column_align=column_align)
 
         shift = resolve_accumulator_output_shift(lhs.precision, out.precision, rhs.precision)
-        fused_act = node.traits.get('fused_activation')
-        use_relu = fused_act is not None and fused_act.data['activation'] == 'relu'
+        fused_act = node.attributes.get('fused_activation')
+        use_relu = fused_act is not None and fused_act.activation == 'relu'
 
         return Conv2dConfig(
             precision=precision,

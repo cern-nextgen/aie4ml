@@ -265,8 +265,8 @@ def test_conv_chain_lowers_to_blocked_frames(conv_model, tmp_path):
     c1, c2, c3, fc = (execution.get(f'{n}_aie') for n in ('c1', 'c2', 'c3', 'fc'))
     assert {inst.variant.variant_id for inst in (c1, c2, c3)} == {'conv2d.b.r.v1'}
     assert fc.variant.variant_id == 'dense.b.r.vector.v1'
-    assert 'fused_activation' in c1.node.traits and 'bias' in c1.node.roles.values()
-    assert c3.node.traits['output_view'].data == {'kind': 'flatten_2d'} and c3.config.flags.emit_flattened
+    assert 'fused_activation' in c1.node.attributes and 'bias' in c1.node.roles.values()
+    assert c3.node.attributes['output_view'].kind == 'flatten_2d' and c3.config.flags.emit_flattened
     assert (c2.config.spatial.kernel, c2.config.spatial.pads, c2.config.groups) == ((3, 3), (1, 1, 1, 1), C2)
 
     # The graph input folds: c1 reads, from the folder beside it, a 1x1 frame of each output pixel's window -- nine
@@ -1725,7 +1725,7 @@ def test_int16_frames_take_the_int16_core(tmp_path, part):
     m16 = {PART: 2, MLV2_PART: 4}[part]
     for name, m in (('c0_aie', 2 * m16), ('c1_aie', m16), ('c2_aie', m16)):
         assert ctx.ir.execution.get(name).config.microtiling.microtile_m == m, name
-    assert {'fused_pool', 'fused_activation', 'output_view'} <= set(ctx.ir.execution.get('c2_aie').node.traits)
+    assert {'fused_pool', 'fused_activation', 'output_view'} <= set(ctx.ir.execution.get('c2_aie').node.attributes)
 
 
 def test_int16_conv_is_refused_where_no_core_takes_it(tmp_path):

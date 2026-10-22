@@ -24,36 +24,13 @@ from .transport.model import Connection
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class PortFace:
-    """
-    One port-bearing face of a rectangular kernel footprint.
-
-    side:
-      - 'left'
-      - 'right'
-      - 'top'
-      - 'bottom'
-
-    start/end are inclusive offsets along that face:
-      - left/right  -> row offsets [0 .. h-1]
-      - top/bottom  -> col offsets [0 .. w-1]
-    """
-
-    side: str
-    start: int
-    end: int
-
-
 @dataclass
 class Rect:
-    """Concrete rectangular footprint and placement metadata."""
+    """Concrete rectangular footprint and placement metadata: inputs arrive on its west column, outputs leave its
+    east one."""
 
     w: int
     h: int
-
-    input_face: PortFace
-    output_face: PortFace
 
     buffer_locations: Optional[Callable[[int], Tuple[BufferLocation, ...]]] = None
     stream_locations: Optional[Callable[[int], Tuple[StreamLocation, ...]]] = None
@@ -181,33 +158,6 @@ class PlacementOutranked(ConfigRefused):
 # ---------------------------------------------------------------------------
 # Geometry
 # ---------------------------------------------------------------------------
-
-
-def _face_abs_box(placed: Placed, face: PortFace) -> Tuple[float, float, float, float]:
-    """
-    Return the absolute axis-aligned span of a face as:
-      (x0, x1, y0, y1)
-
-    A vertical face has x0 == x1 and a y-interval.
-    A horizontal face has y0 == y1 and an x-interval.
-    """
-    x = placed.x
-    y = placed.y
-    w = placed.rect.w
-    h = placed.rect.h
-
-    if face.side == 'left':
-        return (x, x, y + face.start, y + face.end)
-    if face.side == 'right':
-        xr = x + w - 1
-        return (xr, xr, y + face.start, y + face.end)
-    if face.side == 'top':
-        return (x + face.start, x + face.end, y, y)
-    if face.side == 'bottom':
-        yb = y + h - 1
-        return (x + face.start, x + face.end, yb, yb)
-
-    raise ValueError(f'Unsupported face side: {face.side!r}')
 
 
 def _places(spec: NodeSpec, W: int, H: int, pairable: frozenset) -> List[Tuple[Placed, frozenset]]:
@@ -476,7 +426,7 @@ def instance_rect(inst, row_offset: int) -> Rect:
     """The tiles an instance takes and where it pins its buffers and streams, an anchor row counted from the array's
     row `row_offset`."""
     w, h = int(inst.config.parallelism.cas_length), int(inst.config.parallelism.cas_num)
-    rect = Rect(w, h, input_face=PortFace('left', 0, h - 1), output_face=PortFace('right', 0, h - 1))
+    rect = Rect(w, h)
     rect.buffer_locations = lambda anchor_row: inst.variant.buffer_locations(
         inst.node, inst.config, int(anchor_row) + row_offset
     )

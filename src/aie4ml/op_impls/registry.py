@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..ir.attributes import OUTPUT_VIEWS
 from .base import OpImplVariant
-from .family_registry import FUSIONS, OUTPUT_VIEWS
+from .family_registry import FUSIONS
 
 _TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / 'templates' / 'firmware' / 'variants'
 

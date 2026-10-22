@@ -11,7 +11,6 @@ from aie4ml.passes.placement import (  # noqa: E402
     NodeSpec,
     PlacementInfeasibleError,
     PlacementOutranked,
-    PortFace,
     Rect,
 )
 from aie4ml.passes.placement_solver import solve_placement, tidy_placement  # noqa: E402
@@ -40,10 +39,8 @@ def _two_into_one(**edge):
     """Two full-height columns, q and k, each hand a kernel s the buffer of their top tile, which s pins in its own
     tile where it copies it; its core reaches its own memory and those west, north and south of it, so at most one
     of the two. q's leg costs 40 cycles copied, k's 80; q and k take 100 cycles, s 50."""
-    face = PortFace('left', 0, 0), PortFace('right', 0, 0)
-
     def op(name, h, locations, cycles):
-        rect = Rect(1, h, *face, buffer_locations=lambda _row: locations)
+        rect = Rect(1, h, buffer_locations=lambda _row: locations)
         return NodeSpec(name, rect, outputs=frozenset({'out1'}), cycles=cycles)
 
     top = (BufferLocation('out1', 0, 0, 3, (0, 3)),)

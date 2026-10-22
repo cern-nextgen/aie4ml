@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .device_catalog import lookup_device
+from .simulation import read_aiesim_output
 
 # Itanium mangling prefixes each identifier with its length (_ZN12dense_singleI... ->
 # 12 chars of 'dense_single'), which is how the class name is recovered from the symbol.
@@ -115,62 +116,24 @@ def _parse_timing(path: Path, elements_per_inference: Optional[int] = None) -> L
     inference. When the emitted plan is available, accumulate frames until the output
     port's complete IO tile has been transferred.
     """
-    regex = re.compile(r'^T\s+([\d.]+)\s*(ps|ns|us|ms|s)', re.IGNORECASE)
     completion_times: List[float] = []
-    current_time = None
-    current_elements = 0
-    current_tlast = False
     inference_elements = 0
-
-    def finish_sample() -> None:
-        nonlocal current_elements, current_tlast, inference_elements
-        inference_elements += current_elements
-        if current_tlast and current_time is not None:
-            if elements_per_inference is None:
-                completion_times.append(current_time)
-            elif inference_elements == elements_per_inference:
-                completion_times.append(current_time)
-                inference_elements = 0
-            elif inference_elements > elements_per_inference:
-                raise ValueError(f'{path}: TLAST framing exceeded {elements_per_inference} elements per inference.')
-        current_elements = 0
-        current_tlast = False
-
-    with open(path) as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            match = regex.match(line)
-            if match:
-                if current_time is not None:
-                    finish_sample()
-                value, unit = match.groups()
-                current_time = _convert_to_ns(float(value), unit.lower())
-                continue
-
-            tokens = line.split()
-            current_tlast = current_tlast or any(token.upper() == 'TLAST' for token in tokens)
-            current_elements += sum(token.upper() != 'TLAST' for token in tokens)
-
-    if current_time is not None:
-        finish_sample()
+    for time, values, tlast in read_aiesim_output(path):
+        if time is None:
+            continue
+        inference_elements += len(values)
+        if not tlast:
+            continue
+        if elements_per_inference is None:
+            completion_times.append(time)
+        elif inference_elements == elements_per_inference:
+            completion_times.append(time)
+            inference_elements = 0
+        elif inference_elements > elements_per_inference:
+            raise ValueError(f'{path}: TLAST framing exceeded {elements_per_inference} elements per inference.')
     if elements_per_inference is not None and inference_elements:
         raise ValueError(f'{path}: incomplete output inference containing {inference_elements} elements.')
-
     return completion_times
-
-
-def _convert_to_ns(value: float, unit: str) -> float:
-    if unit == 'ps':
-        return value / 1000
-    if unit == 'ns':
-        return value
-    if unit == 'us':
-        return value * 1000
-    if unit == 'ms':
-        return value * 1_000_000
-    if unit == 's':
-        return value * 1_000_000_000
-    raise ValueError(f'Unknown time unit: {unit}')
 
 
 def _plan_ops(doc: Dict[str, Any]) -> int:
@@ -248,12 +211,7 @@ def measured_latency_cc(project: Path) -> Optional[int]:
 def _first_beat_ns(path: Path) -> Optional[float]:
     if not path.exists():
         return None
-    with open(path) as handle:
-        for line in handle:
-            parts = line.split()
-            if len(parts) == 3 and parts[0] == 'T':
-                return _convert_to_ns(float(parts[1]), parts[2].lower())
-    return None
+    return next((time for time, _, _ in read_aiesim_output(path) if time is not None), None)
 
 
 def _vitis(project: Path) -> Dict[str, Any]:
@@ -471,19 +429,26 @@ def _throughput(project: Path) -> List[Dict[str, Any]]:
     return list(ports.values())
 
 
+# The AIE compiler's memory reports: the kind, its file, and the label of its "Used" and "Allotted" lines.
+_MEMORY_REPORTS = (
+    ('program', 'report_pm.txt', 'PM Size'),
+    ('stack', 'report_stack.txt', 'Stack Size'),
+    ('heap', 'report_heap.txt', 'Heap Size'),
+)
+
+
+def _used(label: str) -> str:
+    return label + r' Used[^=]*= (\d+)'
+
+
 def _memory_by_core(project: Path) -> Dict[str, Dict[str, int]]:
     """Per-core program/stack/heap usage, keyed by the same "col_row" the profiles use."""
-    fields = (
-        ('program', 'report_pm.txt', r'PM Size Used = (\d+)'),
-        ('stack', 'report_stack.txt', r'Stack Size Used = (\d+)'),
-        ('heap', 'report_heap.txt', r'Heap Size Used[^=]*= (\d+)'),
-    )
     out: Dict[str, Dict[str, int]] = {}
-    for kind, fname, pattern in fields:
+    for kind, fname, label in _MEMORY_REPORTS:
         path = project / 'Work' / 'reports' / fname
         if not path.exists():
             continue
-        for core, value in re.findall(r'Core (\S+)[\s\S]*?' + pattern, path.read_text(errors='ignore')):
+        for core, value in re.findall(r'Core (\S+)[\s\S]*?' + _used(label), path.read_text(errors='ignore')):
             out.setdefault(core, {})[kind] = int(value)
     return out
 
@@ -491,13 +456,13 @@ def _memory_by_core(project: Path) -> Dict[str, Dict[str, int]]:
 def _memory(project: Path) -> Dict[str, Any]:
     """Program / stack / heap high-water marks across cores."""
 
-    def scan(fname: str, used_re: str, alloc_re: str) -> Optional[Dict[str, Any]]:
+    def scan(fname: str, label: str) -> Optional[Dict[str, Any]]:
         path = project / 'Work' / 'reports' / fname
         if not path.exists():
             return None
         text = path.read_text(errors='ignore')
-        used = [int(x) for x in re.findall(used_re, text)]
-        alloc = [int(x) for x in re.findall(alloc_re, text)]
+        used = [int(x) for x in re.findall(_used(label), text)]
+        alloc = [int(x) for x in re.findall(label + r' Allotted = (\d+)', text)]
         if not used:
             return None
         return {
@@ -507,15 +472,8 @@ def _memory(project: Path) -> Dict[str, Any]:
             'pct': round(100.0 * max(used) / max(alloc), 1) if alloc and max(alloc) else None,
         }
 
-    return {
-        k: v
-        for k, v in {
-            'program': scan('report_pm.txt', r'PM Size Used = (\d+)', r'PM Size Allotted = (\d+)'),
-            'stack': scan('report_stack.txt', r'Stack Size Used = (\d+)', r'Stack Size Allotted = (\d+)'),
-            'heap': scan('report_heap.txt', r'Heap Size Used[^=]*= (\d+)', r'Heap Size Allotted = (\d+)'),
-        }.items()
-        if v
-    }
+    scanned = {kind: scan(fname, label) for kind, fname, label in _MEMORY_REPORTS}
+    return {kind: found for kind, found in scanned.items() if found}
 
 
 def _pipeline(project: Path) -> Dict[str, Any]:
@@ -543,32 +501,9 @@ def _design(project: Path, vitis: Dict[str, Any]) -> Dict[str, Any]:
     if not doc:
         return {}
 
-    def find(node, key):
-        if isinstance(node, dict):
-            if key in node:
-                return node
-            for value in node.values():
-                hit = find(value, key)
-                if hit is not None:
-                    return hit
-        if isinstance(node, list):
-            for value in node:
-                hit = find(value, key)
-                if hit is not None:
-                    return hit
-        return None
-
-    plan = find(doc, 'direct_edges') or {}
-    placements = (doc.get('physical') or {}).get('placements') or {}
-    if placements and all('width' in p for p in placements.values()):
-        # What placement reserved, which counts tiles an op adds beyond its compute tiles.
-        aie_tiles = sum(int(p['width']) * int(p['height']) for p in placements.values())
-    else:  # a plan written before placements recorded their size
-        aie_tiles = sum(
-            int((e.get('config') or {}).get('parallelism', {}).get('cas_num', 1))
-            * int((e.get('config') or {}).get('parallelism', {}).get('cas_length', 1))
-            for e in doc.get('execution', [])
-        )
+    plan, placements = doc['physical']['plan'], doc['physical']['placements']
+    # What placement reserved, which counts tiles an op adds beyond its compute tiles.
+    aie_tiles = sum(int(p['width']) * int(p['height']) for p in placements.values())
     return {
         'aie_tiles': aie_tiles,
         'memtile_buffers': len(plan.get('buffers', [])),
@@ -589,14 +524,6 @@ class Report(dict):
     __repr__ = __str__
 
 
-def report(model_or_path) -> 'Report':
-    """Collect every available metric for a built AIE project.
-
-    Accepts a model (hls4ml or aie4ml) or a path to the project directory.
-    """
-    return collect_report(model_or_path)
-
-
 def layout(model_or_path):
     """Load the emitted physical layout without compiling or profiling the project."""
     from .report_layout import load_layout
@@ -604,8 +531,8 @@ def layout(model_or_path):
     return load_layout(_project_dir(model_or_path))
 
 
-def collect_report(model_or_path) -> 'Report':
-    """Gather every available metric for a built AIE project."""
+def report(model_or_path) -> 'Report':
+    """Collect every available metric for a built AIE project: a model (hls4ml or aie4ml) or its project directory."""
     project = _project_dir(model_or_path)
     if not project.exists():
         raise FileNotFoundError(f'{project}: project directory not found.')

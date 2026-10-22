@@ -64,7 +64,7 @@ def test_hls4ml_conv_reaches_the_canonical_contract(lowered):
 
     inst = lowered.ir.execution.get(conv.name)
     assert inst.variant.variant_id == 'conv2d.b.r.v1'
-    assert 'fused_activation' in conv.traits  # the QActivation folded in
+    assert 'fused_activation' in conv.attributes  # the QActivation folded in
 
 
 def test_hls4ml_depthwise_reaches_the_compact_group_contract(lowered):
@@ -241,7 +241,7 @@ def test_hls4ml_max_pool_fuses_into_the_conv(tmp_path, relu_after_pool):
     logical = aie4ml.from_hls4ml(hls_model).context.ir.logical
     (conv,) = [n for n in logical if n.op_type == 'conv2d']
     assert not [n for n in logical if n.op_type == 'pool']
-    assert {'fused_pool', 'fused_activation', 'output_view'} <= set(conv.traits)
+    assert {'fused_pool', 'fused_activation', 'output_view'} <= set(conv.attributes)
 
 
 def test_hls4ml_bit_exact_pool_keeps_the_conv_rounding(tmp_path):

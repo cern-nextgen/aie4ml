@@ -36,9 +36,9 @@ def _window_rows(access: SpatialAccess2D) -> Tuple[int, int, int]:
 
 def _sent_rows(node: OpNode) -> Tuple[int, int, int]:
     """The rows its consumers' windows read above and below each band, and the rows they take off its height."""
-    view = node.traits.get('output_view')
+    view = node.attributes.get('output_view')
     out = node.outputs[0]
-    if (view is not None and view.data['kind'] == VIEW_FLATTEN_2D) or not out.consumers:
+    if (view is not None and view.kind == VIEW_FLATTEN_2D) or not out.consumers:
         return 0, 0, 0
     if any(consumer.op_type != 'conv2d' for consumer in out.consumers):
         return 0, 0, 0  # only a conv band reads its halo from its neighbours

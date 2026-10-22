@@ -47,14 +47,6 @@ def _deep_copy(value: Any) -> Any:
 
 
 @dataclass
-class TraitInstance:
-    """Instance data for a trait that augments an IR node."""
-
-    name: str
-    data: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
 class OpNode:
     """
     Logical IR node capturing semantic computation only.
@@ -66,7 +58,7 @@ class OpNode:
     inputs: List[TensorVar] = field(default_factory=list)
     outputs: List[TensorVar] = field(default_factory=list)
 
-    traits: Dict[str, TraitInstance] = field(default_factory=dict)
+    attributes: Dict[str, Any] = field(default_factory=dict)  # what passes fused or folded into it (ir.attributes)
     metadata: Dict[str, Any] = field(default_factory=dict)
     directives: Dict[str, Any] = field(default_factory=dict)
     # directives a design search chose for it, in the same vocabulary, resolved over its own
@@ -76,10 +68,7 @@ class OpNode:
     @property
     def is_folded_view(self) -> bool:
         """A slice, split or concat folded into its readers: no kernel implements it."""
-        return 'slice_view' in self.traits or 'concat_view' in self.traits
-
-    def add_trait(self, trait: TraitInstance) -> None:
-        self.traits[trait.name] = trait
+        return 'folded_view' in self.attributes
 
 
 def set_input_roles(node: OpNode, tensors: Sequence[TensorVar], role_names: Sequence[str]) -> None:
@@ -324,6 +313,9 @@ VIEW_REGROUP_ROWS = 'regroup_rows'
 """Output view: the producer writes its rows, the last axis kept, grouped by other leading axes -- `(G*T, C)` as
 `(G, T, C)`, say."""
 
+FOLDED_VIEWS: frozenset = frozenset({'slice', 'split', 'concat'})
+"""The ops a view folds into their readers, which no kernel implements."""
+
 TENSOR_LAYOUTS: frozenset = frozenset({'linear', 'tiled'})
 """Valid `layout:` directive names. Only a variant selector -- the layout itself is the
 staging descriptor, not a name."""
@@ -389,7 +381,7 @@ class ExecutionView:
     parts: Tuple[ViewPart, ...]
 
     def __post_init__(self) -> None:
-        if self.kind not in ('slice', 'split', 'concat') or not self.parts:
+        if self.kind not in FOLDED_VIEWS or not self.parts:
             raise ValueError(f'{self.node}: a {self.kind!r} view with parts {self.parts}.')
         if self.kind != 'concat' and len(self.parts) != 1:
             raise ValueError(f'{self.node}: a {self.kind} output is one window of its source, not {self.parts}.')

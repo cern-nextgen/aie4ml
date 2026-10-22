@@ -28,8 +28,8 @@ EXP_KQ_MAX = 32767 // 255
 
 def _input_scale(node: OpNode) -> float:
     """The runtime scale folded into this Softmax (`fold_scale`); 1.0 when none was."""
-    trait = node.traits.get('input_scale')
-    return 1.0 if trait is None else float(trait.data['scale'])
+    scale = node.attributes.get('input_scale')
+    return 1.0 if scale is None else float(scale.scale)
 
 
 def _requested_approximation(node: OpNode) -> str:

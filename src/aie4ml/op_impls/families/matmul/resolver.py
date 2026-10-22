@@ -75,13 +75,13 @@ class MatmulDims:
 
 def matmul_dims(node) -> MatmulDims:
     lhs = [int(d) for d in view_shape(node, input_tensor_for_role(node, 'lhs'), 'inputs')]
-    pool = node.traits.get('fused_pool')
+    pool = node.attributes.get('fused_pool')
     return MatmulDims(
         outer=math.prod(lhs[:-2]),
         rows=lhs[-2] if len(lhs) > 1 else 1,
         k=lhs[-1],
         n=int(view_shape(node, node.outputs[0], 'outputs')[-1]),
-        pooled_rows=1 if pool is None else math.prod(int(k) for k in pool.data['kernel_shape']),
+        pooled_rows=1 if pool is None else math.prod(pool.kernel_shape),
     )
 
 
@@ -475,23 +475,17 @@ def _validate_matmul_family_rank_contract(node) -> None:
 def _validate_dense_pool(node) -> None:
     """A Dense pools runs of consecutive rows: a window over one axis, strided by itself, unpadded and undilated, each
     run of its LHS rows one output row, the output's rows one run of their own. It regroups its rows only for one."""
-    pool = node.traits.get('fused_pool')
+    pool = node.attributes.get('fused_pool')
     if pool is None:
-        view = node.traits.get('output_view')
-        if view is not None and view.data['kind'] == VIEW_REGROUP_ROWS:
+        view = node.attributes.get('output_view')
+        if view is not None and view.kind == VIEW_REGROUP_ROWS:
             raise NotImplementedError(f'{node.name}: a Dense writes its rows regrouped only into a pool it fuses.')
         return
-    window = pool.data
-    kernel = tuple(int(k) for k in window['kernel_shape'])
-    if (
-        len(kernel) != 1
-        or tuple(window['strides']) != kernel
-        or any(window['pads'])
-        or tuple(window['dilations']) != (1,)
-    ):
+    kernel = pool.kernel_shape
+    if len(kernel) != 1 or pool.strides != kernel or any(pool.pads) or pool.dilations != (1,):
         raise NotImplementedError(
             f'{node.name}: a Dense pools runs of its rows -- a window over one axis, strided by itself, unpadded and '
-            f'undilated -- not {window["kind"]} pool {kernel}, strides {tuple(window["strides"])}.'
+            f'undilated -- not {pool.kind} pool {kernel}, strides {pool.strides}.'
         )
     dims = matmul_dims(node)
     out = view_shape(node, node.outputs[0], 'outputs')

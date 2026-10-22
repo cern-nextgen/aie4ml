@@ -164,8 +164,7 @@ def layout_from_pipeline(document: Dict[str, Any]) -> Dict[str, Any]:
 def _device_geometry(value: Any) -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, int]]]:
     if value is None:
         return None, None
-    # Accept the temporary development format so projects emitted while this feature settled still render.
-    part = value.get('part') if isinstance(value, dict) else value
+    part = value
     if not isinstance(part, str) or not part:
         raise ValueError('aie_pipeline.json: device must name an AIE part.')
     facts = lookup_device(part)

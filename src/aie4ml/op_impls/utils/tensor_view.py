@@ -485,12 +485,12 @@ def build_tensor_view(
     rewritten here. Compacted 2D kernel extents are derived later from the rank-preserving view.
     """
 
-    from .io import view_layout, view_shape  # local import avoids circular dependency
+    from .io import view_perm, view_shape  # local import avoids circular dependency
 
     logical = tuple(int(x) for x in tensor.shape)
     # view-order base shape (= logical under perm); seeds the padded/sliced shapes.
     view = tuple(int(x) for x in view_shape(node, tensor, direction))
-    layout = view_layout(node, tensor, direction)
+    perm = view_perm(node, tensor, direction)
     rank = len(view)
 
     full = list(view)
@@ -515,6 +515,6 @@ def build_tensor_view(
         full=tuple(full),
         tile=tuple(tile),
         tile_raw=tuple(tile_raw),
-        perm=None if layout.get('perm') is None else tuple(int(x) for x in layout['perm']),
+        perm=perm,
         microtile=microtile,
     )

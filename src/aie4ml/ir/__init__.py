@@ -17,7 +17,6 @@ from .graph import (
     OpNode,
     PhysicalIR,
     TensorVar,
-    TraitInstance,
     ViewPart,
     input_role,
     input_tensor_for_role,
@@ -41,7 +40,6 @@ __all__ = [
     'set_input_roles',
     'TensorVar',
     'DeviceSpec',
-    'TraitInstance',
     'ensure_backend_context',
     'get_backend_context',
 ]

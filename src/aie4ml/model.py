@@ -16,7 +16,6 @@ from .simulation import (
     collect_outputs,
     dequantize_outputs,
     prepare_inputs,
-    run_simulation_target,
     write_input_files,
 )
 from .writer import AIEProjectEmitter
@@ -106,7 +105,7 @@ class AIEModel:
         layout = self.write_inputs(X, quantize_in=quantize_in)
 
         log.info('Running %s simulation using make %s', ctx.project_config.project_name, make_target)
-        run_simulation_target(output_dir, make_target)
+        self.build(make_target)
         sim_out = collect_outputs(output_dir, sim_key, layout)
         final_out = dequantize_outputs(layout, sim_out) if dequantize_out else sim_out
 

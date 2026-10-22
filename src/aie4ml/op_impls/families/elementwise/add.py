@@ -25,7 +25,7 @@ from ...utils import (
     extract_inner_outer,
     find_tile_split,
 )
-from ...utils.io import view_layout, view_shape
+from ...utils.io import view_perm, view_shape
 from ...utils.precision import (
     aie_rounding_token,
     infer_accumulator_tag,
@@ -49,7 +49,7 @@ def _adopted_contract(node: OpNode, input_contracts, max_elements: int):
     tensors = (*node.inputs, *node.outputs)
     if len({tuple(t.shape) for t in tensors}) != 1:
         return None
-    if any(view_layout(node, t, 'inputs' if t in node.inputs else 'outputs').get('perm') for t in tensors):
+    if any(view_perm(node, t, 'inputs' if t in node.inputs else 'outputs') for t in tensors):
         return None
     contract = next((input_contracts[t.name] for t in node.inputs if t.name in input_contracts), None)
     if contract is None or contract.inner_shards is not None or contract.view.perm is not None:
@@ -87,7 +87,7 @@ class AddOpImplVariant(OpImplVariant):
         # An operand read through a transpose crosses a memory tile anyway, which can re-shard it: the add keeps
         # its microtile, not its partition, so the next row-wise reduction needs no second memory tile.
         microtile_override = None
-        perm = None if first is None else view_layout(node, first, 'inputs').get('perm')
+        perm = None if first is None else view_perm(node, first, 'inputs')
         if perm is not None and int(perm[-1]) != len(perm) - 1:
             microtile_override = microtile_from_staging(input_contracts[first.name].port_staging[0])
 
@@ -173,11 +173,11 @@ class AddOpImplVariant(OpImplVariant):
             )
 
         # The DMA walks a transposed operand's grid in view order; the kernel does the block.
-        fused = node.traits.get('fused_activation')
+        fused = node.attributes.get('fused_activation')
         flags = AddFlags(
             transpose_lhs=io_views[lhs_tensor.name].is_transposed,
             transpose_rhs=io_views[rhs_tensor.name].is_transposed,
-            use_relu=fused is not None and fused.data['activation'] == 'relu',
+            use_relu=fused is not None and fused.activation == 'relu',
         )
         microtile = io_views[lhs_tensor.name].microtile
         if (flags.transpose_lhs or flags.transpose_rhs) and microtile is not None:
