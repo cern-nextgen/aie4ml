@@ -714,16 +714,16 @@ def report(model_or_path) -> 'Report':
 
     missing = []
     if not kernels:
-        missing.append("per-kernel cycles: run 'make profile' (plain 'make aiesim' does not profile)")
+        missing.append("per-kernel cycles: simulate with predict(simulator='aie', aie_profile=True) or 'make profile'")
     elif unprofiled := sorted({e['node'] for e in doc.get('execution', [])} - {k.get('op') for k in kernels}):
         missing.append(
             f'per-kernel cycles of {", ".join(unprofiled)}: aiesim left no profile of their cores, so the '
             'critical path and the compute / data-movement split leave them out'
         )
     if not report['throughput_plio']:
-        missing.append("PLIO throughput: run 'make aiesim' or 'make profile'")
+        missing.append("PLIO throughput: simulate with predict(simulator='aie') or 'make aiesim'")
     if not report['memory']:
-        missing.append("memory: run 'make aiecom'")
+        missing.append("memory: compile the AIE graph with build() or 'make aiecom'")
     if clock is None:
         missing.append("AIE clock (cycles for latency and interval): compile the design ('make all')")
     if latency and latency.get('latency_cc') is None:

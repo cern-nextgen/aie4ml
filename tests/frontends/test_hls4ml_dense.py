@@ -384,3 +384,27 @@ def test_a_conversion_lowers_one_sample_unless_asked_for_more(tmp_path):
         )
         logical = get_backend_context(aie_model).ir.logical
         assert logical.tensors[logical.input_tensor_names[0]].shape == (batch, 32)
+
+
+def test_predict_forwards_every_simulator_option():
+    """hls4ml's predict takes the options AIEModel.predict takes, with its defaults, and passes them on."""
+    import inspect
+
+    pytest.importorskip('hls4ml')
+    from aie4ml.frontends.hls4ml.backend import AIEBackend
+    from aie4ml.model import AIEModel
+
+    def options(f):
+        return {k: p.default for k, p in inspect.signature(f).parameters.items() if p.kind is p.KEYWORD_ONLY}
+
+    assert options(AIEBackend.predict) == options(AIEModel.predict)
+    seen = {}
+
+    class Model:
+        def predict(self, X, **kwargs):
+            seen.update(kwargs)
+
+    backend = type('Backend', (), {'_aie_model': lambda self, model: Model()})()
+    asked = {k: not v for k, v in options(AIEModel.predict).items()}
+    AIEBackend.predict(backend, None, None, simulator='aie', **asked)
+    assert seen == {'simulator': 'aie', **asked}

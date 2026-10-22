@@ -121,7 +121,7 @@ def test_report_layout_modes_need_no_build_or_profile_artifacts(tmp_path, capsys
 
     assert main([str(tmp_path), '--layout']) == 0
     output = capsys.readouterr().out
-    assert 'AIE layout' in output and 'Not collected' not in output and 'make profile' not in output
+    assert 'AIE layout' in output and 'Not collected' not in output and 'aie_profile' not in output
 
     svg = tmp_path / 'placement.svg'
     assert main([str(tmp_path), '--layout-svg', str(svg)]) == 0

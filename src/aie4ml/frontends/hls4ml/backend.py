@@ -145,12 +145,16 @@ class AIEBackend(Backend):
         *,
         quantize_in=True,
         dequantize_out=True,
+        aie_profile=True,
+        aie_trace=False,
     ):
         return self._aie_model(model).predict(
             X,
             simulator=simulator,
             quantize_in=quantize_in,
             dequantize_out=dequantize_out,
+            aie_profile=aie_profile,
+            aie_trace=aie_trace,
         )
 
     def write(self, model):
