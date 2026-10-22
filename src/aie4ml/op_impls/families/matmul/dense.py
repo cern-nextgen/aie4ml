@@ -384,19 +384,15 @@ class DensePoolOpImplVariant(DenseOpImplVariant):
     graph_name = 'dense_pool_graph'
 
     def matches(self, node: OpNode, device, directives) -> bool:
-        return (
-            super().matches(node, device, directives)
-            and 'fused_pool' in node.attributes
-            and device.generation in ('AIE-ML', 'AIE-MLV2')
-        )
+        return super().matches(node, device, directives) and 'fused_pool' in node.attributes
 
     def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
         """Lanes that define the pool exactly, and steps whose rows lie in one run, which a selector product sums
-        POOL_SELECTOR_ROWS code rows at a time."""
+        POOL_SELECTOR_ROWS code rows at a time, or as many as a step has."""
         super().validate_config(node, config, device)
         _pool_shift(node)
         step = int(config.row_blocks) * int(config.microtiling.microtile_m)
-        if not matmul_dims(node).fits_steps(step) or step % POOL_SELECTOR_ROWS:
+        if not matmul_dims(node).fits_steps(step) or (step % POOL_SELECTOR_ROWS and POOL_SELECTOR_ROWS % step):
             raise ConfigRefused(
                 f'{node.name}: its fused pool sums whole kernel steps of one run, {POOL_SELECTOR_ROWS} rows at a '
                 f'time, but a run holds {matmul_dims(node).pooled_rows} rows and a step {step}.'

@@ -78,8 +78,8 @@ the same model with them builds that design again, place for place.
   `T`, or a Reshape `(G*T, C) -> (G, T, C)` of 2-D rows -- runs in the int8 Dense producing the rows, which writes one
   row per group. It rounds each row into its 8-bit lane, sums a group's codes and converts the sum once into the
   pooled lane, as the model's QuantizeLinear does: an average needs `T` a power of two, and both lanes the same sign,
-  rounding and saturation. Each group is whole kernel steps (8 to 32 rows); the Dense splits K and N only, on buffer
-  ports. Not on AIE1.
+  rounding and saturation. Each group is whole kernel steps (4 to 32 rows); the Dense splits K and N only, on buffer
+  ports.
 
 ## Conv2D
 

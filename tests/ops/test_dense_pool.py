@@ -34,6 +34,8 @@ from aie4ml.writer import kernel_config
 
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
 MLV2_PART = 'xc2ve3858-ssva2112-2MP-e-S'
+# AIE1 tiles cannot re-tile a graph input wider than 8 bytes a row: the first phi Dense reads it as a stream.
+AIE1_INPUT = {'phi0': {'ports': {'inputs': 'stream'}}}
 FEATURES, F_IN, F_W = 16, 4, 6
 
 # (phi widths, rho widths with the classes last, rows per group)
@@ -219,11 +221,13 @@ def test_a_sum_shifts_by_the_lanes_only(tmp_path):
         (MLV2_PART, {}, (4, 8)),
         (MLV2_PART, {'phi1': microtiling(4, 8, 8)}, (2, 4)),
         (PART, {}, (2, 4)),
+        (AIE1_PART, AIE1_INPUT, (2, 2)),
     ],
-    ids=['AIE-MLv2', 'AIE-MLv2 4x8x8', 'AIE-ML'],
+    ids=['AIE-MLv2', 'AIE-MLv2 4x8x8', 'AIE-ML', 'AIE1'],
 )
 def test_the_kernel_steps_through_whole_groups(tmp_path, part, directives, blocks):
-    """64 rows a group take the 4x2 block on AIE-MLv2 (32 rows a step), two 4-row microtiles a step elsewhere."""
+    """64 rows a group take the 4x2 block on AIE-MLv2 (32 rows a step), two 4-row microtiles a step on AIE-ML and two
+    2-row ones on AIE1, whose selector product then sums 4 code rows."""
     model, _, _ = _set_model(2, 64, (32, 32), (32, 16))
     pooled = lower(model, tmp_path, directives, part=part).ir.execution.get('phi1_aie')
     assert (pooled.config.row_blocks, pooled.config.microtiling.microtile_m) == blocks
@@ -245,12 +249,6 @@ def test_groups_that_are_not_whole_steps_are_refused(tmp_path):
     model, _, _ = _set_model(8, 8, (32, 32), (32, 16))
     with pytest.raises(ConfigRefused, match=r'phi1_aie: its fused pool sums whole kernel steps .* a step 16'):
         lower(model, tmp_path, {'phi1': microtiling(8, 8, 8)}, part=MLV2_PART)
-
-
-def test_aie1_has_no_pooled_dense(tmp_path):
-    model, _, _ = _set_model(2, 16, (32, 32), (32, 16))
-    with pytest.raises(ConfigRefused, match=r"phi1_aie: no dense variant matches \(generation='AIE'"):
-        lower(model, tmp_path, part=AIE1_PART)
 
 
 @pytest.mark.parametrize(
@@ -389,10 +387,16 @@ def test_other_forms_match_onnx(tmp_path, variant):
 
 
 @pytest.mark.requires_vitis
-def test_the_aie_ml_part_matches_onnx(tmp_path):
-    """4x8x8 microtiles: a selector product sums the codes of two row microtiles."""
+@pytest.mark.parametrize(
+    'part, directives',
+    [(PART, {}), (PART, {'phi1': microtiling(4, 8, 4)}), (AIE1_PART, AIE1_INPUT)],
+    ids=['AIE-ML', 'AIE-ML 4x8x4', 'AIE1'],
+)
+def test_other_generations_match_onnx(tmp_path, part, directives):
+    """A selector product sums two 4-row microtiles on AIE-ML, four columns a sum row with 4x8x4, and a step of two
+    2-row microtiles and four zero rows on AIE1."""
     model, feeds, frac = _set_model(4, 16, (32, 32), (32, 16), seed=6)
-    assert_x86_matches_onnx(model, feeds, {}, tmp_path, frac=frac, max_code_diff=0, part=PART)
+    assert_x86_matches_onnx(model, feeds, directives, tmp_path, frac=frac, max_code_diff=0, part=part)
 
 
 # --------------------------------------------------------------------------- #
@@ -401,7 +405,9 @@ def test_the_aie_ml_part_matches_onnx(tmp_path):
 
 
 @pytest.mark.requires_vitis
-@pytest.mark.parametrize('part', [MLV2_PART, PART], ids=['AIE-MLv2', 'AIE-ML'])
-def test_the_pooled_kernel_matches_onnx_on_aiesim(tmp_path, part):
+@pytest.mark.parametrize(
+    'part, directives', [(MLV2_PART, {}), (PART, {}), (AIE1_PART, AIE1_INPUT)], ids=['AIE-MLv2', 'AIE-ML', 'AIE1']
+)
+def test_the_pooled_kernel_matches_onnx_on_aiesim(tmp_path, part, directives):
     model, feeds, frac = _set_model(4, 32, (32, 32), (32, 16), seed=7)
-    assert_aie_matches_onnx(model, feeds, {}, tmp_path, frac=frac, max_code_diff=0, part=part)
+    assert_aie_matches_onnx(model, feeds, directives, tmp_path, frac=frac, max_code_diff=0, part=part)
