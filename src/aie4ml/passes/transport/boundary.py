@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from math import prod
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -80,21 +79,8 @@ def host_visible_input_staging(base: StagingDescriptor, *, stream: bool = False)
     return desc
 
 
-def graph_input_writer_port_descs(
-    read_descs: Dict[int, StagingDescriptor], *, stream: bool = False
-) -> Dict[int, Dict[str, Any]]:
-    return {int(port): host_visible_input_staging(base, stream=stream) for port, base in read_descs.items()}
-
-
 def graph_input_port_descriptor(entry, port: int) -> StagingDescriptor:
     try:
-        return entry.graph_input.port_descriptors[int(port)]
+        return entry.graph_input[int(port)]
     except KeyError as exc:
         raise RuntimeError(f'{entry.logical_tensor}: missing graph-input descriptor for port {port}.') from exc
-
-
-def graph_input_writer_port_descriptor(entry, port: int) -> Dict[str, Any]:
-    try:
-        return copy.deepcopy(entry.graph_input.writer_descriptors[int(port)])
-    except KeyError as exc:
-        raise RuntimeError(f'{entry.logical_tensor}: missing graph-input writer descriptor for port {port}.') from exc

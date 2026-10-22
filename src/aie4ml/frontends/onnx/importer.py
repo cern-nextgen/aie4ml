@@ -9,14 +9,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ...ir import LogicalIR, TensorVar, set_input_roles
-from ...ir.context import AIEBackendContext
+from ...ir.context import AIEBackendContext, ProjectConfig
 from ...model import AIEModel
+from ..common import create_context
 from . import handlers  # noqa: F401 - registers all handlers
 from .context import OnnxImportContext
 from .registry import dispatch
 from .shapes import build_shape_table
 from .utils import (
-    create_context,
     initializer_map,
     input_maps,
     require_onnx,
@@ -47,7 +47,12 @@ def lower_onnx_model(
     graph_proto = model_proto.graph
 
     resolved_project_name = resolve_project_name(model_path, model_proto, project_name)
-    backend = create_context(config, output_dir, resolved_project_name, stamp, custom_sources)
+    aie_config = config.get('AIEConfig', {}) or {}
+    backend = create_context(
+        aie_config.get('Part') or config.get('Part'),
+        aie_config,
+        ProjectConfig(Path(output_dir), resolved_project_name, stamp, dict(custom_sources or {})),
+    )
     graph: LogicalIR = backend.ir.logical
 
     initializers = initializer_map(graph_proto, numpy_helper)

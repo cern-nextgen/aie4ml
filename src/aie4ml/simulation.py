@@ -22,10 +22,8 @@ def _is_float_format(fmt: str) -> bool:
 
 @dataclass
 class IOPortLayout:
-    direction: str
     port: int
     tensor: str
-    descriptor: Dict
     staging: Dict
     dtype: AIEDataType
 
@@ -40,16 +38,6 @@ class IOPortLayout:
     @property
     def io_boundary_dimension(self) -> List[int]:
         return [int(x) for x in self.staging['io_boundary_dimension']]
-
-    @property
-    def io_tiling_dimension(self) -> List[int]:
-        return [int(x) for x in self.staging['io_tiling_dimension']]
-
-    @property
-    def offset(self) -> List[int]:
-        # Host-visible tensor slicing must use the kernel staging descriptor.
-        # Physical plan offsets may be shard-rebased for memtile units>1.
-        return [int(x) for x in self.staging['offset']]
 
     @property
     def transfer_bytes(self) -> int:
@@ -112,21 +100,13 @@ def build_io_layout(model) -> IOLayout:
         tensor = item.get('tensor')
         if not tensor:
             raise RuntimeError('Physical plan contains an IO port without a tensor name.')
-        staging = item.get('staging')
-        dtype = _dtype_from_plan(item.get('dtype'))
+        staging, dtype = item.get('staging'), item.get('dtype')
         if staging is None:
             raise RuntimeError(f'{tensor}: physical plan is missing graph-{direction} staging data.')
         if dtype is None:
             raise RuntimeError(f'{tensor}: physical plan is missing graph-{direction} dtype data.')
 
-        port = IOPortLayout(
-            direction=direction,
-            port=int(item['port']),
-            tensor=tensor,
-            descriptor=item['descriptor'],
-            staging=staging,
-            dtype=dtype,
-        )
+        port = IOPortLayout(port=int(item['port']), tensor=tensor, staging=staging, dtype=AIEDataType.from_dict(dtype))
         (inputs if direction == 'input' else outputs).setdefault(tensor, []).append(port)
 
     for t in inputs:
@@ -135,12 +115,6 @@ def build_io_layout(model) -> IOLayout:
         outputs[t] = sorted(outputs[t], key=lambda p: p.port)
 
     return IOLayout(inputs=inputs, outputs=outputs)
-
-
-def _dtype_from_plan(data: Dict | None) -> AIEDataType | None:
-    if data is None:
-        return None
-    return AIEDataType.from_dict(data)
 
 
 def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) -> Dict[str, np.ndarray]:

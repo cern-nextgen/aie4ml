@@ -6,7 +6,6 @@ from .common import (
     pack_as_float,
     pack_mmul_rhs_matrix,
     pack_vector_by_n_slice,
-    select_generation_key,
 )
 from .config import DenseConfig, DenseFlags, MatmulConfig, MatmulFlags, MatmulMicrotileConfig
 from .dense import DenseOpImplVariant
@@ -26,5 +25,4 @@ __all__ = [
     'pack_as_float',
     'pack_mmul_rhs_matrix',
     'pack_vector_by_n_slice',
-    'select_generation_key',
 ]

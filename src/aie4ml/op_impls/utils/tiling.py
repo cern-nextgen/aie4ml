@@ -33,11 +33,6 @@ class ParallelismConfig:
         return int(self.cas_length) * int(self.cas_num)
 
 
-def parse_directives(directives) -> tuple[dict, dict]:
-    """Return (io_route, parallel_cfg) from a directives dict."""
-    return dict(directives.get('io_route', {})), dict(directives.get('parallelism') or {})
-
-
 def extract_inner_outer(shape: tuple[int, ...]) -> tuple[int, int, int]:
     """Return (full_inner, outer_prefix, last_outer) for any ND shape.
 

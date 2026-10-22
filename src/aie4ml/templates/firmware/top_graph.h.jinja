@@ -24,13 +24,6 @@ public:
   adf::input_port  ifm [{{ graph_plan.graph_input_count }}];
   adf::output_port ofm [{{ graph_plan.graph_output_count }}];
 
-{% for p in graph_plan.extra_input_ports %}
-  adf::input_port {{ p.name }} [{{ p.count }}];
-{% endfor %}
-{% for p in graph_plan.extra_output_ports %}
-  adf::output_port {{ p.name }} [{{ p.count }}];
-{% endfor %}
-
 {% for L in layers %}
   {% set Cfg = "Cfg" ~ loop.index %}
   {% set Lidx = loop.index %}
@@ -48,7 +41,7 @@ public:
 private:
 {% for L in layers %}
   {{ L.op_impl.graph_name }}<Cfg{{ loop.index }}>
-    {{ L.op_impl_name }};
+    {{ L.inst_name }};
 {% endfor %}
 
 {% for buf in graph_plan.buffers %}
@@ -82,7 +75,7 @@ public:
         {% if spec.kind == "2d" %}
         connect<>(
           {{ spec.port }}{{ Lidx }}[idx],
-          {{ L.op_impl_name }}.{{ spec.port }}[idx]
+          {{ L.inst_name }}.{{ spec.port }}[idx]
         );
         {% endif %}
         {% endfor %}
@@ -92,7 +85,7 @@ public:
       {% if spec.kind == "1d" %}
       connect<>(
         {{ spec.port }}{{ Lidx }}[ch],
-        {{ L.op_impl_name }}.{{ spec.port }}[ch]
+        {{ L.inst_name }}.{{ spec.port }}[ch]
       );
       {% endif %}
       {% endfor %}
@@ -100,7 +93,7 @@ public:
 {% endfor %}
 
 {% for L in layers %}
-    {{ L.op_impl_name }}.place_graph(
+    {{ L.inst_name }}.place_graph(
       Cfg{{ loop.index }}::col_placement,
       Cfg{{ loop.index }}::row_placement
     );

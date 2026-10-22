@@ -16,7 +16,7 @@ from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ce
 from ...utils.io import view_shape
 from ...utils.precision import element_bytes, resolve_operand_precision
 from ...utils.tiling import ROW_HEIGHTS
-from .common import MICROTILE_OPTIONS, select_generation_key
+from .common import MICROTILE_OPTIONS
 from .config import MatmulMicrotileConfig
 
 
@@ -119,7 +119,7 @@ def _tile_bank_usage(
 
 def _supported_microtile_options(generation: str, lhs_dtype, rhs_dtype):
     key = (legality_format(lhs_dtype.format), legality_format(rhs_dtype.format))
-    return list(MICROTILE_OPTIONS.get(select_generation_key(generation), {}).get(key, []))
+    return list(MICROTILE_OPTIONS[generation].get(key, []))
 
 
 def _resolve_tile_cfg(
@@ -297,7 +297,7 @@ def matmul_microtiling_candidates(node, device) -> tuple[Dict[str, Any], ...]:
     computes. None where the generation offers one height."""
     precision, _ = resolve_operand_precision(node, device)
     key = (legality_format(precision['lhs'].format), legality_format(precision['rhs'].format))
-    heights = ROW_HEIGHTS.get(select_generation_key(device.generation), {}).get(key, ())
+    heights = ROW_HEIGHTS.get(device.generation, {}).get(key, ())
     if len(heights) < 2:
         return ()
     _, k, n = _supported_microtile_options(device.generation, precision['lhs'], precision['rhs'])[0]

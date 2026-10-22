@@ -7,10 +7,9 @@ import numpy as np
 from ...errors import ConfigRefused
 from ...ir import get_backend_context
 from ..base import AIEPass
-from .boundary import graph_input_port_descs, graph_input_writer_port_descs
+from .boundary import graph_input_port_descs
 from .layout import port_layout
-from .legality import uses_stream
-from .model import EdgeEntry, GraphInputSpec, TransportDecision, TransportUnit
+from .model import EdgeEntry, TransportDecision, TransportUnit
 
 
 class LegalizeMemtilePortLimits(AIEPass):
@@ -32,12 +31,8 @@ class LegalizeMemtilePortLimits(AIEPass):
         for entry in ctx.ir.physical.entries:
             self._validate_classified_entry(entry)
             if entry.producer.node is None:
-                descriptors = graph_input_port_descs(entry, execution, next_graph_input_port)
-                next_graph_input_port += len(descriptors)
-                stream = uses_stream(execution, entry.endpoints())
-                entry.graph_input = GraphInputSpec(
-                    descriptors, graph_input_writer_port_descs(descriptors, stream=stream)
-                )
+                entry.graph_input = graph_input_port_descs(entry, execution, next_graph_input_port)
+                next_graph_input_port += len(entry.graph_input)
 
             if entry.decision.realization == 'direct':
                 if entry.unit is None:  # a graph boundary's: kernel-to-kernel legs are paired by classification
@@ -104,8 +99,7 @@ def check_memtile_leg(leg, execution, device) -> None:
         decision=TransportDecision('memtile', None),
     )
     if leg.producer.node is None:
-        descriptors = graph_input_port_descs(entry, execution, 0)
-        entry.graph_input = GraphInputSpec(descriptors, graph_input_writer_port_descs(descriptors, stream=False))
+        entry.graph_input = graph_input_port_descs(entry, execution, 0)
     memtile_units(entry, execution, int(device.max_mem_in_ports), int(device.max_mem_out_ports))
 
 
@@ -136,7 +130,7 @@ def _reader_chunks(entry, execution, writer_chunks, consumer_ports):
 def _writer_data(entry, execution, port):
     """The tensor coordinates one writer holds as data: a graph-input port's, the part its consumer port reads."""
     if entry.producer.node is None:
-        return port_layout(entry.graph_input.port_descriptors[int(port)]).data
+        return port_layout(entry.graph_input[int(port)]).data
     producer = entry.producer
     inst = execution.get(producer.node.name)
     staging = inst.staging[producer.tensor][port]
@@ -154,7 +148,7 @@ def _validate_limits(entry, max_in: int, max_out: int) -> None:
 def _writer_ports(entry, execution):
     """The ports writing the leg: a graph input's numbered ones, else its producer's."""
     if entry.producer.node is None:
-        return tuple(entry.graph_input.port_descriptors)
+        return tuple(entry.graph_input)
     inst = execution.get(entry.producer.node.name)
     return entry.producer.selected_ports(inst.ports.outputs[entry.producer.tensor].count)
 

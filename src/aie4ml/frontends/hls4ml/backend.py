@@ -83,15 +83,15 @@ class AIEBackend(Backend):
         self.attribute_map[Activation] = activation_attrs
 
     def _register_flows(self):
-        from aie4ml.pipeline import HLS4ML_FLOW_SPEC
+        from aie4ml.pipeline import DEFAULT_PIPELINE
 
         initializers = self._get_layer_initializers()
         flow = register_flow('init_layers', initializers, requires=['optimize'], backend=self.name)
         flow = register_flow('lower', ['aie:lower_to_aie_ir'], requires=[flow], backend=self.name)
 
-        for flow_name, pass_cls in HLS4ML_FLOW_SPEC:
+        for pass_cls in DEFAULT_PIPELINE:
             pass_name = pass_cls().name
-            flow = register_flow(flow_name, [f'aie:{pass_name}'], requires=[flow], backend=self.name)
+            flow = register_flow(pass_name, [f'aie:{pass_name}'], requires=[flow], backend=self.name)
 
         flow = register_flow('apply_templates', self._get_layer_templates, requires=[flow], backend=self.name)
         self._default_flow = register_flow('project', None, requires=[flow], backend=self.name)

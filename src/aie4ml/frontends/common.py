@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..device_catalog import resolve_device
+from ..ir.context import AIEBackendContext, ProjectConfig
 from ..ir.graph import ROUTE_MODES, STAGING_CONTRACTS, TENSOR_LAYOUTS
 from ..op_impls.common_types import PORT_KIND_BUFFER, PORT_KINDS
 
@@ -16,6 +18,18 @@ _DIRECTIVE_FIELDS = {
 }
 DIRECTIVES = frozenset({*_DIRECTIVE_FIELDS, 'layout', 'ports', 'approximation', 'input_fold'})
 LAYER_NODE_SUFFIX = '_aie'  # a layer's node is `<layer>_aie`
+
+
+def create_context(part: Any, aie_config: Dict[str, Any], project_config: ProjectConfig) -> AIEBackendContext:
+    """A model's backend context: the device `part` names, and its AIE configuration completed from the device
+    catalog, the PL options normalized."""
+    from ..system_plan import normalize_pl_config
+
+    if not part:
+        raise KeyError('the config names no Part (or AIEConfig.Part).')
+    device, merged = resolve_device(part, dict(aie_config))
+    resolved = normalize_pl_config({**merged, 'Part': str(part)})
+    return AIEBackendContext(device=device, project_config=project_config, aie_config=resolved)
 
 
 def _group(name: str, key: str, value: Any) -> Dict[str, Any]:

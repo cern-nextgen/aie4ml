@@ -42,7 +42,7 @@ def resolve_instance(node, device, input_contracts, choice=None) -> ExecutionIns
     """The kernel graph that implements `node`, given the contracts its inputs arrive in and, when given, directives
     to resolve it under over its own (a schedule). Pure: nothing is registered."""
     directives = {**(node.directives or {}), **(choice or {})}
-    directives['io_route'] = resolve_io_route(node)  # user intents
+    io_route = resolve_io_route(node)  # user intents
 
     check_io_view(node, device.generation)
     config, variant = (
@@ -60,7 +60,7 @@ def resolve_instance(node, device, input_contracts, choice=None) -> ExecutionIns
         node=node,
         variant=variant,
         ports=ports,
-        io_route=dict(config.io_route),
+        io_route=io_route,
         port_views={name: config.io_views[name] for name in (*(item.tensor for item in inputs), *outputs)},
         config=config,
         staging=port_staging(node, variant, config, ports),

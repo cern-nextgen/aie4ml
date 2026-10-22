@@ -2,7 +2,7 @@
 {%- set mode = pl_plan.mode -%}
 /*
  * Host application for {{ project_name }}.
- * Single Dense layer: {{ in_feat }}->{{ out_feat }}, int8, BATCH={{ batch }}.
+ * {{ in_feat }} -> {{ out_feat }} features, BATCH={{ batch }}.
  *
  * PL data-mover mode: {{ mode }}
  *
@@ -56,17 +56,6 @@
 #include "experimental/xrt_graph.h"
 #include "data.h"
 
-
-// IN_FEAT={{ in_feat }} split across {{ n_ifm }} PLIO(s) → IN_FEAT_SLICE = {{ in_feat_slice }} per tile.
-// OUT_FEAT={{ out_feat }} split across CAS_NUM={{ cas_num }} chain(s) → OUT_FEAT_SLICE = {{ out_feat_slice }} per tile.
-// Per-tile weight block = IN_FEAT_SLICE * OUT_FEAT_SLICE = {{ in_feat_slice }} * {{ out_feat_slice }} = {{ in_feat_slice * out_feat_slice }}.
-// CAS_NUM * CAS_LENGTH = {{ cas_num }} * {{ cas_length }} = {{ cas_num * cas_length }} weight tiles total.
-static constexpr int IN_FEAT       = {{ in_feat }};
-static constexpr int OUT_FEAT      = {{ out_feat }};
-static constexpr int CAS_NUM       = {{ cas_num }};
-static constexpr int CAS_LENGTH    = {{ cas_length }};
-static constexpr int IN_FEAT_SLICE  = {{ in_feat_slice }};
-static constexpr int OUT_FEAT_SLICE = {{ out_feat_slice }};
 
 // PL clock — must match `pl-freq` in aie.cfg.
 static constexpr double PL_FREQ_HZ = {{ "%.1f"|format(pl_freq_hz / 1e6) }}e6;

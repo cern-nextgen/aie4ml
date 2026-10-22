@@ -17,7 +17,7 @@ from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, hand_over_problem
 from .boundary import (
     direct_boundary_access,
     graph_input_port_descriptor,
-    graph_input_writer_port_descriptor,
+    host_visible_input_staging,
     require_linear_stream_staging,
 )
 from .collect import TransportCollector
@@ -51,18 +51,6 @@ class MaterializeMemoryPlan(AIEPass):
 class _MemoryPlanMaterializer:
     def __init__(self, ctx):
         self.ctx = ctx
-        self.device = ctx.device
-
-        self.buffers = []
-        self.direct_edges = []
-        self.merges = []
-        self.io_ports = []
-        self.kernel_read_accesses = []
-        self.kernel_write_accesses = []
-        self.layer_indices = {}
-        self._next_graph_output_port = 0
-        self._max_graph_input_port = -1
-        self._buffer_seq: Dict[str, int] = {}
 
     def materialize(self, entries):
         self.buffers = []
@@ -71,10 +59,9 @@ class _MemoryPlanMaterializer:
         self.io_ports = []
         self.kernel_read_accesses = []
         self.kernel_write_accesses = []
-        self.layer_indices = {inst.name: idx for idx, inst in enumerate(self.ctx.ir.execution, start=1)}
         self._next_graph_output_port = 0
         self._max_graph_input_port = -1
-        self._buffer_seq = {}
+        self._buffer_seq: Dict[str, int] = {}
 
         for entry in entries:
             self._materialize_entry(entry)
@@ -189,8 +176,8 @@ class _MemoryPlanMaterializer:
 
         for graph_port, consumer_port in zip(graph_ports, consumer_ports):
             endpoint = f'{consumer_id}.{consumer.group}[{int(consumer_port)}]'
-            staging = graph_input_writer_port_descriptor(entry, int(graph_port))
             port_staging = graph_input_port_descriptor(entry, int(graph_port))
+            staging = host_visible_input_staging(port_staging, stream=stream)
             descriptor = port_staging.to_dict()
 
             self.direct_edges.append(
@@ -299,8 +286,8 @@ class _MemoryPlanMaterializer:
         writers = []  # (port, staging, layout)
         for port in p_ports:
             if producer.node is None:
-                staging = graph_input_writer_port_descriptor(entry, port)
-                writers.append((port, staging, host_layout(graph_input_port_descriptor(entry, port))))
+                port_staging = graph_input_port_descriptor(entry, port)
+                writers.append((port, host_visible_input_staging(port_staging), host_layout(port_staging)))
             else:
                 inst = self._kernel_inst(producer.node)
                 staging = inst.staging[producer.tensor][port]

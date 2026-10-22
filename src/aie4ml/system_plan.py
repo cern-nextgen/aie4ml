@@ -155,12 +155,9 @@ def normalize_pl_config(aie_config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def emits_system(model_or_ctx) -> bool:
-    """Return True when PL + host code should be emitted (``target='hardware'``).
-
-    Defaults to AIE-only emission (``target='aie'``) when the key is absent.
-    """
+    """Return True when PL + host code should be emitted (``target='hardware'``)."""
     ctx = get_backend_context(model_or_ctx)
-    return str(ctx.aie_config.get('Target', 'aie')).lower() == 'hardware'
+    return ctx.aie_config['Target'] == 'hardware'
 
 
 def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int) -> int:
@@ -205,14 +202,13 @@ def _kernel_entry(name: str, template_dir: str) -> Dict[str, str]:
 
 
 def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> Dict[str, Any]:
-    """Describe the PL data path for a given ``PLDataMoverMode``: which kernels to emit,
-    the v++ linker connectivity (``nk=`` / ``sc=``), and the host's timing wiring.
+    """Describe the PL data path for a given ``PLDataMoverMode``: which kernels to emit and
+    the v++ linker connectivity (``nk=`` / ``sc=``).
 
     This is the single source of truth consumed by:
       * the writer            -> ``plan['kernels']`` (which .cpp/.cfg templates to render),
       * ``Makefile.jinja``    -> kernel ``.xo`` list + per-kernel build,
-      * ``system.cfg.jinja``  -> ``plan['nk']`` / ``plan['sc']`` connectivity,
-      * ``host.cpp.jinja``    -> ``plan['host']`` (timing CU + ``cycles_*`` register names).
+      * ``system.cfg.jinja``  -> ``plan['nk']`` / ``plan['sc']`` connectivity.
 
     Modes:
       ``benchmark``     single combined ``ddr_pl_aie_datamover`` CU (today's design);
@@ -240,18 +236,6 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
             'kernels': [_kernel_entry(name, _BENCHMARK_TEMPLATE_DIR)],
             'nk': [f'{name}:1:{name}'],
             'sc': sc,
-            'host': {
-                'timing_kernel': name,
-                'cycles': [
-                    'preload_done',
-                    'first_send',
-                    'last_send',
-                    'first_recv',
-                    'last_recv',
-                    'compute_done',
-                    'total',
-                ],
-            },
         }
 
     if mode == 'memory_stream':
@@ -260,7 +244,6 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
         nk = [f'{ifm_k}:1:{ifm_k}', f'{ofm_k}:1:{ofm_k}']
         sc = [f'{ifm_k}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
         sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
-        host = {'timing_kernel': None, 'cycles': []}
         if enable_pl_timing:
             timer = 'tick_gen'
             kernels.append(_kernel_entry(timer, _DEPLOYMENT_TEMPLATE_DIR))
@@ -273,14 +256,12 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
                 f'{ofm_k}.ev_last_recv:{timer}.ev_last_recv',
                 f'{ofm_k}.ev_done:{timer}.ev_done',
             ]
-            host = {'timing_kernel': timer, 'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total']}
         return {
             'mode': mode,
             'enable_pl_timing': enable_pl_timing,
             'kernels': kernels,
             'nk': nk,
             'sc': sc,
-            'host': host,
         }
 
     if mode == 'external_stream':
@@ -310,7 +291,6 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
             'kernels': kernels,
             'nk': nk,
             'sc': sc,
-            'host': {'timing_kernel': None, 'cycles': []},
         }
     raise ValueError(f'unknown PLDataMoverMode {mode!r}.')
 
@@ -342,12 +322,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
 
     in_feat = _single_io_feat(layout.inputs, 'input', batch)
     out_feat = _single_io_feat(layout.outputs, 'output', batch)
-    # Per-PLIO-tile feature slices come from the GRAPH BOUNDARY ports -- the single graph
-    # input and single graph output (already validated to be 1 each above).
     gin_port = next(iter(layout.inputs.values()))[0]
     gout_port = next(iter(layout.outputs.values()))[0]
-    in_feat_slice = gin_port.tiling_dimension[gin_port.slice_dimension]
-    out_feat_slice = gout_port.tiling_dimension[gout_port.slice_dimension]
 
     # Per-layer RTP artifacts (weights/bias/...). layer_index counts every executed node
     # (incl. param-less activations) so the RTP port suffix matches the app.cpp graph index.
@@ -380,29 +356,22 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
                 ],
             }
         )
-    # Top-level cas_* describe the graph-output-producing (last weight) layer.
-    cas_num = layers[-1]['cas_num'] if layers else 1
-    cas_length = layers[-1]['cas_length'] if layers else 1
     if in_feat % n_ifm != 0:
         raise NotImplementedError(
             f'in_feat {in_feat} not divisible by n_ifm {n_ifm}; uneven input shard is not yet supported.'
-        )
-    if out_feat % cas_num != 0:
-        raise NotImplementedError(
-            f'out_feat {out_feat} not divisible by cas_num {cas_num}; uneven output shard is not yet supported.'
         )
     ifm_per_stream = _stream_words_512(gin_port, 'input')
     ofm_per_stream = _stream_words_512(gout_port, 'output')
     iterations = int(ctx.aie_config['Iterations'])
 
     # On-chip pool selection -- common to every mover (all bind_storage to URAM or BRAM).
-    pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
+    pl_memory = ctx.aie_config['PLMemory']
     pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
 
     # PL data-path style (benchmark single CU vs split deployment movers).
     # Resolve the mode FIRST -- the on-chip budget below is mode-specific.
-    pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
-    pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm, bool(ctx.aie_config.get('EnablePLTiming', True)))
+    pl_data_mover_mode = ctx.aie_config['PLDataMoverMode']
+    pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm, ctx.aie_config['EnablePLTiming'])
     enable_pl_timing = pl_plan['enable_pl_timing']
 
     # On-chip budget is mode-specific, but BOTH count in BLOCKS -- the buffers are 512-bit
@@ -426,9 +395,7 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     return {
         'project_name': ctx.project_config.project_name,
         'platform': ctx.device.platform,
-        'graph_name': 'dut',
-        'pl_freq_hz': float(ctx.aie_config['PLClockFreqMHz']) * 1e6,
-        'plio_width_bits': int(ctx.device.plio_width_bits),
+        'pl_freq_hz': float(ctx.device.pl_clock_mhz) * 1e6,
         'pl_mem_impl': pl_mem_impl,
         'enable_pl_timing': enable_pl_timing,
         'n_ifm': n_ifm,
@@ -438,14 +405,9 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'max_n_iter': max_n_iter,
         'in_feat': in_feat,
         'out_feat': out_feat,
-        'in_feat_slice': in_feat_slice,
-        'out_feat_slice': out_feat_slice,
-        'cas_num': cas_num,
-        'cas_length': cas_length,
         'ifm_per_stream': ifm_per_stream,
         'ofm_per_stream': ofm_per_stream,
         'layers': layers,
-        'pl_data_mover_mode': pl_data_mover_mode,
         'pl_plan': pl_plan,
     }
 

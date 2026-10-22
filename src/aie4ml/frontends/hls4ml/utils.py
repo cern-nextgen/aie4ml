@@ -148,3 +148,35 @@ def _create_weight_tensors(layer, graph: LogicalIR):
     )
     graph.add_tensor(bias_tv)
     return weight_tv, bias_tv
+
+
+def assert_true_pointwise(layer) -> None:
+    """A Conv1D that stands in for a Dense must really be pointwise; hls4ml's multi-dense
+    replacement only ever produces that shape."""
+    filt_w = layer.get_attr('filt_width')
+    stride_w = layer.get_attr('stride_width')
+    pad_l = layer.get_attr('pad_left')
+    pad_r = layer.get_attr('pad_right')
+    if not (filt_w == 1 and stride_w == 1 and pad_l == 0 and pad_r == 0):
+        raise ValueError(f'{layer.name}: PointwiseConv1D is not true pointwise.')
+    if layer.get_attr('in_width') != layer.get_attr('out_width'):
+        raise ValueError(f'{layer.name}: PointwiseConv1D is not true pointwise.')
+
+
+def is_pointwise_dense(layer) -> bool:
+    """Whether a convolution layer is a Dense in disguise: a 1x1 window over every pixel.
+
+    A Conv2D that is not pointwise is an ordinary convolution and lowers to the conv2d family.
+    """
+    if layer.class_name == 'Conv1D':
+        assert_true_pointwise(layer)
+        return True
+    if layer.class_name != 'Conv2D':
+        return False
+    return (
+        (layer.get_attr('filt_height'), layer.get_attr('filt_width')) == (1, 1)
+        and (layer.get_attr('stride_height'), layer.get_attr('stride_width')) == (1, 1)
+        and not any(layer.get_attr(f'pad_{side}', 0) for side in ('top', 'bottom', 'left', 'right'))
+        and (layer.get_attr('in_height'), layer.get_attr('in_width'))
+        == (layer.get_attr('out_height'), layer.get_attr('out_width'))
+    )

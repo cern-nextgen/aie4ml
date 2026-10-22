@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,12 +11,11 @@ from aie4ml.errors import ConfigRefused
 from aie4ml.frontends.onnx import from_onnx, lower_onnx_model
 from aie4ml.ir import TraitInstance
 from aie4ml.op_impls.common_types import PortBinding, kernel_endpoints, to_plain
-from aie4ml.op_impls.families.matmul.common import select_generation_key
 from aie4ml.op_impls.families.matmul.matmul import MatmulOpImplVariant, MatmulRowWiseOpImplVariant
 from aie4ml.op_impls.utils import TraversalStep
 from aie4ml.op_impls.utils.precision import infer_accumulator_tag
 from aie4ml.passes import PackKernelArtifacts, Resolve
-from aie4ml.writer import AIEProjectEmitter
+from aie4ml.writer import TEMPLATE_ROOT, AIEProjectEmitter
 from helpers import TensorProto, helper, make_model, numpy_helper
 from jinja2 import Environment, FileSystemLoader
 
@@ -298,7 +296,7 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     assert device.cascade_layout == 'alternating_horizontal'
     assert device.aie_compiler_target == 'part'
 
-    template_root = Path(AIEProjectEmitter()._template_root) / 'firmware'
+    template_root = TEMPLATE_ROOT / 'firmware'
     env = Environment(loader=FileSystemLoader(str(template_root)), trim_blocks=True, lstrip_blocks=True)
     ctx = SimpleNamespace(
         device=device,
@@ -336,7 +334,7 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
 @pytest.mark.parametrize('generation', ['', 'AIE-ML3', 'not-a-device'])
 def test_unknown_generation_is_rejected(generation):
     with pytest.raises(ValueError, match='Unknown AIE generation'):
-        select_generation_key(generation)
+        resolve_device('xilinx_vck190_base', {'Generation': generation})
 
 
 def test_aie1_onnx_int8_dense_prefers_direct_compatible_microtile(tmp_path):

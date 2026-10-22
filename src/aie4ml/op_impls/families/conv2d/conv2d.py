@@ -34,7 +34,6 @@ from ...utils import (
     SpatialAccess2D,
     TensorView,
     build_padded_spatial_view,
-    parse_directives,
     shared_consumer_spatial_access,
 )
 from ...utils.math import align_up
@@ -50,7 +49,6 @@ from ..matmul.common import (
     describe_inner_output_staging,
     np_bias_dtype_for_spec,
     np_dtype_for_spec,
-    select_generation_key,
 )
 from ..matmul.config import MatmulMicrotileConfig
 from .common import (
@@ -166,7 +164,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         if rhs_width != 8 or lhs_width not in (8, 16) or out_width not in (8, 16):
             return False
         # int16 activations, in or out, need a core for them on the generation
-        return _core_microtile(select_generation_key(device.generation), max(lhs_width, out_width)) is not None
+        return _core_microtile(device.generation, max(lhs_width, out_width)) is not None
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> Conv2dConfig:
         """A conv folds its input where it can and its folded frame fits a bank (`_fold_unit`), unless `input_fold`
@@ -180,7 +178,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         return config
 
     def _resolve(self, node: OpNode, device, directives, input_contracts, *, fold: bool) -> Conv2dConfig:
-        io_route, parallel_cfg = parse_directives(directives)
+        parallel_cfg = dict(directives.get('parallelism') or {})
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')
         out = node.outputs[0]
@@ -207,7 +205,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 f'{node.name}: {self.variant_id} implements a horizontal stride for int8 inputs only, '
                 f'got {precision["lhs"].width}-bit.'
             )
-        generation = select_generation_key(device.generation)
+        generation = device.generation
         m, k, n = _core_microtile(generation, int(precision['lhs'].width))
         microtiling = MatmulMicrotileConfig(microtile_m=m, microtile_k=k, microtile_n=n)
         in_shape, spatial, input_fold = self._kernel_input(node, generation, fold=fold)
@@ -288,7 +286,6 @@ class Conv2dOpImplVariant(OpImplVariant):
             parallelism=parallelism,
             microtiling=microtiling,
             io_views=io_views,
-            io_route=io_route,
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode=aie_rounding_token(precision['output']),

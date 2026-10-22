@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..aie_types import QuantIntent
 from ..ir import TraitInstance, get_backend_context
 from ..op_impls.family_registry import fuses, get_family_resolver_registry
 from .base import AIEPass
-from .utils import keeps_values
 
 
 def _row_permutation(shape, axis_order):
@@ -138,3 +138,11 @@ class FuseOps(AIEPass):
         producer.add_trait(TraitInstance('output_view', {'kind': kind}))
         graph.remove_node(node, mode='contract')
         return True
+
+
+def keeps_values(source, result) -> bool:
+    """Whether an op that only moves or selects values (a reshape, a max pool) can carry `source`'s quantization into
+    `result`: they must share a representation; how `result` would round or saturate never applies."""
+    if isinstance(source, QuantIntent) and isinstance(result, QuantIntent):
+        return (source.width, source.frac, source.signed) == (result.width, result.frac, result.signed)
+    return source == result

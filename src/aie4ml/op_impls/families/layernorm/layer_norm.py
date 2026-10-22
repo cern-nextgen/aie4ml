@@ -14,7 +14,6 @@ from ...utils import (
     extract_inner_outer,
     find_tile_split,
     layout_variant_matches,
-    parse_directives,
     require_power_of_two,
 )
 from ...utils.io import view_shape
@@ -94,7 +93,7 @@ class _LayerNormVariantBase(RowWiseVariantBase):
         return GAMMA_FRAC_BITS, BETA_FRAC_BITS, 15, 0
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> LayerNormConfig:
-        io_route, parallel_cfg = parse_directives(directives)
+        parallel_cfg = dict(directives.get('parallelism') or {})
 
         in_tensor = input_tensor_for_role(node, 'lhs')
         out_tensor = node.outputs[0]
@@ -170,7 +169,6 @@ class _LayerNormVariantBase(RowWiseVariantBase):
             rounding_mode=aie_rounding_token(precision['output']),
             alternating_horizontal=device.alternating_horizontal,
             io_views=io_views,
-            io_route=io_route,
             layout=self.layout_name,
             microtile=microtile,
             transpose_input=io_views[in_tensor.name].is_transposed,

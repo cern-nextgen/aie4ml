@@ -29,7 +29,6 @@ class LayerNormConfig:
     rounding_mode: Optional[str]
     alternating_horizontal: bool
     io_views: Dict[str, TensorView]
-    io_route: Dict[str, Any]
     #: One of ir.graph.TENSOR_LAYOUTS; picks the kernel via the template's LAYOUT_TILED.
     layout: str = 'linear'
     #: Block a 'tiled' layout is stored in, inherited from the producer so the edge stays direct.

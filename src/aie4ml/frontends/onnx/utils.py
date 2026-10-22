@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import ml_dtypes
 import numpy as np
 
 from ...aie_types import FloatFormat, FloatIntent, QuantIntent, RoundingMode, SaturationMode
-from ...device_catalog import resolve_device
-from ...ir import BackendPolicies
-from ...ir.context import AIEBackendContext, ProjectConfig
-from ...system_plan import normalize_pl_config
 
 
 def require_onnx():
@@ -48,34 +44,6 @@ def resolve_project_name(model_path, model_proto, project_name: Optional[str]) -
     if graph_name:
         return graph_name
     raise ValueError('project_name must be provided when lowering an in-memory ONNX model without graph.name.')
-
-
-def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp, custom_sources) -> AIEBackendContext:
-    aie_cfg = dict(config.get('AIEConfig', {}) or {})
-    part_name = aie_cfg.get('Part') or config.get('Part') or aie_cfg.get('Device')
-    if not part_name:
-        raise KeyError('ONNX frontend requires Part or AIEConfig.Part in the config dict.')
-
-    device, merged = resolve_device(part_name, aie_cfg)
-    policies = BackendPolicies(tensors_have_batch=True)
-    project_config = ProjectConfig(
-        output_dir=Path(output_dir),
-        project_name=project_name,
-        stamp=stamp,
-        custom_sources=dict(custom_sources or {}),
-    )
-    resolved_aie_config = dict(merged)
-    resolved_aie_config['Part'] = str(part_name)
-
-    normalize_pl_config(resolved_aie_config)
-
-    ctx = AIEBackendContext(
-        device=device,
-        policies=policies,
-        project_config=project_config,
-        aie_config=resolved_aie_config,
-    )
-    return ctx
 
 
 # ONNX bfloat16 and float8 e4m3fn, decoded here: onnx < 1.18 returns their raw bits, and reads a bfloat16 tensor's

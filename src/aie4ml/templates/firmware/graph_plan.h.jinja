@@ -50,10 +50,6 @@ struct graph_plan {
     {% endfor %}
 {% endfor %}
 
-{% for dim in graph_plan.port_dimensions %}
-    dimensions(self.{{ dim.endpoint }}) = { {{ dim.elements }} };
-{% endfor %}
-
 {% for acc in graph_plan.kernel_read_accesses %}
     read_access(self.{{ acc.endpoint }}) = {{ render_tiling(acc.descriptor) }};
 {% endfor %}

@@ -18,7 +18,7 @@ from ....quant_utils import quantize_to_int
 from ...base import OpImplVariant, StreamLocation, cascade_locations, cascade_ports, rom_artifact
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, inherited_microtile, parse_directives
+from ...utils import ParallelismConfig, inherited_microtile
 from ...utils.precision import (
     aie_rounding_token,
     element_bytes,
@@ -119,7 +119,7 @@ class _DenseVariantBase(_MatmulFamilyVariantBase):
         return requested_contract(node, directives) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> DenseConfig:
-        io_route, parallel_cfg = parse_directives(directives)
+        parallel_cfg = dict(directives.get('parallelism') or {})
         precision, accumulator_tag = resolve_operand_precision(node, device)
         precision['bias'] = resolve_bias_dtype(node, precision)
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -204,7 +204,6 @@ class _DenseVariantBase(_MatmulFamilyVariantBase):
             ),
             microtiling=microtiling,
             io_views=io_views,
-            io_route=io_route,
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),

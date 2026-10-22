@@ -17,7 +17,6 @@ class SoftmaxConfig:
     use_clb: bool
     alternating_horizontal: bool
     io_views: Dict[str, TensorView]
-    io_route: Dict[str, Any]
     hccs: Dict[str, Any]
     layout: str = 'linear'
     microtile: Optional[MicrotileShape] = None

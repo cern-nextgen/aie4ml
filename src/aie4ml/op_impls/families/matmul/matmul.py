@@ -5,7 +5,7 @@ from ....ir.graph import OpNode, input_role, input_tensor_for_role
 from ...base import KERNEL_BANKS, PING_PONG_BANKS, BufferLocation, row_flow
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, parse_directives
+from ...utils import ParallelismConfig
 from ...utils.precision import (
     aie_rounding_token,
     resolve_accumulator_output_shift,
@@ -43,7 +43,7 @@ class _MatmulVariantBase(_MatmulFamilyVariantBase):
         return requested_contract(node, directives) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> MatmulConfig:
-        io_route, parallel_cfg = parse_directives(directives)
+        parallel_cfg = dict(directives.get('parallelism') or {})
         precision, accumulator_tag = resolve_operand_precision(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'], directives.get('microtiling'))
         tiling = _resolve_parallelism(
@@ -79,7 +79,6 @@ class _MatmulVariantBase(_MatmulFamilyVariantBase):
             ),
             microtiling=microtiling,
             io_views=io_views,
-            io_route=io_route,
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),

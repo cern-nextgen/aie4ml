@@ -13,7 +13,6 @@ from ...utils import (
     extract_inner_outer,
     find_tile_split,
     layout_variant_matches,
-    parse_directives,
 )
 from ...utils.io import view_shape
 from ...utils.precision import infer_accumulator_tag, resolve_exact_storage_dtype, storage_bytes_for_spec
@@ -104,7 +103,7 @@ class _SoftmaxVariantBase(RowWiseVariantBase):
         raise NotImplementedError
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> SoftmaxConfig:
-        io_route, parallel_cfg = parse_directives(directives)
+        parallel_cfg = dict(directives.get('parallelism') or {})
 
         in_tensor = input_tensor_for_role(node, 'lhs')
         out_tensor = node.outputs[0]
@@ -174,7 +173,6 @@ class _SoftmaxVariantBase(RowWiseVariantBase):
             accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs']),
             alternating_horizontal=device.alternating_horizontal,
             io_views=io_views,
-            io_route=io_route,
             layout=self.layout_name,
             microtile=microtile,
             transpose_input=io_views[in_tensor.name].is_transposed,

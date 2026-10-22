@@ -85,8 +85,7 @@ def infer_accumulator_tag(
 
     lhs_w = int(getattr(lhs_dtype, 'width', 0) or 0)
     rhs_w = int(getattr(rhs_dtype, 'width', 0) or 0)
-    norm_gen = (getattr(device, 'generation', '') or '').upper()
-    is_ml = norm_gen.startswith('AIE-ML')
+    is_ml = device.generation.startswith('AIE-ML')
 
     if not is_ml:
         if lhs_w <= 8 and rhs_w <= 8:

@@ -2,7 +2,6 @@
 
 from .context import (
     AIEBackendContext,
-    BackendPolicies,
     DeviceSpec,
     ensure_backend_context,
     get_backend_context,
@@ -41,7 +40,6 @@ __all__ = [
     'OpNode',
     'set_input_roles',
     'TensorVar',
-    'BackendPolicies',
     'DeviceSpec',
     'TraitInstance',
     'ensure_backend_context',

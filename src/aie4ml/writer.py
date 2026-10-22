@@ -3,7 +3,7 @@
 
 from functools import lru_cache
 from pathlib import Path
-from shutil import copyfile
+from shutil import copyfile, rmtree
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -46,9 +46,6 @@ def kernel_config(inst) -> str:
 
 class AIEProjectEmitter:
     """Framework-agnostic project emitter. Takes a populated AIEBackendContext and writes all output files."""
-
-    def __init__(self):
-        self._template_root = TEMPLATE_ROOT
 
     def emit(self, ctx):
         output_dir = ctx.project_config.output_dir
@@ -103,13 +100,7 @@ class AIEProjectEmitter:
             sanitized_name = sanitize_identifier(inst.name)
             entry = _layer(inst, placement, f'L{layer_index}Cfg')
             entry['op_impl']['parameters']['buffer_locations'] = pinned_buffers(ctx, inst)
-            entry.update(
-                index=layer_index,
-                inst_name=sanitized_name,
-                op_impl_name=sanitized_name,
-                port_views=inst.port_views,
-                artifacts=artifacts,
-            )
+            entry.update(inst_name=sanitized_name, artifacts=artifacts)
             layers.append(entry)
 
         return layers
@@ -135,17 +126,10 @@ class AIEProjectEmitter:
                 )
 
     def _copy_kernel_sources(self, output_dir: Path, custom_sources: dict):
-        src_kernel_dir = self._template_root / 'nnet_utils'
+        src_kernel_dir = TEMPLATE_ROOT / 'nnet_utils'
         dst_kernel_dir = output_dir / 'src' / 'kernels'
-
-        if dst_kernel_dir.exists():
-            for p in dst_kernel_dir.iterdir():
-                if p.is_file():
-                    p.unlink()
-                else:
-                    self._remove_tree(p)
-
-        dst_kernel_dir.mkdir(exist_ok=True)
+        rmtree(dst_kernel_dir, ignore_errors=True)
+        dst_kernel_dir.mkdir()
 
         for src in src_kernel_dir.rglob('*'):
             if src.is_file():
@@ -158,14 +142,6 @@ class AIEProjectEmitter:
             dst.parent.mkdir(parents=True, exist_ok=True)
             copyfile(src, dst)
 
-    def _remove_tree(self, path: Path):
-        if path.is_dir():
-            for c in path.iterdir():
-                self._remove_tree(c)
-            path.rmdir()
-        else:
-            path.unlink()
-
     def _render_aie_templates(self, output_dir: Path, ctx, layers, graph_plan, env: Environment):
         """Render the AIE compute sources (always, hardware-agnostic)."""
         context = {
@@ -173,7 +149,7 @@ class AIEProjectEmitter:
             'graph_plan': graph_plan,
             'plio_bitwidth': ctx.device.plio_width_bits,
             'iterations': int(ctx.aie_config['Iterations']),
-            'pl_freq_mhz': float(ctx.aie_config['PLClockFreqMHz']),
+            'pl_freq_mhz': float(ctx.device.pl_clock_mhz),
             'stack_bank': STACK_BANK,
             'weight_bank': WEIGHT_BANK,
         }

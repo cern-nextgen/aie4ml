@@ -49,7 +49,6 @@ class DenseConfig:
     parallelism: ParallelismConfig
     microtiling: MatmulMicrotileConfig
     io_views: Dict[str, TensorView]
-    io_route: Dict[str, Any]
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
@@ -67,7 +66,6 @@ class MatmulConfig:
     parallelism: ParallelismConfig
     microtiling: MatmulMicrotileConfig
     io_views: Dict[str, TensorView]
-    io_route: Dict[str, Any]
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]

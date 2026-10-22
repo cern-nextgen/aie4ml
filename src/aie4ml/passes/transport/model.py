@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from ...ir import OpNode
 from ...op_impls.utils import StagingDescriptor
@@ -94,14 +94,6 @@ class TransportUnit:
             raise ValueError(f'Invalid transport unit index/count ({self.index}/{self.count}).')
 
 
-@dataclass(frozen=True)
-class GraphInputSpec:
-    """Per graph-input port: the staging of the kernel port it feeds, in the leg's frame, and what the host writes."""
-
-    port_descriptors: Dict[int, StagingDescriptor]
-    writer_descriptors: Dict[int, Dict[str, Any]]
-
-
 @dataclass
 class EdgeEntry:
     """Transport leg state progressively resolved by transport passes."""
@@ -113,7 +105,8 @@ class EdgeEntry:
     graph_output: bool = False
     decision: Optional[TransportDecision] = None
     unit: Optional[TransportUnit] = None
-    graph_input: Optional[GraphInputSpec] = None
+    # per graph-input port, the staging of the kernel port it feeds, in the leg's frame
+    graph_input: Optional[Dict[int, StagingDescriptor]] = None
 
     def endpoints(self) -> Tuple[Endpoint, ...]:
         return (self.producer, *(conn.consumer for conn in self.consumers if conn.consumer is not None))

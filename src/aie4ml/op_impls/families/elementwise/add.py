@@ -24,7 +24,6 @@ from ...utils import (
     describe_partition_staging,
     extract_inner_outer,
     find_tile_split,
-    parse_directives,
 )
 from ...utils.io import view_layout, view_shape
 from ...utils.precision import (
@@ -79,7 +78,7 @@ class AddOpImplVariant(OpImplVariant):
         return True
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> AddConfig:
-        io_route, parallel_cfg = parse_directives(directives)
+        parallel_cfg = dict(directives.get('parallelism') or {})
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
@@ -196,7 +195,6 @@ class AddOpImplVariant(OpImplVariant):
             parallelism=ParallelismConfig(cas_num=int(cas_num), contract=staging_contract),
             vec_size=vec_size,
             io_views=io_views,
-            io_route=io_route,
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode=rounding_mode,

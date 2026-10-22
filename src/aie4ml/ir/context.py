@@ -16,13 +16,6 @@ from .graph import AIEPipelineIR
 CONTEXT_ATTR = '_aie_backend_context'
 
 
-@dataclass
-class BackendPolicies:
-    """Policies steering graph lowering and transformation stages."""
-
-    tensors_have_batch: bool = False
-
-
 @dataclass(frozen=True)
 class RamPool:
     """One PL on-chip RAM pool: its blocks, and one block's Depth x WidthBits."""
@@ -77,9 +70,6 @@ class DeviceSpec:
     bank_count: int
     tile_mem_bytes: int
     cascade_layout: str
-    # Words in flight between cascaded cores: the sender's output FIFO and the receiver's input FIFO; None where
-    # the architecture manual does not document them.
-    cascade_words_in_flight: Optional[int]
     aie_compiler_target: str
     # The PL on-chip pools data movers stage in, where the catalog gives them; system planning picks the one
     # PLMemory selects.
@@ -106,9 +96,6 @@ class DeviceSpec:
         generation = str(require(cfg, 'Generation'))
         if generation not in ('AIE', 'AIE-ML', 'AIE-MLV2'):
             raise ValueError(f'Unknown AIE generation {generation!r}; expected "AIE", "AIE-ML" or "AIE-MLV2".')
-        fifos = [key in cfg for key in ('CascadeOutputFifoDepth', 'CascadeInputFifoDepth')]
-        if any(fifos) and not all(fifos):
-            raise KeyError(f'Device {platform!r} gives one cascade FIFO depth without the other.')
 
         def dma(entry: Dict[str, Any]) -> DmaSpec:
             return DmaSpec(
@@ -157,9 +144,6 @@ class DeviceSpec:
             bank_count=int(require(cfg, 'BankCount')),
             tile_mem_bytes=int(require(cfg, 'TileMemBytes')),
             cascade_layout=str(require(cfg, 'CascadeLayout')),
-            cascade_words_in_flight=(
-                int(cfg['CascadeOutputFifoDepth']) + int(cfg['CascadeInputFifoDepth']) if all(fifos) else None
-            ),
             aie_compiler_target=compiler_target,
             uram=pool('UltraRAM'),
             bram=pool('BlockRAM'),
@@ -180,10 +164,9 @@ class ProjectConfig:
 
 @dataclass
 class AIEBackendContext:
-    """Container carrying IR graph, device spec and policies."""
+    """Container carrying IR graph and device spec."""
 
     device: DeviceSpec
-    policies: BackendPolicies
     project_config: ProjectConfig
     aie_config: Dict[str, Any] = field(default_factory=dict)
     ir: AIEPipelineIR = field(default_factory=AIEPipelineIR)

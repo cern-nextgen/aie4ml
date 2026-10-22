@@ -54,7 +54,7 @@ REGISTER_TRANSPOSE = frozenset({'AIE-ML', 'AIE-MLV2'})
 
 def check_register_transpose(node, io_views, device) -> None:
     """Refuse an operand read transposed on a generation that cannot transpose it at vector speed."""
-    if select_generation_key(device.generation) in REGISTER_TRANSPOSE:
+    if device.generation in REGISTER_TRANSPOSE:
         return
     for role in ('lhs', 'rhs'):
         tensor = input_tensor_for_role(node, role)
@@ -63,13 +63,6 @@ def check_register_transpose(node, io_views, device) -> None:
                 f'{node.name}: reads {tensor.name!r} transposed, which {device.generation} cores cannot do at vector '
                 'speed; transpose it before the AIE.'
             )
-
-
-def select_generation_key(generation: str) -> str:
-    norm = (generation or '').strip().upper()
-    if norm not in MICROTILE_OPTIONS:
-        raise ValueError(f'Unknown AIE generation {generation!r}; expected one of {", ".join(MICROTILE_OPTIONS)}.')
-    return norm
 
 
 _SUPPORTED_INT_WIDTH_COMBOS = {
@@ -81,7 +74,7 @@ _SUPPORTED_INT_WIDTH_COMBOS = {
 
 def bitwidths_supported(node, device) -> bool:
     """Whether this device can run the node's lhs/rhs storage widths."""
-    generation = select_generation_key(device.generation)
+    generation = device.generation
     lhs = input_tensor_for_role(node, 'lhs')
     rhs = input_tensor_for_role(node, 'rhs')
     if isinstance(lhs.precision, FloatIntent):

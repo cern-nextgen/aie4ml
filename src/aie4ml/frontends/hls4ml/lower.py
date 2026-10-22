@@ -11,9 +11,7 @@ from typing import Any, Dict
 import numpy as np
 from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 
-from ...device_catalog import resolve_device
 from ...ir import (
-    BackendPolicies,
     LogicalIR,
     OpNode,
     TensorVar,
@@ -22,9 +20,14 @@ from ...ir import (
 )
 from ...ir.context import AIEBackendContext, ProjectConfig
 from ...ir.graph import VIEW_FLATTEN_2D
-from ...passes.utils import is_pointwise_dense
-from ..common import LAYER_NODE_SUFFIX
-from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
+from ..common import LAYER_NODE_SUFFIX, create_context
+from .utils import (
+    _create_weight_tensors,
+    _get_post_activation_precision,
+    _precision_of,
+    extract_layer_directives,
+    is_pointwise_dense,
+)
 
 
 class LowerToAieIr(ModelOptimizerPass):
@@ -41,7 +44,8 @@ class LowerToAieIr(ModelOptimizerPass):
         layers = list(model.get_layers())
         input_var = model.get_input_variables()[0]
         batch_size = int(model.config.get_config_value('BatchSize'))
-        batch_included = bool(ctx.policies.tensors_have_batch)
+        policy = model.config.get_config_value('AIEFrontendPolicy', {}) or {}
+        batch_included = bool(policy.get('TensorsHaveBatch', False))
 
         def _canon(shape):
             dims = [int(x) for x in shape]
@@ -239,22 +243,13 @@ class LowerToAieIr(ModelOptimizerPass):
     def _create_context(self, model) -> AIEBackendContext:
         config = model.config
         aie_cfg = config.get_config_value('AIEConfig', {}) or {}
-        part_name = aie_cfg.get('Part') or config.get_config_value('Part') or aie_cfg.get('Device') or 'unknown_part'
-
-        device, _ = resolve_device(part_name, aie_cfg)
-        policies = BackendPolicies(
-            tensors_have_batch=bool(
-                (config.get_config_value('AIEFrontendPolicy', {}) or {}).get('TensorsHaveBatch', False)
-            ),
-        )
-
         project_config = ProjectConfig(
             output_dir=Path(config.get_output_dir()),
             project_name=config.get_project_name(),
             stamp=config.get_config_value('Stamp'),
             custom_sources=dict(config.backend.get_custom_source()),
         )
-        return AIEBackendContext(device=device, policies=policies, project_config=project_config, aie_config=aie_cfg)
+        return create_context(aie_cfg.get('Part') or config.get_config_value('Part'), aie_cfg, project_config)
 
     def _map_op_type(self, layer) -> str:
         if layer.class_name == 'Merge':

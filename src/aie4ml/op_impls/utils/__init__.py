@@ -25,7 +25,6 @@ from .tiling import (
     find_tile_split,
     inherited_microtile,
     layout_variant_matches,
-    parse_directives,
     requested_layout,
     requested_port_kinds,
 )
@@ -57,7 +56,6 @@ __all__ = [
     'layout_variant_matches',
     'map_view_axis',
     'ordered_view_shape',
-    'parse_directives',
     'require_power_of_two',
     'requested_layout',
     'requested_port_kinds',
