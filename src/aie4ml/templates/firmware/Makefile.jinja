@@ -152,7 +152,7 @@ x86com: $(MY_SOURCES) aie.cfg $(STAMP_MARKER)
 	set -o pipefail; v++ --compile --config aie.cfg --mode aie --target=x86sim $(AIE_FLAGS_X86) |& tee log
 
 aiesim:
-	aiesimulator --pkg-dir=$(AIE_WORKDIR) |& tee -a log
+	aiesimulator --pkg-dir=$(AIE_WORKDIR) $(AIESIM_FLAGS) |& tee -a log
 
 x86sim:
 	x86simulator --pkg-dir=$(X86_WORKDIR) |& tee -a log

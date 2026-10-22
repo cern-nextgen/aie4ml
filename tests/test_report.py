@@ -339,3 +339,90 @@ def test_a_dense_reading_its_input_transposed_is_rated_by_its_reduction(tmp_path
     )
     ctx = lower(model, tmp_path, part='xc2ve3858-ssva2112-2MP-e-S')
     assert serialize_logical_node(ctx.ir.execution.get('fc_aie').node)['macs'] == 16 * 8 * 4
+
+
+def test_the_timeline_follows_the_first_sample_through_each_op(tmp_path):
+    """From aiesim's event trace: each op's first call after the first input beat -- its first port access to its last
+    before the core's main loop acquires again -- over its tiles, how long it waited once its producer finished, and
+    over what. A port access is one aiesim labels with its port or one to a buffer port's memory. A tile whose main
+    loop the trace never shows repeating bounds no call, and its op is left out. The latency splits along the chain to
+    the op finishing last, and the drain after it to the output."""
+    from aie4ml.report import _timeline, _traced_split
+
+    def acquire(t, col, row):
+        if col == 6:  # AIE1 names its acquires by direction
+            return f'time={t},event=ACQ_READ_LOCK_REQ,col={col},row={row},lockid=0,dir=W,pc=506,info=_main+196'
+        return f'time={t},event=ACQUIRED_LOCK_REQ,col={col},row={row},busy_out=0,lockid=1,dir=W,pc=388,info=_main+160'
+
+    def port(t, col, row, kind='READ', p='in[0]'):
+        return f'time={t},event=CORE_{kind}_REQ,col={col},row={row},pc=456,info=NA.0.kk[0],data_port={p},bank=even'
+
+    def buffer(t, col, row, kind='READ'):  # a port access aiesim leaves unlabelled, known by its buffer's name
+        return f'time={t},event=CORE_{kind}_REQ,col={col},row={row},pc=456,data_port=NA,addrinfo=buf3d+32,bank=odd'
+
+    (tmp_path / 'trdata.aiesim').mkdir()
+    (tmp_path / 'trdata.aiesim' / 'events.txt').write_text(
+        '\n'.join(
+            [
+                'time=800,event=SIMULATION_START',
+                acquire(900, 4, 0),
+                port(950, 4, 0),  # before the first beat: not sample 0
+                'time=1000,event=PL_TO_SHIM,col=4,shim_row=0,channelId=0',
+                acquire(1500, 4, 0),
+                acquire(1600, 4, 1),
+                port(2000, 4, 0),
+                buffer(2800, 4, 1),
+                'time=3000,event=CORE_CASCADE_OUTSTREAM,col=4,row=0,pc=470',
+                buffer(4400, 4, 1, 'WRITE'),
+                'time=4750,event=CORE_WRITE_REQ,col=4,row=1,pc=460,data_port=NA,addrinfo=i0_w+0,bank=odd',  # no port
+                acquire(4800, 4, 0),  # its next call
+                acquire(4900, 4, 1),
+                port(5000, 4, 0),
+                acquire(5600, 6, 0),
+                port(6000, 6, 0),
+                port(7600, 6, 0, 'WRITE', 'out[0]'),
+                acquire(8000, 6, 0),
+                port(8400, 7, 0),  # c_aie: one acquire only, so no call is bounded
+                acquire(8800, 7, 0),
+            ]
+        )
+    )
+    doc = {
+        'physical': {
+            'placements': {
+                'a_aie': {'col': 4, 'row': 0, 'width': 1, 'height': 2},
+                'b_aie': {'col': 6, 'row': 0, 'width': 1, 'height': 1},
+                'c_aie': {'col': 7, 'row': 0, 'width': 1, 'height': 1},
+            },
+            'plan': {
+                'direct_edges': [{'source': 'b_aie.out1[0]', 'target': 'c_aie.in1[0]', 'realization': 'shared_memory'}],
+                'buffers': [
+                    {
+                        'writers': [{'source': 'ifm[0]', 'source_type': 'plio'}],
+                        'readers': [_reader('a_aie')],
+                    },
+                    {
+                        'writers': [{'source_type': 'op_impl', 'source_endpoint': {'op_impl': 'a_aie'}}],
+                        'readers': [_reader('b_aie')],
+                    },
+                ],
+            },
+        },
+        'execution': [
+            {'node': 'a_aie', 'inputs': [{'tensor': 'x'}], 'outputs': ['h']},
+            {'node': 'b_aie', 'inputs': [{'tensor': 'h'}], 'outputs': ['g']},
+            {'node': 'c_aie', 'inputs': [{'tensor': 'g'}], 'outputs': ['y']},
+        ],
+    }
+    timeline = _timeline(tmp_path, doc, 1.25)
+    assert timeline == [
+        {'op': 'a_aie', 'after': None, 'start_cc': 1, 'end_cc': 4, 'wait_cc': 1, 'via': 'PLIO, memtile'},
+        {'op': 'b_aie', 'after': 'a_aie', 'start_cc': 6, 'end_cc': 8, 'wait_cc': 2, 'via': 'memtile'},
+    ]
+    split = _traced_split(timeline, 10)
+    assert (split['compute_cc'], split['data_movement_cc'], split['drain_cc']) == (3 + 2, 10 - 5, 10 - 8)
+    assert _timeline(tmp_path, doc, None) == []  # no clock, no cycles
+
+
+def _reader(op: str) -> dict:
+    return {'target': f'{op}.in1[0]', 'target_type': 'op_impl', 'target_endpoint': {'op_impl': op}}

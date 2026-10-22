@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from .ir import get_backend_context
 from .ir.context import CONTEXT_ATTR, AIEBackendContext
@@ -48,13 +50,21 @@ class AIEModel:
         AIEProjectEmitter().emit(self.context)
         return self
 
-    def build(self, make_target: str = 'all', env=None, log_to_stdout: bool = True, jobs: Optional[int] = None) -> int:
+    def build(
+        self,
+        make_target: str = 'all',
+        env=None,
+        log_to_stdout: bool = True,
+        jobs: Optional[int] = None,
+        variables: Optional[Dict[str, str]] = None,
+    ) -> int:
         """Run a target of the generated Makefile, writing the project first if needed.
 
         make_target: 'all' compiles for the hardware target; others as in the Makefile ('x86com', ...).
         env: environment for make (default: this process's).
         log_to_stdout: stream the tools' output; otherwise it is captured into the log.
         jobs: kernels compiled in parallel (make -jN); default: the AIE compiler's, 8.
+        variables: make variables set on its command line, e.g. {'AIESIM_FLAGS': '--profile'}.
         """
         ctx = self.context
         output_dir = ctx.project_config.output_dir
@@ -62,6 +72,7 @@ class AIEModel:
             self.write()
 
         cmd = ['make', make_target] + ([f'-j{int(jobs)}'] if jobs else [])  # -jN: kernels compiled at once
+        cmd += [f'{name}={value}' for name, value in (variables or {}).items()]
         log.debug('Running %s in %s', ' '.join(cmd), output_dir)
 
         stdout = None if log_to_stdout else subprocess.PIPE
@@ -84,6 +95,7 @@ class AIEModel:
         quantize_in: bool = True,
         dequantize_out: bool = True,
         aie_profile: bool = True,
+        aie_trace: bool = False,
     ):
         """Simulate the compiled project on `X` and return its outputs.
 
@@ -91,12 +103,13 @@ class AIEModel:
         simulator: 'x86' (functional) or 'aie' (cycle-accurate aiesim).
         quantize_in / dequantize_out: convert inputs to and outputs from the ports' fixed-point types.
         aie_profile: aiesim with per-kernel profiling, for report(); slower.
+        aie_trace: aiesim with an event trace, for report()'s timeline of one sample; slower.
         """
         sim_key = simulator.lower()
         if sim_key == 'x86':
             make_target = 'x86sim'
         elif sim_key == 'aie':
-            make_target = 'profile' if aie_profile else 'aiesim'
+            make_target = 'aiesim'
         else:
             raise ValueError(f'Unknown simulator "{simulator}". Expected one of: x86, aie.')
 
@@ -104,8 +117,12 @@ class AIEModel:
         output_dir = ctx.project_config.output_dir
         layout = self.write_inputs(X, quantize_in=quantize_in)
 
+        variables = None
+        if sim_key == 'aie':
+            variables = {'AIESIM_FLAGS': ' '.join(['--profile'] * aie_profile + ['--online', '-text'] * aie_trace)}
+            shutil.rmtree(Path(output_dir) / 'trdata.aiesim', ignore_errors=True)  # no trace from an earlier run
         log.info('Running %s simulation using make %s', ctx.project_config.project_name, make_target)
-        self.build(make_target)
+        self.build(make_target, variables=variables)
         sim_out = collect_outputs(output_dir, sim_key, layout)
         final_out = dequantize_outputs(layout, sim_out) if dequantize_out else sim_out
 

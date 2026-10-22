@@ -9,10 +9,11 @@ tiers -- the report gathers whatever is present and says what is missing:
     make aiecom     Work/reports/*          tiles, program/stack/heap memory
     make aiesim     aiesimulator_output/    output interval, PLIO throughput
     make profile    profile_funct_*.txt     per-kernel cycles
+    aiesim --online -text   trdata.aiesim/events.txt   one sample's timeline
 
-`predict(simulator='aie')` runs `make profile`, so it covers all three tiers. Bare
-`make aiesim` (`predict(simulator='aie', aie_profile=False)`) does not profile -- that yields
-latency and throughput but no per-kernel breakdown, and needs `make profile` re-run for it.
+`predict(simulator='aie')` runs aiesim with profiling, so it covers the first three tiers. Without
+it (`aie_profile=False`) there is latency and throughput but no per-kernel breakdown;
+`aie_trace=True` adds the event trace, from which the timeline comes.
 
     from aie4ml.report import report        # notebook: report(model) or report(project_dir)
     aie4ml-report path/to/project-folder    # terminal
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .device_catalog import lookup_device
+from .report_layout import _KINDS, layout_from_pipeline
 from .simulation import read_aiesim_output
 
 # Itanium mangling prefixes each identifier with its length (_ZN12dense_singleI... ->
@@ -206,6 +208,111 @@ def measured_latency_cc(project: Path) -> Optional[int]:
     if not (starts and clock and first_beat is not None and complete is not None):
         return None
     return int(starts[-1]) + round((complete - first_beat) * clock)
+
+
+_EVENT_RE = re.compile(
+    r'time=(\d+),event=(PL_TO_SHIM|ACQ\w*_LOCK_REQ|CORE_READ_REQ|CORE_WRITE_REQ|CORE_CASCADE_\w+),'
+    r'col=(\d+),(?:shim_)?row=(\d+)(.*)'
+)
+# A kernel port access: aiesim labels some with their port, and names every buffer port's memory bufN.
+_PORT_RE = re.compile(r'data_port=(?:in|out)\[|addrinfo=buf\d+[a-z]*\+')
+_PC_RE = re.compile(r',pc=(\d+)')
+
+
+def _timeline(project: Path, doc: Dict[str, Any], clock: Optional[float]) -> List[Dict[str, Any]]:
+    """The first sample through each op, from aiesim's event trace: from the first read of a kernel port to its last
+    port or cascade access before the core's main loop next acquires a lock, over the op's tiles -- which also times a
+    kernel the compiler inlined into main -- and how long the op waited for its input once its producers had finished,
+    and how (the realizations report_layout draws; the graph input over PLIO). Empty without a trace; an op none of
+    whose tiles shows such a call is left out."""
+    path = project / 'trdata.aiesim' / 'events.txt'
+    placements = (doc.get('physical') or {}).get('placements') or {}
+    if not (path.exists() and clock and placements):
+        return []
+    owner = {
+        (p['col'] + dc, p['row'] + dr): op
+        for op, p in placements.items()
+        for dc in range(p['width'])
+        for dr in range(p['height'])
+    }
+    first_beat, events = None, {}  # events: tile -> [(time, is a port access, the acquire's pc or None)]
+    with path.open(errors='replace') as f:
+        for line in f:
+            m = _EVENT_RE.match(line)
+            if not m:
+                continue
+            t, kind, tile = int(m.group(1)), m.group(2), (int(m.group(3)), int(m.group(4)))
+            if kind == 'PL_TO_SHIM':
+                first_beat = t if first_beat is None else first_beat
+            elif tile in owner:
+                if kind.startswith('ACQ'):  # ACQUIRED_LOCK_REQ, or AIE1's ACQ_READ_ and ACQ_WRITE_LOCK_REQ
+                    pc = _PC_RE.search(m.group(5))
+                    events.setdefault(tile, []).append((t, False, pc and pc.group(1)))
+                elif kind.startswith('CORE_CASCADE') or _PORT_RE.search(m.group(5)):
+                    events.setdefault(tile, []).append((t, True, None))
+    if first_beat is None:
+        return []
+    spans: Dict[str, List[int]] = {}
+    for tile, tile_events in events.items():
+        loop = {pc for pc, n in Counter(pc for _, port, pc in tile_events if not port).items() if n > 1}
+        after = [e for e in tile_events if e[0] >= first_beat]
+        start = next((t for t, port, _ in after if port), None)
+        until = next((t for t, port, pc in after if start and t > start and pc in loop), None)
+        if start is None or until is None:  # no call, or none a main-loop lock bounds
+            continue
+        end = max(t for t, port, _ in after if port and t < until)
+        span = spans.setdefault(owner[tile], [start, end])
+        span[0], span[1] = min(span[0], start), max(span[1], end)
+    producer = {t: e['node'] for e in doc.get('execution', []) for t in e.get('outputs') or []}
+    reads = {
+        e['node']: {producer[i['tensor']] for i in e.get('inputs') or [] if i.get('tensor') in producer}
+        for e in doc.get('execution', [])
+    }
+    via: Dict[str, set] = {}
+    for c in layout_from_pipeline(doc)['connections']:
+        via.setdefault(c['target'], set()).add(_KINDS[c['kind']])
+    for e in doc.get('execution', []):
+        if any(i.get('tensor') not in producer for i in e.get('inputs') or []):  # it reads the graph input
+            via.setdefault(e['node'], set()).add('PLIO')
+    for b in ((doc.get('physical') or {}).get('plan') or {}).get('buffers', []):
+        if any(w.get('source_type') == 'plio' for w in b.get('writers', [])):
+            for r in b.get('readers', []):
+                via.setdefault(r['target'].split('.')[0], set()).add('memtile')
+    cc = lambda ps: round((ps - first_beat) * clock / 1000.0)  # noqa: E731 - ps after the first beat, in cycles
+    rows = []
+    for op, (start, end) in sorted(spans.items(), key=lambda item: item[1][0]):
+        after = max((p for p in reads.get(op, ()) if p in spans), key=lambda p: spans[p][1], default=None)
+        ready = spans[after][1] if after else first_beat
+        rows.append(
+            {
+                'op': op,
+                'after': after,
+                'start_cc': cc(start),
+                'end_cc': cc(end),
+                'wait_cc': cc(start) - cc(ready),
+                'via': ', '.join(sorted(via.get(op, ()))),
+            }
+        )
+    return rows
+
+
+def _traced_split(timeline: List[Dict[str, Any]], latency_cc: int) -> Dict[str, Any]:
+    """Latency as the traced chain to the op finishing last spent it: its ops' runs, and the rest moving data -- its
+    ops' waits and the drain from the last op's end to the output's."""
+    rows = {row['op']: row for row in timeline}
+    last = max(timeline, key=lambda row: row['end_cc'])
+    compute, at = 0, last
+    while at is not None:
+        compute += at['end_cc'] - at['start_cc']
+        at = rows.get(at['after'])
+    return {
+        'total_cc': latency_cc,
+        'compute_cc': compute,
+        'data_movement_cc': latency_cc - compute,
+        'data_movement_pct': round(100.0 * (latency_cc - compute) / latency_cc, 1),
+        'drain_cc': latency_cc - last['end_cc'],
+        'traced': True,
+    }
 
 
 def _first_beat_ns(path: Path) -> Optional[float]:
@@ -564,6 +671,7 @@ def report(model_or_path) -> 'Report':
         'bottleneck': _bottleneck(kernels),
         'memory': _memory(project),
         'optimizer': doc.get('optimizer') or None,
+        'timeline': _timeline(project, doc, clock),
     }
 
     interval = (latency or {}).get('global') or {}
@@ -600,6 +708,10 @@ def report(model_or_path) -> 'Report':
                 'data_movement_pct': round(100.0 * (first - critical['cycles']) / first, 1),
             }
 
+    first = (latency or {}).get('latency_cc')
+    if report['timeline'] and first:
+        report['latency_split'] = _traced_split(report['timeline'], first)
+
     missing = []
     if not kernels:
         missing.append("per-kernel cycles: run 'make profile' (plain 'make aiesim' does not profile)")
@@ -619,6 +731,10 @@ def report(model_or_path) -> 'Report':
             'latency: the aie simulation timed no input against the output (an event::start_profiling error in the '
             'log), or the project predates this aie4ml version'
         )
+    timed = {row['op'] for row in report['timeline']}
+    untimed = sorted(set((doc.get('physical') or {}).get('placements') or {}) - timed) if timed else []
+    if untimed:
+        missing.append(f'timeline of {", ".join(untimed)}: no call of their kernels that a main-loop lock bounds')
     report['missing'] = missing
     return Report(report)
 
@@ -661,7 +777,7 @@ def format_report(report: Dict[str, Any]) -> str:
     first_cc = (report.get('latency') or {}).get('latency_cc')
     critical = report.get('critical_path') or {}
     split = report.get('latency_split') or {}
-    if first_cc is not None or critical:
+    if first_cc is not None or critical or split:
         add('')
         add('Latency  (first input beat to output complete; excludes start-up and initial weight initialization)')
         if first_cc is not None:
@@ -672,7 +788,10 @@ def format_report(report: Dict[str, Any]) -> str:
         else:
             add('    latency               n/a   (not measured: see Not collected)')
         estimated = critical.get('estimated_stages', 0)
-        if critical:
+        if split.get('traced'):
+            estimated = 0
+            add(f'      compute      {split["compute_cc"]:12,d} cc  {ns(split["compute_cc"]):12,.1f} ns   traced chain')
+        elif critical:
             stages = f'{len(critical["chain"])} stages' + (f', {estimated} estimated' if estimated else '')
             add(
                 f'      compute      {approx(critical["cycles"], estimated, 12)} cc  '
@@ -686,6 +805,21 @@ def format_report(report: Dict[str, Any]) -> str:
                 f'      data move    {approx(split["data_movement_cc"], estimated, 12)} cc  '
                 f'{ns(split["data_movement_cc"]):12,.1f} ns   {split["data_movement_pct"]}% memtile/DMA/lock etc.'
             )
+
+    timeline = report.get('timeline') or []
+    if timeline:
+        add('')
+        add('Timeline  (sample 0, cycles from its first input beat; aiesim trace)')
+        add(f'    {"op":26s} {"start":>8s} {"end":>8s} {"ran":>8s}   waited for its input')
+        for row in timeline:
+            ran = row['end_cc'] - row['start_cc']
+            add(
+                f'    {row["op"]:26s} {row["start_cc"]:8,d} {row["end_cc"]:8,d} {ran:8,d}   '
+                f'{row["wait_cc"]:6,d} cc  {row["via"]}'
+            )
+        if first_cc is not None:
+            drain = split['drain_cc']
+            add(f'    {"output complete":26s} {"":8s} {first_cc:8,d} {"":8s}   {drain:6,d} cc  to the output')
 
     compute = report.get('compute') or {}
     if latency or compute:

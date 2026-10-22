@@ -139,3 +139,29 @@ def test_mlv2_four_row_blocks_match_onnx(tmp_path):
         iterations=2,
         per_iteration=True,
     )
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', PARTS.values(), ids=PARTS.keys())
+def test_the_trace_times_each_op_on_every_generation(tmp_path, part):
+    """aiesim's event trace, beside its profile, yields the first sample's timeline: each op after its producer, all
+    before the output."""
+    from aie4ml.frontends.onnx import from_onnx
+    from aie4ml.report import report
+
+    model = from_onnx(
+        _mlp(),
+        {'Part': part, 'AIEConfig': {'Iterations': 2}, 'LayerDirectives': SPLIT},
+        output_dir=tmp_path / 'proj',
+        project_name='proj',
+    )
+    model.build('all')
+    x = np.random.default_rng(1).integers(-128, 128, (2, 1, K)).astype(np.int8)
+    model.predict({'x_q': x}, simulator='aie', quantize_in=False, aie_trace=True)
+    assert list((tmp_path / 'proj' / 'aiesimulator_output').glob('profile_funct_*.txt'))
+    rep = report(tmp_path / 'proj')
+    timeline = {row['op']: row for row in rep['timeline']}
+    assert timeline, 'no timeline from the trace'
+    starts = [timeline[op]['start_cc'] for op in ('d0_aie', 'd1_aie', 'd2_aie') if op in timeline]
+    assert starts == sorted(starts) and all(row['wait_cc'] >= 0 for row in timeline.values())
+    assert max(row['end_cc'] for row in timeline.values()) <= rep['latency']['latency_cc']
