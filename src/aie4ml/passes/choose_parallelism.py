@@ -2,7 +2,8 @@
 graph at once (AIEConfig `Optimize`), before resolution.
 
 Resolution and the transport classifier stay the only judges of legality; user directives are constraints and are
-never rewritten -- the choice lives in `ctx.ir.optimizer`, which Resolve and placement read. Designs are ranked by
+never rewritten -- the choice is each node's schedule, which Resolve reads, and the design's placement, which
+placement lays out; `ctx.ir.optimizer` reports the search. Designs are ranked by
 the mode's ranking (`ranking.RANKING`) of an estimate of their interval (the slowest kernel or leg) and latency (the
 critical path), in cycles (`estimate`), their memory-tile legs, hand-overs a DMA copies, and tiles.
 
@@ -42,10 +43,16 @@ from ..op_impls.family_registry import get_family_resolver_registry
 from .base import AIEPass, run_aie_passes
 from .cpsat import cp_model
 from .estimate import kernel_cycles, leg_cycles
-from .legalize_layouts import convert_inputs
-from .placement import PlacementInfeasibleError, PlacementOutranked, instance_rect, pair_offsets, share_offsets
+from .placement import (
+    PlaceKernels,
+    PlacementInfeasibleError,
+    PlacementOutranked,
+    instance_rect,
+    pair_offsets,
+    share_offsets,
+)
 from .ranking import PLACED, RANKING, optimize_mode, rank, solve_ranked, to_beat
-from .resolve import logical_values, output_contracts, resolve_instance
+from .resolve import convert_inputs, logical_values, output_contracts, resolve_instance
 from .shared_buffer import static_problem
 from .transport.classify import classify_connection, direct_unit, gathers
 from .transport.collect import TransportCollector
@@ -292,7 +299,11 @@ class ChooseParallelism(AIEPass):
         if max_tiles < 1:
             raise ValueError(f'AIEConfig MaxTiles={max_tiles} must be positive.')
 
-        ctx.ir.optimizer = {}  # a previous run's choice must not steer this one
+        # a previous run's choice must not steer this one
+        ctx.ir.optimizer = {}
+        ctx.ir.physical.reset()
+        for node in ctx.ir.logical:
+            node.schedule = {}
         _refuse_unfused(ctx)
         print(
             f"[aie4ml] Searching for a '{mode}' design within {max_tiles} AIE tiles; this can take a minute...",
@@ -335,14 +346,13 @@ class ChooseParallelism(AIEPass):
             'designs_tried': shared.built,
             'proven': not doubts,
             'doubts': doubts,
-            **search.choices(design),
-            # The trial ranked the design's placement already: the placer, which consumes these, only lays it out.
-            'placement': {
-                name: {key: placed[key] for key in ('col', 'row')}
-                for name, placed in built.ir.physical.placements.items()
-            },
-            'estimate': built.ir.physical.estimate,
         }
+        schedule = search.schedule(design)
+        for node in ctx.ir.logical:
+            node.schedule = schedule.get(node.name, {})
+        # The trial ranked the design's placement already: placement only lays it out.
+        ctx.ir.physical.placements = built.ir.physical.placements
+        ctx.ir.physical.estimate = built.ir.physical.estimate
         log.info('choose_parallelism: %s', ctx.ir.optimizer)
         return True
 
@@ -1168,18 +1178,19 @@ class _Search:
             self.shared.doubts.append('a placement was not proven the best within AIEConfig PlacerTime')
         return placed
 
-    def choices(self, design: _Design) -> Dict[str, Dict[str, Any]]:
-        """Per directive the search chooses, what the design resolved each chosen layer under: its parallelism as
-        resolved, its microtiling and fallback kernel (`fallback_kernels`) as chosen."""
-        made: Dict[str, Dict[str, Any]] = {'parallelism': {}, 'microtiling': {}, 'kernel': {}}
+    def schedule(self, design: _Design) -> Dict[str, Dict[str, Any]]:
+        """Per layer it chose for, the directives the design resolved it under: its parallelism as resolved, its
+        microtiling and fallback kernel (`fallback_kernels`) as chosen."""
+        chosen: Dict[str, Dict[str, Any]] = {}
         for name, inst, option in design.chosen:
+            made = dict(_kernel(option))
             if name in self.choosing:
-                made['parallelism'][name] = asdict(inst.config.parallelism)
+                made['parallelism'] = asdict(inst.config.parallelism)
             if option and 'microtiling' in option:
-                made['microtiling'][name] = option['microtiling']
-            if _kernel(option):
-                made['kernel'][name] = _kernel(option)
-        return made
+                made['microtiling'] = option['microtiling']
+            if made:
+                chosen[name] = made
+        return chosen
 
     def _build(self, design: _Design, best: Optional[tuple] = None):
         """The rest of the pipeline run on a copy of the context with this design: the built copy, or the refusal --
@@ -1187,14 +1198,18 @@ class _Search:
         from ..pipeline import DEFAULT_PIPELINE
 
         trial = copy.deepcopy(self.ctx)
+        schedule = self.schedule(design)
+        for node in trial.ir.logical:
+            node.schedule = schedule.get(node.name, {})
         # the design's bound on what placement decides, which a placement reaching it is proven the best by
-        trial.ir.optimizer = {**self.choices(design), 'bound': {name: getattr(design, name) for name in PLACED}}
+        bound, beat = {name: getattr(design, name) for name in PLACED}, None
         if best is not None:  # what its placement must rank to beat the best, which spares ranking one that cannot
             order = RANKING[self.mode]
-            trial.ir.optimizer['beat'] = to_beat({name: getattr(design, name) for name, _ in order}, order, best)
+            beat = to_beat({name: getattr(design, name) for name, _ in order}, order, best)
         rest = DEFAULT_PIPELINE[DEFAULT_PIPELINE.index(ChooseParallelism) + 1 :]
+        passes = [PlaceKernels(bound=bound, beat=beat) if cls is PlaceKernels else cls() for cls in rest]
         try:
-            run_aie_passes(trial, [cls() for cls in rest])
+            run_aie_passes(trial, passes)
         except ConfigRefused as refusal:
             return refusal
         return trial

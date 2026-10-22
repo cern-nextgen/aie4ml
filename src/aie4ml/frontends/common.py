@@ -14,7 +14,7 @@ _DIRECTIVE_FIELDS = {
     'io_route': ('inputs', 'outputs'),
     'hccs': ('B', 'S', 'Dmax', 'param_sets', 'inv_shift', 'use_clb'),
 }
-DIRECTIVES = frozenset({*_DIRECTIVE_FIELDS, 'layout', 'ports', 'approximation'})
+DIRECTIVES = frozenset({*_DIRECTIVE_FIELDS, 'layout', 'ports', 'approximation', 'input_fold'})
 LAYER_NODE_SUFFIX = '_aie'  # a layer's node is `<layer>_aie`
 
 
@@ -84,6 +84,11 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
             )
         directives['ports'] = ports
 
+    if 'input_fold' in raw:
+        if not isinstance(raw['input_fold'], bool):
+            raise TypeError(f'{name}: input_fold must be True or False.')
+        directives['input_fold'] = raw['input_fold']
+
     if 'approximation' in raw:
         directives['approximation'] = str(raw['approximation'])
 
@@ -97,16 +102,15 @@ def design_directives(
     pipeline: Path, directives: Optional[Dict[str, Dict[str, Any]]] = None
 ) -> Dict[str, Dict[str, Any]]:
     """`directives` (LayerDirectives) with the design a lowering recorded in `pipeline`, its aie_pipeline.json,
-    pinned: each layer's parallelism and microtiling as the design search chose them, and its place. Lowering the
-    same model with them builds that design again; the kernels the compiler adds and the hand-overs it shares follow
-    from the layers pinned, and a fallback kernel (`fallback_kernels`), which no directive names, is chosen again
-    by the same criterion. A directive the record contradicts is refused."""
+    pinned: each layer's schedule and its place. Lowering the same model with them builds that design again; the
+    kernels the compiler adds and the hand-overs it shares follow from the layers pinned. A directive the record
+    contradicts is refused."""
     recorded = json.loads(Path(pipeline).read_text())
-    chosen, placed = recorded['optimizer'], recorded['physical']['placements']
+    placed = recorded['physical']['placements']
     merged = {layer: dict(given) for layer, given in (directives or {}).items()}
     for node in recorded['logical']:
         name = node['name']
-        design = {key: chosen[key][name] for key in ('parallelism', 'microtiling') if name in chosen[key]}
+        design = dict(node['schedule'])
         if name in placed:
             design['placement'] = {key: placed[name][key] for key in ('col', 'row')}
         if not design:

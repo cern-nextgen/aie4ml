@@ -124,7 +124,8 @@ def test_throughput_splits_the_busiest_layers_within_max_tiles(tmp_path, part):
     busiest = max(inst.variant.work(inst.node, inst.config) for inst in base.ir.execution)
     assert max(inst.variant.work(inst.node, inst.config) for inst in ctx.ir.execution) < busiest
     assert chosen['tiles'] == _placed_tiles(ctx) <= 8 and chosen['memtile_legs'] == 0
-    assert chosen['parallelism'] == {name: vars(p) for name, p in _splits(ctx).items()}
+    schedule = {node.name: node.schedule['parallelism'] for node in ctx.ir.logical if 'parallelism' in node.schedule}
+    assert schedule == {name: vars(p) for name, p in _splits(ctx).items()}
 
 
 @pytest.mark.parametrize('part', PARTS.values(), ids=PARTS.keys())
@@ -132,7 +133,7 @@ def test_a_frame_read_twice_is_placed_and_verified(tmp_path, part):
     """A branch keeps two readers of one frame in the search state at once; the design still places and verifies."""
     ctx = lower(_branch_model(), tmp_path, part=part, aie_config={'Optimize': 'throughput', 'MaxTiles': 6})
     assert ctx.ir.optimizer['tiles'] == _placed_tiles(ctx) <= 6
-    assert set(ctx.ir.optimizer['parallelism']) == {'c0_aie', 'c1_aie', 'c2_aie'}
+    assert {node.name for node in ctx.ir.logical if 'parallelism' in node.schedule} == {'c0_aie', 'c1_aie', 'c2_aie'}
 
 
 @pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
@@ -182,7 +183,8 @@ def test_user_parallelism_constrains_the_choice_and_a_short_budget_names_the_ref
     """A partial directive fixes what it names and leaves the rest to the search."""
     directives = {'c1': {'parallelism': {'cas_num': 2}}}
     ctx = lower(_wide_model(), tmp_path, directives, part=PART, aie_config={'Optimize': 'resource'})
-    assert ctx.ir.optimizer['parallelism']['c1_aie']['cas_num'] == _splits(ctx)['c1_aie'].cas_num == 2
+    chosen = {node.name: node.schedule for node in ctx.ir.logical}
+    assert chosen['c1_aie']['parallelism']['cas_num'] == _splits(ctx)['c1_aie'].cas_num == 2
     with pytest.raises(ConfigRefused, match=r'(?s)MaxTiles=3.*c2_aie: .*option\(s\) refused'):
         lower(_wide_model(), tmp_path / 'short', part=AIE1_PART, aie_config={'Optimize': 'resource', 'MaxTiles': 3})
 

@@ -22,7 +22,7 @@ class ClassifyTransportEntries(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        entries = ctx.ir.physical.plan['_memory_plan_state']['entries']
+        entries = ctx.ir.physical.entries
         execution = ctx.ir.execution
         collector = TransportCollector(execution)
         changed = False

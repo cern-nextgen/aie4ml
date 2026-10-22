@@ -22,7 +22,6 @@ class LegalizeMemtilePortLimits(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        state = ctx.ir.physical.plan['_memory_plan_state']
         execution = ctx.ir.execution
         max_in = int(ctx.device.max_mem_in_ports)
         max_out = int(ctx.device.max_mem_out_ports)
@@ -30,7 +29,7 @@ class LegalizeMemtilePortLimits(AIEPass):
         changed = False
         next_graph_input_port = 0
 
-        for entry in state['entries']:
+        for entry in ctx.ir.physical.entries:
             self._validate_classified_entry(entry)
             if entry.producer.node is None:
                 descriptors = graph_input_port_descs(entry, execution, next_graph_input_port)
@@ -54,7 +53,7 @@ class LegalizeMemtilePortLimits(AIEPass):
             changed = changed or len(units) > 1
             rewritten.extend(units)
 
-        state['entries'] = rewritten
+        ctx.ir.physical.entries = rewritten
         return changed
 
     @staticmethod

@@ -171,7 +171,7 @@ class PlacementInfeasibleError(ConfigRefused):
 
 class PlacementOutranked(ConfigRefused):
     """Raised when no placement ranks the design better than the one the search asks it to beat
-    (`ctx.ir.optimizer['beat']`, `ranking.to_beat`); `proven` False where the placer only found none in its time."""
+    (`PlaceKernels` beat, `ranking.to_beat`); `proven` False where the placer only found none in its time."""
 
     def __init__(self, message: str, proven: bool = True):
         super().__init__(message)
@@ -317,10 +317,9 @@ def _buffers(graph: GraphSpec, placed: Dict[str, Placed], shares) -> Dict[str, L
 
 
 def _transport_entries(ctx) -> list:
-    state = ctx.ir.physical.plan.get('_memory_plan_state')
-    if state is None:
+    if ctx.ir.physical.entries is None:
         raise RuntimeError('Placement requires collected transport entries.')
-    return state['entries']
+    return ctx.ir.physical.entries
 
 
 def _copy_cycles(ctx, entry, leg: Connection) -> Tuple[int, int]:
@@ -528,9 +527,9 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
 class PlaceKernels(AIEPass):
     """
     Graph-aware AIE kernel placement: the placement the constraint solver (`placement_solver`) ranks best by the
-    design's ranking (`ranking.RANKING`, AIEConfig Optimize), deciding which hand-overs are one shared buffer. A design
-    the search tries is ranked against its bound (`solve_placement`); the one it keeps, already ranked, is only laid
-    out (`tidy_placement`).
+    design's ranking (`ranking.RANKING`, AIEConfig Optimize), deciding which hand-overs are one shared buffer. A
+    placement the IR already holds, with its estimate, is only laid out (`tidy_placement`), as the design search leaves
+    the design it keeps.
 
     Parameters
     ----------
@@ -541,12 +540,23 @@ class PlaceKernels(AIEPass):
     mu:
         Row-bias weight in the layout:
           + mu * Σ(node.row)
+
+    bound, beat:
+        For a design the search tries: its bound on the placed criteria, which a placement reaching is proven the
+        best, and what the placement must rank to beat (`ranking.to_beat`).
     """
 
-    def __init__(self, lam: float = 1.0, mu: float = 0.05):
+    def __init__(
+        self,
+        lam: float = 1.0,
+        mu: float = 0.05,
+        bound: Optional[Dict[str, int]] = None,
+        beat: Optional[Tuple[tuple, bool]] = None,
+    ):
         self.name = 'place_kernels'
         self._lam = float(lam)
         self._mu = float(mu)
+        self._bound, self._beat = bound, beat
 
     def transform(self, model_or_ctx) -> bool:
         from .placement_solver import solve_placement, tidy_placement  # they build on this module's rules
@@ -567,20 +577,19 @@ class PlaceKernels(AIEPass):
         if not graph.specs:
             return False
 
-        # the design search's hand-off, which placement consumes: the IR keeps the placement it makes alone
-        time, searched = placer_time(ctx), ctx.ir.optimizer.pop('placement', None)
+        time, held = placer_time(ctx), ctx.ir.physical.placements
         first = int(device.preferred_column_start) - col_offset  # the layout packs from the PLIOs' columns
-        if searched is None:
-            floors, beat = ctx.ir.optimizer.pop('bound', None), ctx.ir.optimizer.pop('beat', None)
+        if not held:
             order = RANKING[optimize_mode(ctx)]
-            placed, shares, estimate = solve_placement(graph, W, H, time, order, first, floors, beat)
+            placed, shares, estimate = solve_placement(graph, W, H, time, order, first, self._bound, self._beat)
         else:
             start = {
                 name: Placed(name, int(at['col']) - col_offset, int(at['row']) - row_offset, graph.specs[name].rect)
-                for name, at in searched.items()
+                for name, at in held.items()
             }
-            estimate = ctx.ir.optimizer.pop('estimate')
-            placed, shares, estimate = tidy_placement(graph, W, H, self._lam, self._mu, first, time, start, estimate)
+            placed, shares, estimate = tidy_placement(
+                graph, W, H, self._lam, self._mu, first, time, start, ctx.ir.physical.estimate
+            )
         buffers = _buffers(graph, placed, shares)
         placements = {
             name: {

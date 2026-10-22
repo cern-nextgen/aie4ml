@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
+
 from ..errors import ConfigRefused
 from ..ir import get_backend_context
 from ..ir.graph import (
@@ -7,6 +10,7 @@ from ..ir.graph import (
     ExecutionInstance,
     ExecutionValue,
     ExecutionView,
+    OpNode,
     TensorContract,
     ViewPart,
     input_role,
@@ -14,6 +18,8 @@ from ..ir.graph import (
 from ..op_impls.family_registry import get_family_resolver_registry
 from ..op_impls.utils.io import check_io_view, resolve_io_route, view_layout
 from .base import AIEPass
+
+log = logging.getLogger(__name__)
 
 
 def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
@@ -33,8 +39,8 @@ def output_contracts(inst: ExecutionInstance) -> dict[str, TensorContract]:
 
 
 def resolve_instance(node, device, input_contracts, choice=None) -> ExecutionInstance:
-    """The kernel graph that implements `node`, given the contracts its inputs arrive in and, when given, a design
-    search's choice of directives to resolve it under instead of its own. Pure: nothing is registered."""
+    """The kernel graph that implements `node`, given the contracts its inputs arrive in and, when given, directives
+    to resolve it under over its own (a schedule). Pure: nothing is registered."""
     directives = {**(node.directives or {}), **(choice or {})}
     directives['io_route'] = resolve_io_route(node)  # user intents
 
@@ -160,15 +166,66 @@ def logical_values(logical) -> dict[str, ExecutionValue]:
     return values
 
 
+def convert_inputs(inst: ExecutionInstance, sources, device) -> list[ExecutionInstance]:
+    """The converter kernels `inst` asks for, then `inst` reading their outputs instead; `sources` are the values it
+    reads. Pure: `inst` is left as it is, so the parallelism search builds the same kernels this pass inserts."""
+    kernels = []
+    for conversion in inst.variant.input_conversions(inst.node, inst.config, sources):
+        source = inst.input(conversion.source)
+        variant, config = conversion.variant, conversion.config
+        # The converter implements no logical op: its node only names it.
+        node = OpNode(name=conversion.name, op_type=variant.op_type)
+        variant.validate_config(node, config, device)
+        routes = inst.io_route.get('inputs', {})
+        view = inst.port_views[conversion.source]
+        ports = variant.build_ports(node, config)
+        kernels.append(
+            ExecutionInstance(
+                node=node,
+                variant=variant,
+                ports=ports,
+                io_route={
+                    'inputs': {conversion.source: routes.get(conversion.source, 'auto')},
+                    'outputs': {conversion.target: 'direct'},
+                },
+                port_views={conversion.source: conversion.source_view, conversion.target: view},
+                config=config,
+                staging=port_staging(node, variant, config, ports),
+                inputs=(source,),
+                outputs=(conversion.target,),
+            )
+        )
+        # The op now reads the converted value, straight from the converter.
+        inst = replace(
+            inst,
+            inputs=tuple(
+                ExecutionInput(conversion.target, item.role, shared_memory=conversion.shared_memory)
+                if item.tensor == conversion.source
+                else item
+                for item in inst.inputs
+            ),
+            io_route={
+                **inst.io_route,
+                'inputs': {**{k: v for k, v in routes.items() if k != conversion.source}, conversion.target: 'direct'},
+            },
+            port_views={
+                **{k: v for k, v in inst.port_views.items() if k != conversion.source},
+                conversion.target: view,
+            },
+        )
+    return kernels + [inst]
+
+
 class Resolve(AIEPass):
-    """Resolve logical nodes into family-owned execution instances."""
+    """Lower each logical node, in graph order, to the execution instance its family resolves, preceded by the
+    converter kernels it asks for (`convert_inputs`): the execution graph it leaves is complete. The logical graph
+    is left untouched."""
 
     def __init__(self):
         self.name = 'resolve'
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        ctx.ir.logical.verify()
         ctx.ir.execution.clear()
         execution = ctx.ir.execution
         # Producer before consumer (the logical order), so each node reads its inputs' published contracts.
@@ -178,14 +235,7 @@ class Resolve(AIEPass):
             inputs = {
                 t.name: execution.tensor_contracts[t.name] for t in node.inputs if t.name in execution.tensor_contracts
             }
-            # the design search's choices where it made them; otherwise the node's own directives
-            choice = {
-                key: chosen[node.name]
-                for key in ('parallelism', 'microtiling')
-                if node.name in (chosen := ctx.ir.optimizer.get(key, {}))
-            }
-            choice.update(ctx.ir.optimizer.get('kernel', {}).get(node.name, {}))
-            inst = resolve_instance(node, ctx.device, inputs, choice)
+            inst = resolve_instance(node, ctx.device, inputs, node.schedule)
             execution.add(inst)
             execution.tensor_contracts.update(output_contracts(inst))
 
@@ -195,4 +245,21 @@ class Resolve(AIEPass):
         execution.values = {}
         for value in logical_values(ctx.ir.logical).values():
             execution.add_value(value)
+
+        for inst in list(execution):
+            *converters, reader = convert_inputs(
+                inst, {item.tensor: execution.values[item.tensor] for item in inst.inputs}, ctx.device
+            )
+            for converter in converters:
+                execution.insert_before(inst.name, converter)
+                execution.add_value(ExecutionValue(converter.outputs[0], producer=converter.name))
+                execution.tensor_contracts.update(output_contracts(converter))
+                log.info(
+                    '%s: reads %s through %s, a kernel on a tile of its own',
+                    inst.name,
+                    converter.inputs[0].tensor,
+                    converter.name,
+                )
+            if converters:
+                execution.instances[inst.name] = reader
         return True

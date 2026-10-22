@@ -41,6 +41,7 @@ def serialize_logical_node(node: OpNode) -> Dict[str, Any]:
         'outputs': [t.name for t in node.outputs],
         'traits': {name: to_plain(trait.data) for name, trait in node.traits.items()},
         'metadata': dict(node.metadata),
+        'schedule': to_plain(node.schedule),
         'macs': family.macs(node) if family is not None else 0,
     }
 

@@ -69,6 +69,8 @@ class OpNode:
     traits: Dict[str, TraitInstance] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     directives: Dict[str, Any] = field(default_factory=dict)
+    # directives a design search chose for it, in the same vocabulary, resolved over its own
+    schedule: Dict[str, Any] = field(default_factory=dict)
     roles: Dict[str, str] = field(default_factory=dict)
 
     @property
@@ -548,11 +550,15 @@ class PhysicalIR:
     # placement's estimate of the placed design (`placement_solver`): latency, interval and copies in cycles and
     # hand-overs, and whether its solves proved them the best of its placements
     estimate: Dict[str, Any] = field(default_factory=dict)
+    # the transport entries the memory passes collect, legalize and materialize into `plan` (passes/transport); None
+    # until collected
+    entries: Optional[List[Any]] = None
 
     def reset(self) -> None:
         self.placements.clear()
         self.plan.clear()
         self.estimate.clear()
+        self.entries = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -569,7 +575,11 @@ class AIEPipelineIR:
     logical: LogicalIR = field(default_factory=LogicalIR)
     execution: ExecutionIR = field(default_factory=ExecutionIR)
     physical: PhysicalIR = field(default_factory=PhysicalIR)
-    optimizer: Dict[str, Any] = field(default_factory=dict)  # the design search's choice, when it ran
+    optimizer: Dict[str, Any] = field(default_factory=dict)  # the design search's report, when it ran
+
+    def verify(self) -> None:
+        self.logical.verify()
+        self.execution.verify()
 
     def reset(self) -> None:
         self.logical = LogicalIR()

@@ -191,13 +191,15 @@ class AIEBackendContext:
 
     def configuration_fingerprint(self) -> str:
         """A hash of what a project is generated from: the device, the AIE configuration, every node's directives
-        and the design search's choice. Not of the whole project: the model's graph is fixed at conversion."""
+        and schedule, and the design search's report. Not of the whole project: the model's graph is fixed at
+        conversion."""
         return hashlib.sha256(
             json.dumps(
                 {
                     'device': [self.device.platform, self.device.part],
                     'aie_config': self.aie_config,
                     'directives': {node.name: node.directives for node in self.ir.logical},
+                    'schedule': {node.name: node.schedule for node in self.ir.logical},
                     'optimizer': self.ir.optimizer,
                 },
                 sort_keys=True,

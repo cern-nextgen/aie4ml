@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from ..ir import get_backend_context
 from ..ir.context import AIEBackendContext
 
 
@@ -26,8 +27,15 @@ class AIEPass:
         raise NotImplementedError
 
 
+def run_pass(p: AIEPass, model_or_ctx) -> bool:
+    """Run one pass, then verify every level of the IR it leaves."""
+    changed = p.transform(model_or_ctx)
+    get_backend_context(model_or_ctx).ir.verify()
+    return changed
+
+
 def run_aie_passes(ctx: AIEBackendContext, passes: Iterable[AIEPass]) -> None:
     """Run a sequence of AIE passes once in the declared pipeline order."""
     ctx.ir.logical.verify()
     for p in passes:
-        p.transform(ctx)
+        run_pass(p, ctx)

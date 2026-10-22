@@ -169,8 +169,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         return _core_microtile(select_generation_key(device.generation), max(lhs_width, out_width)) is not None
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> Conv2dConfig:
-        """A conv folds its input where it can and its folded frame fits a bank (`_fold_unit`), unless a design search
-        falls back on reading it as it is (`input_fold`, internal: see `fallback_kernels`)."""
+        """A conv folds its input where it can and its folded frame fits a bank (`_fold_unit`), unless `input_fold`
+        is False, as a design search falling back on reading it as it is (`fallback_kernels`) or a user sets."""
         config = self._resolve(node, device, directives, input_contracts, fold=directives.get('input_fold', True))
         lhs = input_tensor_for_role(node, 'lhs')
         if config.input_fold is not None and int(np.prod(config.io_views[lhs.name].tile)) > int(device.bank_mem_bytes):

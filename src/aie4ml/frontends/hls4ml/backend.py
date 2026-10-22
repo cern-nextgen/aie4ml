@@ -17,6 +17,7 @@ from hls4ml.writer import get_writer
 from ...device_catalog import PART_HELP, known_boards, lookup_device
 from ...ir import get_backend_context
 from ...model import AIEModel
+from ...passes.base import run_pass
 from ...system_plan import normalize_pl_config
 
 log = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ def _make_hls4ml_pass(aie_pass_instance):
             self.name = aie_pass_instance.name
 
         def transform(self, model):
-            return self._aie.transform(model)
+            return run_pass(self._aie, model)
 
     _Wrapper.__name__ = type(aie_pass_instance).__name__
     return _Wrapper

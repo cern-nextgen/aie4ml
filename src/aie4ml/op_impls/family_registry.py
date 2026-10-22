@@ -66,7 +66,7 @@ class FamilyResolver(ABC):
     def fallback_kernels(self, _node: Any, _device: Any) -> Tuple[Dict[str, Any], ...]:
         """Directives resolving the node with a kernel its resolution prefers not to, which takes fewer tiles: a
         design search falls back on it where the preferred kernel's design does not fit the budget, or, optimizing
-        speed, is slower. Internal: no user sets them."""
+        speed, is slower."""
         return ()
 
     def macs(self, _node: Any) -> int:

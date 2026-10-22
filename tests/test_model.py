@@ -59,7 +59,6 @@ def test_a_recorded_design_is_built_again_without_a_search(tmp_path):
     replayed = tmp_path / 'again' / 'aie_pipeline.json'
     first, second = (json.loads(path.read_text())['physical'] for path in (recorded, replayed))
     assert 'second_aie_retile' in first['placements'] and first['placements'] == second['placements']
-    assert not {'placement', 'estimate'} & set(json.loads(recorded.read_text())['optimizer'])  # placement consumed them
     assert first['plan']['direct_edges'] == second['plan']['direct_edges']
     assert again.context.ir.optimizer['designs_tried'] == 1
     with pytest.raises(ValueError, match='contradicts the recorded design'):
@@ -68,18 +67,19 @@ def test_a_recorded_design_is_built_again_without_a_search(tmp_path):
 
 def test_a_recorded_fallback_kernel_is_built_again(tmp_path):
     """A design the search built with a fallback kernel (`fallback_kernels`), pinned from its record, takes that
-    kernel again at the same places: no directive names it, the search chooses it by the same criterion."""
+    kernel again at the same places: its schedule names it as a directive."""
     config = {'Part': PART, 'AIEConfig': {'Iterations': 1, 'MaxTiles': 1}}
     model = _strided_model(stride=1, k=3, channels_in=2, channels_out=8, size=12, pad=1)
     first = from_onnx(model, config, output_dir=tmp_path / 'first', project_name='proj')
     first.write()
     recorded = tmp_path / 'first' / 'aie_pipeline.json'
-    assert first.context.ir.optimizer['kernel'] == {'b_aie': {'input_fold': False}}
+    assert {node.name: node.schedule for node in first.context.ir.logical}['b_aie']['input_fold'] is False
     pinned = {**config, 'LayerDirectives': design_directives(recorded)}
-    assert 'input_fold' not in pinned['LayerDirectives']['b']
+    assert pinned['LayerDirectives']['b']['input_fold'] is False
     again = from_onnx(model, pinned, output_dir=tmp_path / 'again', project_name='proj')
     again.write()
-    assert again.context.ir.optimizer['kernel'] == first.context.ir.optimizer['kernel']
+    assert [inst.name for inst in again.context.ir.execution] == [inst.name for inst in first.context.ir.execution]
+    assert again.context.ir.execution.instances['b_aie'].config.input_fold is None
     replayed = tmp_path / 'again' / 'aie_pipeline.json'
     first_plan, second_plan = (json.loads(path.read_text())['physical'] for path in (recorded, replayed))
     assert first_plan['placements'] == second_plan['placements']

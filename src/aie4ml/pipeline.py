@@ -12,7 +12,6 @@ from .passes import (
     ForceFloatMode,
     FuseOps,
     LegalizeFanoutEntries,
-    LegalizeLayouts,
     LegalizeMemtilePortLimits,
     MaterializeMemoryPlan,
     PackKernelArtifacts,
@@ -30,7 +29,6 @@ HLS4ML_FLOW_SPEC = (
     ('fold_views', FoldViewOps),
     ('choose_parallelism', ChooseParallelism),  # AIEConfig Optimize
     ('resolve', Resolve),
-    ('legalize_layouts', LegalizeLayouts),
     ('pack', PackKernelArtifacts),
     ('memory_collect', CollectMemoryEntries),
     ('fanout_legalize', LegalizeFanoutEntries),

@@ -9,7 +9,6 @@ from .fold_scale import FoldScale
 from .fold_views import FoldViewOps
 from .force_float_mode import ForceFloatMode
 from .fuse_ops import FuseOps
-from .legalize_layouts import LegalizeLayouts
 from .pack import PackKernelArtifacts
 from .placement import PlaceKernels
 from .resolve import Resolve
@@ -34,7 +33,6 @@ __all__ = [
     'FoldViewOps',
     'CompactBufferRank',
     'LegalizeFanoutEntries',
-    'LegalizeLayouts',
     'LegalizeMemtilePortLimits',
     'Resolve',
     'VerifyPhysicalPlan',

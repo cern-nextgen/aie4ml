@@ -12,8 +12,7 @@ class LegalizeFanoutEntries(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        state = ctx.ir.physical.plan['_memory_plan_state']
-        entries = state['entries']
+        entries = ctx.ir.physical.entries
 
         changed = False
         rewritten = []
@@ -46,9 +45,9 @@ class LegalizeFanoutEntries(AIEPass):
                     )
                 rewritten.append(replica)
 
-        state['entries'] = rewritten
+        ctx.ir.physical.entries = rewritten
 
-        for entry in state['entries']:
+        for entry in rewritten:
             if len(entry.consumers) > 1:
                 raise RuntimeError(
                     f'{entry.logical_tensor}: unsupported split transport; '

@@ -32,10 +32,8 @@ class CollectMemoryEntries(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        ctx.ir.execution.verify()
-        ctx.ir.physical.reset()
-        state = _MemoryPlanMaterializer(ctx).collect()
-        ctx.ir.physical.plan = {'_memory_plan_state': state}
+        ctx.ir.physical.plan = {}
+        ctx.ir.physical.entries = TransportCollector(ctx.ir.execution).collect()
         return True
 
 
@@ -46,8 +44,7 @@ class MaterializeMemoryPlan(AIEPass):
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         planner = _MemoryPlanMaterializer(ctx)
-        state = ctx.ir.physical.plan['_memory_plan_state']
-        ctx.ir.physical.plan = planner.materialize(state)
+        ctx.ir.physical.plan = planner.materialize(ctx.ir.physical.entries)
         return True
 
 
@@ -67,26 +64,19 @@ class _MemoryPlanMaterializer:
         self._max_graph_input_port = -1
         self._buffer_seq: Dict[str, int] = {}
 
-    def collect(self):
-        self.layer_indices = {inst.name: idx for idx, inst in enumerate(self.ctx.ir.execution, start=1)}
-        return {
-            'layer_indices': dict(self.layer_indices),
-            'entries': TransportCollector(self.ctx.ir.execution).collect(),
-        }
-
-    def materialize(self, state):
+    def materialize(self, entries):
         self.buffers = []
         self.direct_edges = []
         self.merges = []
         self.io_ports = []
         self.kernel_read_accesses = []
         self.kernel_write_accesses = []
-        self.layer_indices = dict(state['layer_indices'])
+        self.layer_indices = {inst.name: idx for idx, inst in enumerate(self.ctx.ir.execution, start=1)}
         self._next_graph_output_port = 0
         self._max_graph_input_port = -1
         self._buffer_seq = {}
 
-        for entry in state['entries']:
+        for entry in entries:
             self._materialize_entry(entry)
 
         return {

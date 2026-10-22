@@ -115,6 +115,7 @@ the same model with them builds that design again, place for place.
   The horizontal stride goes with it (a power of two up to 8 over the padded channels: 2 for 3 or 4 channels), so it
   needs no retiler. It costs one extra tile and one pipeline stage of latency. Where one tile's folded frame outgrows
   a memory bank, the conv reads its input unfolded: on AIE1, a 16×16 image of 3 channels folds once split into rows.
+  `input_fold: False` reads it unfolded anyway, as the design search does where the extra tile does not pay.
 - **Graph boundary**: a buffer port carries one 8-channel block, so an input or output with more channels at the
   boundary needs a matching `cas_length` or `cas_num`, or stream ports.
 - **Streams** (`ports: 'stream'`): one tile, int8, stride 1, no pool or flatten. They let a frame of several channel

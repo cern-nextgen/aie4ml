@@ -73,7 +73,7 @@ def extract_layer_directives(layer, model) -> Dict[str, Any]:
     """Compiler directives for one layer from the hls4ml config; flat keys win over the nested dicts."""
     cfg = model.config.get_layer_config_value
     raw: Dict[str, Any] = {}
-    for key in ('placement', 'microtiling', 'parallelism', 'io_route', 'layout', 'ports'):
+    for key in ('placement', 'microtiling', 'parallelism', 'io_route', 'layout', 'ports', 'input_fold'):
         value = cfg(layer, key)
         if value is not None:
             raw[key] = value
