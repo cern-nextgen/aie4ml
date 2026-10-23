@@ -12,6 +12,9 @@ import re
 
 import numpy as np
 import pytest
+from aie4ml.errors import ConfigRefused
+from aie4ml.serialization import serialize_logical_node
+from aie4ml.writer import kernel_config
 from helpers import (
     PART,
     TensorProto,
@@ -27,10 +30,6 @@ from helpers import (
     qdq,
     qparams,
 )
-
-from aie4ml.errors import ConfigRefused
-from aie4ml.serialization import serialize_logical_node
-from aie4ml.writer import kernel_config
 
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
 MLV2_PART = 'xc2ve3858-ssva2112-2MP-e-S'

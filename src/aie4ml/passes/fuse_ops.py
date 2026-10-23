@@ -25,8 +25,8 @@ def _row_permutation(shape, axis_order):
 
 class FuseOps(AIEPass):
     """Fuse each op into the op producing its input, where that op's family fuses it: a ReLU (the fused_activation
-    attribute), a pool (fused_pool) and a reshape the producer writes as a view (output_view); a linear activation, a cast,
-    goes.
+    attribute), a pool (fused_pool) and a reshape the producer writes as a view (output_view); a linear activation, a
+    cast, goes.
 
     One walk in graph order, so each producer is final by the time its consumer is reached and a chain folds whole in
     any order: a ReLU, a pool, a ReLU, a flatten; or a reshape regrouping rows, then the pool over them. A ReLU nothing
