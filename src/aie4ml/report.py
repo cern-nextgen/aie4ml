@@ -211,9 +211,11 @@ def measured_latency_cc(project: Path) -> Optional[int]:
 
 
 _EVENT_RE = re.compile(
-    r'time=(\d+),event=(PL_TO_SHIM|ACQ\w*_LOCK_REQ|CORE_READ_REQ|CORE_WRITE_REQ|CORE_CASCADE_\w+),'
+    r'time=(\d+),event=(PL_TO_SHIM|DATA_START|ACQ\w*_LOCK_REQ|CORE_READ_REQ|CORE_WRITE_REQ|CORE_CASCADE_\w+),'
     r'col=(\d+),(?:shim_)?row=(\d+)(.*)'
 )
+# A stream from the PL entering a shim's switch: its first beat is the input's where aiesim logs no PL_TO_SHIM.
+_FROM_PL_RE = re.compile(r'name=\d+:S_SHIM_SOUTH_')
 # A kernel port access: aiesim labels some with their port, and names every buffer port's memory bufN.
 _PORT_RE = re.compile(r'data_port=(?:in|out)\[|addrinfo=buf\d+[a-z]*\+')
 _PC_RE = re.compile(r',pc=(\d+)')
@@ -224,7 +226,9 @@ def _timeline(project: Path, doc: Dict[str, Any], clock: Optional[float]) -> Lis
     port or cascade access before the core's main loop next acquires a lock, over the op's tiles -- which also times a
     kernel the compiler inlined into main -- and how long the op waited for its input once its producers had finished,
     and how (the realizations report_layout draws; the graph input over PLIO). Empty without a trace; an op none of
-    whose tiles shows such a call is left out."""
+    whose tiles shows such a call is left out. The first input beat is its crossing from the PL into a shim
+    (PL_TO_SHIM); on a trace aiesim logs none of, its entering the shim's switch from the PL side a few cycles on
+    (DATA_START on S_SHIM_SOUTH)."""
     path = project / 'trdata.aiesim' / 'events.txt'
     placements = (doc.get('physical') or {}).get('placements') or {}
     if not (path.exists() and clock and placements):
@@ -235,7 +239,7 @@ def _timeline(project: Path, doc: Dict[str, Any], clock: Optional[float]) -> Lis
         for dc in range(p['width'])
         for dr in range(p['height'])
     }
-    first_beat, events = None, {}  # events: tile -> [(time, is a port access, the acquire's pc or None)]
+    crossed, entered, events = None, None, {}  # events: tile -> [(time, is a port access, the acquire's pc or None)]
     with path.open(errors='replace') as f:
         for line in f:
             m = _EVENT_RE.match(line)
@@ -243,13 +247,17 @@ def _timeline(project: Path, doc: Dict[str, Any], clock: Optional[float]) -> Lis
                 continue
             t, kind, tile = int(m.group(1)), m.group(2), (int(m.group(3)), int(m.group(4)))
             if kind == 'PL_TO_SHIM':
-                first_beat = t if first_beat is None else first_beat
+                crossed = t if crossed is None else crossed
+            elif kind == 'DATA_START':
+                if entered is None and _FROM_PL_RE.search(m.group(5)):
+                    entered = t
             elif tile in owner:
                 if kind.startswith('ACQ'):  # ACQUIRED_LOCK_REQ, or AIE1's ACQ_READ_ and ACQ_WRITE_LOCK_REQ
                     pc = _PC_RE.search(m.group(5))
                     events.setdefault(tile, []).append((t, False, pc and pc.group(1)))
                 elif kind.startswith('CORE_CASCADE') or _PORT_RE.search(m.group(5)):
                     events.setdefault(tile, []).append((t, True, None))
+    first_beat = crossed if crossed is not None else entered
     if first_beat is None:
         return []
     spans: Dict[str, List[int]] = {}

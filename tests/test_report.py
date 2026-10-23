@@ -341,7 +341,20 @@ def test_a_dense_reading_its_input_transposed_is_rated_by_its_reduction(tmp_path
     assert serialize_logical_node(ctx.ir.execution.get('fc_aie').node)['macs'] == 16 * 8 * 4
 
 
-def test_the_timeline_follows_the_first_sample_through_each_op(tmp_path):
+# The first input beat: crossing from the PL into the shim; or, where aiesim logs no crossing, entering the shim's
+# switch from the PL side; where it logs both, the crossing, the entry a few cycles on.
+_FROM_PL = (
+    'event=DATA_START,col=4,shim_row=0,pkt_color=0,idx=1,net_list_size=1,name=00:S_SHIM_SOUTH_ch0_C4,net_id=net0:100'
+)
+_BEATS = {
+    'crossing': ['time=1000,event=PL_TO_SHIM,col=4,shim_row=0,channelId=0'],
+    'entry': [f'time=1000,{_FROM_PL}'],
+    'both': ['time=1000,event=PL_TO_SHIM,col=4,shim_row=0,channelId=0', f'time=1004,{_FROM_PL}'],
+}
+
+
+@pytest.mark.parametrize('beat', _BEATS.values(), ids=_BEATS.keys())
+def test_the_timeline_follows_the_first_sample_through_each_op(tmp_path, beat):
     """From aiesim's event trace: each op's first call after the first input beat -- its first port access to its last
     before the core's main loop acquires again -- over its tiles, how long it waited once its producer finished, and
     over what. A port access is one aiesim labels with its port or one to a buffer port's memory. A tile whose main
@@ -367,7 +380,7 @@ def test_the_timeline_follows_the_first_sample_through_each_op(tmp_path):
                 'time=800,event=SIMULATION_START',
                 acquire(900, 4, 0),
                 port(950, 4, 0),  # before the first beat: not sample 0
-                'time=1000,event=PL_TO_SHIM,col=4,shim_row=0,channelId=0',
+                *beat,
                 acquire(1500, 4, 0),
                 acquire(1600, 4, 1),
                 port(2000, 4, 0),
