@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import Sequence, Tuple
 
 from ...errors import ConfigRefused
@@ -34,6 +35,8 @@ class ClassifyTransportEntries(AIEPass):
                 ctx.device, tensor, collector.reads(tensor), execution.graph_outputs
             )
             decision = classify_connection(leg, ctx.ir.execution, ctx.device, merge=merge)
+            if entry.producer.node is None and decision.realization == 'direct':
+                _warn_inner_padding(leg, execution)
             changed = changed or entry.decision != decision
             entry.decision = decision
             kernels = entry.producer.node is not None and entry.consumers
@@ -115,7 +118,7 @@ def classify_connection(leg: Connection, execution, device, *, merge: bool) -> T
             realization = 'direct'
         elif route == 'memtile':
             realization = 'memtile'
-        else:  # a memory tile adds a stage and streams the padding it zero-fills; take it only where it must
+        else:  # a memory tile adds a stage; take it only where it must
             realization = 'direct' if _direct_boundary_failure(leg, execution, device) is None else 'memtile'
         return TransportDecision(realization, True if realization == 'direct' else None)
 
@@ -147,10 +150,8 @@ def classify_connection(leg: Connection, execution, device, *, merge: bool) -> T
 
 
 def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
-    """Why a PLIO cannot feed or drain this graph-boundary leg's kernel ports through the tile's own DMA, or None.
-    That DMA writes only the logical elements: padding rows may hold anything, since no row reads another, but an
-    input padded along its inner axis is summed across it, so only a memory tile, which zero-fills, may feed it.
-    Nor may one port's walk need more BDs than its tile has beside the kernel's other buffer ports there, each of
+    """Why a PLIO cannot feed or drain this graph-boundary leg's kernel ports through the tile's own DMA, or None:
+    one port's walk may not need more BDs than its tile has beside the kernel's other buffer ports there, each of
     which a DMA may feed wherever the kernel is placed."""
     output = leg.consumer is None
     endpoint = leg.producer if output else leg.consumer
@@ -164,9 +165,6 @@ def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
         staging = inst.staging[endpoint.tensor][port]
         if not output:
             staging = rebase_descriptor_offset(staging, endpoint.offset_base)
-            inner = staging.inner_dimension
-            if staging.io_tiling_dimension[inner] < staging.tile_shape[inner]:
-                return f'{endpoint.node.name}.{endpoint.group} pads its inner axis'
         try:
             access, _ = direct_boundary_access(
                 staging, staging.io_tiling_dimension, element_bits=element.width, output=output
@@ -182,6 +180,27 @@ def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
                 f'{neighbours} other buffer port(s), past a tile of {device.tile_dma.bds}'
             )
     return None
+
+
+def _warn_inner_padding(leg: Connection, execution) -> None:
+    """Warn where a graph input fed into its consumer's buffers is padded along its inner axis there: the tile DMA
+    writes only the input's elements, so the padding holds the zeros the compiler clears tile memory to at load
+    (aie_cdo_mem_clear), which AMD does not document."""
+    endpoint = leg.consumer
+    inst = execution.get(endpoint.node.name)
+    stagings = [
+        rebase_descriptor_offset(inst.staging[endpoint.tensor][port], endpoint.offset_base)
+        for port in endpoint.selected_ports(inst.ports.inputs[endpoint.tensor].count)
+    ]
+    inner = stagings[0].inner_dimension
+    if any(s.io_tiling_dimension[inner] < s.tile_shape[inner] for s in stagings):
+        extent = stagings[0].io_boundary_dimension[inner]
+        padded = max(s.logical_origin[inner] + s.tile_shape[inner] for s in stagings)
+        warnings.warn(
+            f'{leg.logical_tensor}: {endpoint.node.name} pads its inner axis of {extent} to {padded} in tile memory, '
+            f'relying on that memory being cleared at load; an inner axis of {padded} needs no padding.',
+            stacklevel=2,
+        )
 
 
 def _ports_beside(inst, group: str, port: int) -> int:

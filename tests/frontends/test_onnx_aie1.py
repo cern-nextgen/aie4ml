@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -764,17 +765,23 @@ def test_aie1_staging_mismatch_requires_an_explicit_relayout(tmp_path):
         )
 
 
-def test_memtile_device_takes_boundaries_direct_unless_an_input_needs_zero_padding(tmp_path):
-    """The tile's DMA moves only the logical rows; a memory tile would stream the padding rows it zero-fills. An
-    input padded along the axis it is summed over needs real zeros, which only a memory tile writes."""
-    plan = _run_pipeline(_dense_model(), tmp_path / 'rows', part='xilinx_vek280_base_202610_1').context.ir.physical.plan
+def test_memtile_device_takes_boundaries_direct_and_warns_of_inner_padding(tmp_path):
+    """The tile's DMA moves only the logical elements. An input padded along the axis it is summed over is read
+    with the zeros tile memory is cleared to at load, which the compiler warns of with the size that needs none."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        plan = _run_pipeline(
+            _dense_model(), tmp_path / 'rows', part='xilinx_vek280_base_202610_1'
+        ).context.ir.physical.plan
     assert plan['buffers'] == []
     assert [(port['direction'], port['port']) for port in plan['io_ports']] == [('input', 0), ('output', 0)]
+    assert not [w for w in caught if 'tile memory' in str(w.message)]
 
-    plan = _run_pipeline(
-        _dense_model(in_features=12), tmp_path / 'inner', part='xilinx_vek280_base_202610_1'
-    ).context.ir.physical.plan
-    assert [buffer['tensor'] for buffer in plan['buffers']] == ['x_q']
+    with pytest.warns(UserWarning, match=r'x_q: dense_aie pads its inner axis of 12 to 16 in tile memory'):
+        plan = _run_pipeline(
+            _dense_model(in_features=12), tmp_path / 'inner', part='xilinx_vek280_base_202610_1'
+        ).context.ir.physical.plan
+    assert plan['buffers'] == []
 
 
 def test_direct_padded_output_uses_dma_projection(tmp_path):
