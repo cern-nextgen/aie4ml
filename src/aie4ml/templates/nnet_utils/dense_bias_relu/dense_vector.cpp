@@ -5,7 +5,6 @@
 // microtile (a single sample), so no second row block of padding is computed or moved.
 
 #include "dense_vector.h"
-#include "dense_roles.h"
 using namespace adf;
 
 template<typename ConfigT>
@@ -74,8 +73,11 @@ vector_replicate_rows(const aie::vector<VT, N>& row) {
 }
 
 
+enum class dense_vector_in { bias, cascade };
+enum class dense_vector_out { store, cascade };
+
 // One row microtile by two column tiles a step, over the tile's K slice.
-template<typename ConfigT, dense_in IN, dense_out OUT>
+template<typename ConfigT, dense_vector_in IN, dense_vector_out OUT>
 static inline void dense_vector_tile(const typename ConfigT::data_t* pA, const typename ConfigT::weight_t* wts,
                                      const typename ConfigT::bias_t* pBias, typename ConfigT::result_t* pC,
                                      input_cascade<typename ConfigT::acc_scalar_t>* inCascade,
@@ -106,7 +108,7 @@ static inline void dense_vector_tile(const typename ConfigT::data_t* pA, const t
       const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       MMUL C00, C01;
-      if constexpr (IN == dense_in::cascade) {
+      if constexpr (IN == dense_vector_in::cascade) {
         C00 = MMUL(readincr_v<MMUL::size_C>(inCascade));
         C01 = MMUL(readincr_v<MMUL::size_C>(inCascade));
       }
@@ -122,12 +124,12 @@ static inline void dense_vector_tile(const typename ConfigT::data_t* pA, const t
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
       // The first K step starts the accumulators: on the bias, from zero, or on the cascade's partial sums.
-      if constexpr (IN == dense_in::bias && ConfigT::USE_BIAS) {
+      if constexpr (IN == dense_vector_in::bias && ConfigT::USE_BIAS) {
         auto bias_block_0 = vector_replicate_rows<M, bias_t, N>(aie::load_v<N>(pBias + j * N));
         auto bias_block_1 = vector_replicate_rows<M, bias_t, N>(aie::load_v<N>(pBias + (j + 1) * N));
         C00 = bias_block_0; C00.mac(A0, B0);
         C01 = bias_block_1; C01.mac(A0, B1);
-      } else if constexpr (IN == dense_in::bias) {
+      } else if constexpr (IN == dense_vector_in::bias) {
         C00.mul(A0, B0);
         C01.mul(A0, B1);
       } else {
@@ -151,7 +153,7 @@ static inline void dense_vector_tile(const typename ConfigT::data_t* pA, const t
         C01.mac(A0, B1);
       }
 
-      if constexpr (OUT == dense_out::cascade) {
+      if constexpr (OUT == dense_vector_out::cascade) {
         writeincr(outCascade, C00.to_accum());
         writeincr(outCascade, C01.to_accum());
       } else if constexpr (ConfigT::USE_RELU) {
@@ -172,7 +174,7 @@ void dense_vector_single<ConfigT>::run(input_buffer<data_t>& ifm,
                                 const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
                                 output_buffer<result_t>& ofm)
 {
-  dense_vector_tile<ConfigT, dense_in::bias, dense_out::store>(ifm.data(), wts, bias, ofm.data(), nullptr, nullptr);
+  dense_vector_tile<ConfigT, dense_vector_in::bias, dense_vector_out::store>(ifm.data(), wts, bias, ofm.data(), nullptr, nullptr);
 }
 
 template<typename ConfigT>
@@ -181,7 +183,7 @@ void dense_vector_first<ConfigT>::run(input_buffer<data_t>& ifm,
                                const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
                                output_cascade<acc_scalar_t>* outCascade)
 {
-  dense_vector_tile<ConfigT, dense_in::bias, dense_out::cascade>(ifm.data(), wts, bias, nullptr, nullptr, outCascade);
+  dense_vector_tile<ConfigT, dense_vector_in::bias, dense_vector_out::cascade>(ifm.data(), wts, bias, nullptr, nullptr, outCascade);
 }
 
 template<typename ConfigT>
@@ -190,7 +192,7 @@ void dense_vector_middle<ConfigT>::run(input_buffer<data_t>& ifm,
                                 input_cascade<acc_scalar_t>* inCascade,
                                 output_cascade<acc_scalar_t>* outCascade)
 {
-  dense_vector_tile<ConfigT, dense_in::cascade, dense_out::cascade>(ifm.data(), wts, nullptr, nullptr, inCascade,
+  dense_vector_tile<ConfigT, dense_vector_in::cascade, dense_vector_out::cascade>(ifm.data(), wts, nullptr, nullptr, inCascade,
                                                                     outCascade);
 }
 
@@ -200,6 +202,6 @@ void dense_vector_last<ConfigT>::run(input_buffer<data_t>& ifm,
                               input_cascade<acc_scalar_t>* inCascade,
                               output_buffer<result_t>& ofm)
 {
-  dense_vector_tile<ConfigT, dense_in::cascade, dense_out::store>(ifm.data(), wts, nullptr, ofm.data(), inCascade,
+  dense_vector_tile<ConfigT, dense_vector_in::cascade, dense_vector_out::store>(ifm.data(), wts, nullptr, ofm.data(), inCascade,
                                                                   nullptr);
 }

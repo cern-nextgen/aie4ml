@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dense_bias_relu.h"
-#include "dense_roles.h"
 using namespace adf;
 
 template<typename ConfigT>
@@ -63,6 +62,9 @@ replicate_rows(const aie::vector<VT, N>& row) {
   return row_replicator<M, VT, N>::run(row);
 }
 
+
+enum class dense_in { bias, cascade };
+enum class dense_out { store, cascade };
 
 // Two row microtiles by two column tiles a step, over the tile's K slice.
 template<typename ConfigT, dense_in IN, dense_out OUT>
