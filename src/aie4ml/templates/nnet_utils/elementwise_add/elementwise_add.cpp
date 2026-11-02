@@ -37,7 +37,11 @@ void elementwise_add_kernel<ConfigT>::run(
     if constexpr (ConfigT::TRANSPOSE_RHS)
       vb = aie::transpose(vb, MT_INNER, MT_OUTER);
     rhs_ptr += VEC;
-    auto acc = aie::add(aie::from_vector<acc_scalar_t>(va), vb);
+    aie::accum<acc_scalar_t, VEC> acc;
+    if constexpr (ConfigT::RHS_SHIFT == 0)  // the coarser operand shifted onto the finer one's fixed point
+      acc = aie::add(aie::from_vector<acc_scalar_t>(va, ConfigT::LHS_SHIFT), vb);
+    else
+      acc = aie::add(aie::from_vector<acc_scalar_t>(vb, ConfigT::RHS_SHIFT), va);
     auto sum = aie::to_vector<result_t>(acc, ConfigT::SHIFT);
     if constexpr (ConfigT::USE_RELU)
       sum = aie::max(sum, aie::zeros<result_t, VEC>());

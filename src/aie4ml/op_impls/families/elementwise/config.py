@@ -19,6 +19,8 @@ class AddConfig:
     parallelism: ParallelismConfig
     vec_size: int
     io_views: Dict[str, TensorView]
+    lhs_shift: int  # left shift aligning the coarser operand to the finer one's fixed point
+    rhs_shift: int
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]

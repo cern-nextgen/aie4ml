@@ -1,4 +1,5 @@
-"""QDQ patterns a PyTorch-style export puts a quantizer behind: a Dense's bias and ReLU, and a scale."""
+"""QDQ patterns a PyTorch-style export puts a quantizer behind: a Dense's bias and ReLU, a scale, and a residual sum
+of operands quantized apart."""
 
 from __future__ import annotations
 
@@ -21,8 +22,9 @@ ROWS, FEATURES = 16, 32
 
 
 def _model(softmax=False):
-    """x -> MatMul -> Add(bias) -> Relu -> Q (uint8), then -> MatMul -> Mul(1/8) -> Q, and optionally -> Softmax: each
-    quantizer sits after the ops it measures, so the frontend types the accumulators behind them."""
+    """x -> MatMul -> Add(bias) -> Relu -> Q (uint8), then -> MatMul -> Mul(1/8) -> Q, then -> Softmax or a residual
+    x + y (2^-5 + 2^-3 -> 2^-4): each quantizer sits after the ops it measures, so the frontend types the accumulators
+    behind them."""
     rng = np.random.default_rng(3)
     nodes: list = []
     dq(nodes, 'x_q', 'x', 'x')
@@ -45,6 +47,10 @@ def _model(softmax=False):
         nodes.append(helper.make_node('Softmax', ['y'], ['sm'], name='softmax', axis=-1))
         qdq(nodes, 'sm', 'p', 'p')
         out = 'p'
+    else:
+        nodes.append(helper.make_node('Add', ['x', 'y'], ['sum'], name='residual'))
+        qdq(nodes, 'sum', 'r', 'r')
+        out = 'r'
     return make_model(
         'qdq_patterns',
         nodes=nodes,
@@ -58,6 +64,7 @@ def _model(softmax=False):
             *qparams('h', frac=8, unsigned=True),
             *qparams('w2', frac=7),
             *qparams('y', frac=3),
+            *qparams('r', frac=4),
             numpy_helper.from_array(rng.integers(-64, 64, (FEATURES, FEATURES), dtype=np.int8), 'w1_q'),
             numpy_helper.from_array(rng.integers(-32, 32, FEATURES, dtype=np.int8), 'b1_q'),
             numpy_helper.from_array(rng.integers(-64, 64, (FEATURES, FEATURES), dtype=np.int8), 'w2_q'),
@@ -76,7 +83,12 @@ def test_quantizers_behind_a_bias_relu_and_scale_fold_into_the_dense_kernels(tmp
     assert 'output_scale' in fc2.node.attributes and 'input_scale' not in softmax.node.attributes
 
 
+def test_a_residual_aligns_its_operands_to_the_finer_fixed_point(tmp_path):
+    residual = lower(_model(), tmp_path, part=PART).ir.execution.get('residual_aie').config
+    assert (residual.lhs_shift, residual.rhs_shift, residual.shift) == (0, 2, 1)
+
+
 @pytest.mark.requires_vitis
-def test_quantizers_behind_a_bias_relu_and_scale_match_onnx(tmp_path):
+def test_quantizers_behind_a_bias_relu_scale_and_residual_match_onnx(tmp_path):
     feeds = {'x_q': np.random.default_rng(5).integers(-64, 64, size=(ROWS, FEATURES), dtype=np.int8)}
-    assert_x86_matches_onnx(_model(), feeds, {}, tmp_path, frac=3, max_code_diff=0, part=PART)
+    assert_x86_matches_onnx(_model(), feeds, {}, tmp_path, frac=4, max_code_diff=0, part=PART)

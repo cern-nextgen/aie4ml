@@ -29,7 +29,6 @@ from ...utils.io import view_perm, view_shape
 from ...utils.precision import (
     aie_rounding_token,
     infer_accumulator_tag,
-    resolve_accumulator_output_shift,
     resolve_exact_storage_dtype,
     storage_bytes_for_spec,
 )
@@ -184,18 +183,26 @@ class AddOpImplVariant(OpImplVariant):
             vec_size = int(microtile.outer) * int(microtile.inner)
 
         if is_float:
-            shift, accumulator_tag, rounding_mode = 0, 'accfloat', 'conv_even'
+            shifts, accumulator_tag, rounding_mode = (0, 0, 0), 'accfloat', 'conv_even'
         else:
-            shift = resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision)
+            # The coarser operand is aligned to the finer one's fixed point, where their sum is exact.
+            fracs = [int(precision[role].frac) for role in ('lhs', 'rhs', 'output')]
+            shifts = tuple(max(fracs[:2]) - frac for frac in fracs)
             accumulator_tag = infer_accumulator_tag(device, precision['lhs'], precision['rhs'])
             rounding_mode = aie_rounding_token(precision['output'])
+            if shifts[2] < 0:
+                raise ValueError(f'{node.name}: output frac {fracs[2]} is finer than both operands {fracs[:2]}.')
+            if max(shifts[:2]) > int(accumulator_tag[3:]) - int(precision['lhs'].width) - 1:
+                raise ValueError(f'{node.name}: aligning fixed points {fracs[:2]} overflows its {accumulator_tag}.')
 
         return AddConfig(
             precision=precision,
             parallelism=ParallelismConfig(cas_num=int(cas_num), contract=staging_contract),
             vec_size=vec_size,
             io_views=io_views,
-            shift=shift,
+            lhs_shift=shifts[0],
+            rhs_shift=shifts[1],
+            shift=shifts[2],
             accumulator_tag=accumulator_tag,
             rounding_mode=rounding_mode,
             alternating_horizontal=device.alternating_horizontal,

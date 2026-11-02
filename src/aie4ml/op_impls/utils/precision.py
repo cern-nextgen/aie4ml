@@ -121,18 +121,11 @@ def aie_rounding_token(source) -> str:
     return token
 
 
-def resolve_accumulator_output_shift(
-    lhs_precision: Any,
-    output_precision: Any,
-    rhs_precision: Any = None,
-) -> int:
-    """Right-shift from accumulator fixed-point to output fixed-point.
-
-    For matmul: acc_frac = lhs_frac + rhs_frac; for elementwise add: rhs_precision=None → rhs_frac=0.
-    """
+def resolve_accumulator_output_shift(lhs_precision: Any, output_precision: Any, rhs_precision: Any) -> int:
+    """Right-shift from a product's accumulator fixed-point (lhs_frac + rhs_frac) to output fixed-point."""
     lhs_frac = to_quant_intent(lhs_precision).frac
     out_frac = to_quant_intent(output_precision).frac
-    rhs_frac = to_quant_intent(rhs_precision).frac if rhs_precision is not None else 0
+    rhs_frac = to_quant_intent(rhs_precision).frac
     shift = int(lhs_frac + rhs_frac - out_frac)
     if shift < 0:
         raise ValueError(f'output frac {out_frac} exceeds the accumulator frac {lhs_frac + rhs_frac}: no left shift.')

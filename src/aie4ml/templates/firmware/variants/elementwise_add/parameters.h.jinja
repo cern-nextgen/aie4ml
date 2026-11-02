@@ -18,6 +18,7 @@ struct {{L.struct_name}} {
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
   static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
   static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
+  static constexpr int LHS_SHIFT = {{P.lhs_shift}}, RHS_SHIFT = {{P.rhs_shift}};
   static constexpr int SHIFT = {{P.shift}};
 {{ rounding(P.rounding_mode) }}
   static constexpr int col_placement = {{L.placement.col}};

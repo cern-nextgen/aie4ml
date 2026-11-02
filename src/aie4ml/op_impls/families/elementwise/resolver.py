@@ -29,5 +29,5 @@ class AddFamilyResolver(FamilyResolver):
         precision_lhs = resolve_exact_storage_dtype(lhs_tensor.precision, namespace='lhs', layer_name=node.name)
         precision_rhs = resolve_exact_storage_dtype(rhs_tensor.precision, namespace='rhs', layer_name=node.name)
         precision_out = resolve_exact_storage_dtype(node.outputs[0].precision, namespace='output', layer_name=node.name)
-        if precision_lhs != precision_rhs or precision_lhs != precision_out:
+        if not precision_lhs.format == precision_rhs.format == precision_out.format:
             raise ValueError(f'{node.name}: elementwise Add requires lhs/rhs/output to use the same storage type.')
