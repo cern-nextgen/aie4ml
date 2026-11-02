@@ -10,6 +10,7 @@ from .passes import (
     FoldScale,
     FoldViewOps,
     ForceFloatMode,
+    FuseAttention,
     FuseOps,
     LegalizeFanoutEntries,
     LegalizeMemtilePortLimits,
@@ -27,6 +28,7 @@ DEFAULT_PIPELINE = (
     FoldScale,
     FuseOps,
     FoldViewOps,
+    FuseAttention,
     ChooseParallelism,  # AIEConfig Optimize
     Resolve,
     PackKernelArtifacts,

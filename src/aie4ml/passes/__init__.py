@@ -8,6 +8,7 @@ from .fold_bias import FoldBias
 from .fold_scale import FoldScale
 from .fold_views import FoldViewOps
 from .force_float_mode import ForceFloatMode
+from .fuse_attention import FuseAttention
 from .fuse_ops import FuseOps
 from .pack import PackKernelArtifacts
 from .placement import PlaceKernels
@@ -25,6 +26,7 @@ __all__ = [
     'ChooseParallelism',
     'AIEPass',
     'run_aie_passes',
+    'FuseAttention',
     'FuseOps',
     'FoldApplyAlpha',
     'FoldBias',

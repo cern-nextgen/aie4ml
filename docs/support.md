@@ -147,6 +147,17 @@ of length `n`: `0 <= S, Dmax <= 127`, `S*Dmax <= B` (a zero floor is allowed), `
 `n*B <= 32767`. `use_clb: true` normalises by a power of two instead of an exact division, several times faster; use
 it when the model was trained that way. `inv_shift` (default 15) must be 14 or 15 with `use_clb` and uint8 output.
 
+## Attention
+
+A head's `Q·Kᵀ` (K read transposed) -> Softmax -> `·V` fuses into one op on AIE-ML and AIE-MLv2: int8 Q, K, V and
+logits, uint8 (Q8) probabilities, int8 out, up to 128 tokens, head dimension a multiple of 8. The Softmax's name and
+its `parallelism` direct it: `cas_num` splits the queries, `cas_length` 2 gives the values and the division a second
+tile. A Softmax with any other directive, or a directed matmul, keeps the three ops.
+
+It is not bit-exact with the QDQ graph: the graph rounds each normalised probability to uint8 before `·V`; the op
+keeps them unnormalised and divides each output once. An output can differ from the graph's by about a code;
+accuracy against float attention is the same, and it is much cheaper than rounding every probability exactly.
+
 ## Folded operators
 
 These never become kernels of their own:

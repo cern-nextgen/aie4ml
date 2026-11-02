@@ -1,0 +1,23 @@
+{% set P = L.op_impl.parameters %}
+{% from 'variants/placement.jinja' import buffer_locations %}
+struct {{L.struct_name}} {
+  static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
+  static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}};
+  static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};
+  static constexpr int HEAD_DIM = {{P.columns}};  // as stored: a padding Dense's zero columns included
+  static constexpr int QUERY_BLOCKS = {{P.query_blocks}};
+  static constexpr int KEY_BLOCKS = {{P.key_blocks}};
+  static constexpr int Q_ROWS = {{P.microtile_rows.q}}, K_ROWS = {{P.microtile_rows.k}}, V_ROWS = {{P.microtile_rows.v}}, O_ROWS = {{P.microtile_rows.output}};
+  static constexpr int SCORE_SHIFT = {{P.score_shift}};
+  static constexpr int OUT_SHIFT = {{P.out_shift}};
+  static constexpr int STACK_BYTES = {{P.stack_bytes}};
+  static constexpr int TABLE_SIZE = {{P.exp_table | length}};
+{{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
+{{ buffer_locations('IN2_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in2') | list) }}
+{{ buffer_locations('IN3_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in3') | list) }}
+{{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
+  inline static constexpr int16_t EXP_TABLE[TABLE_SIZE] = { {%- for v in P.exp_table -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
+  inline static constexpr int16_t RECIP_TABLE[TABLE_SIZE] = { {%- for v in P.recip_table -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
+  static constexpr int col_placement = {{L.placement.col}};
+  static constexpr int row_placement = {{L.placement.row}};
+};
