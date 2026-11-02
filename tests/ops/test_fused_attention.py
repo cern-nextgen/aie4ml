@@ -28,6 +28,7 @@ from aie4ml import from_onnx
 from aie4ml.errors import ConfigRefused
 from aie4ml.ir.graph import input_tensor_for_role
 from aie4ml.op_impls.families.attention.fused import RECIP_TABLE, THETA_SHIFT
+from aie4ml.passes.choose_parallelism import SearchLimit
 
 AIE_ML = 'xilinx_vek280_base_202610_1'
 AIE_MLV2 = 'xc2ve3858-ssva2112-2MP-e-S'
@@ -162,6 +163,12 @@ def test_a_lone_tile_past_a_bank_is_refused_and_a_pair_fits(tmp_path):
     with pytest.raises(ConfigRefused, match='B of buffers'):
         lower(_head(128, 64), tmp_path / 'one', {'attn': parallelism(8)}, part=AIE_ML)
     lower(_head(128, 64), tmp_path / 'two', {'attn': parallelism(8, cas_length=2)}, part=AIE_ML)
+
+
+def test_k_and_v_broadcast_to_more_than_four_common_chains_are_refused(tmp_path):
+    with pytest.raises(SearchLimit, match='common tiles'):
+        directives = {'q': parallelism(8, contract='outer'), 'k': parallelism(1), 'v': parallelism(1)}
+        lower(_head(64, 16), tmp_path, {**directives, 'attn': parallelism(8)}, part=AIE_ML)
 
 
 @pytest.mark.requires_vitis

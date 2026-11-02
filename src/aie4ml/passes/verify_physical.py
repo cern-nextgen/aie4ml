@@ -19,13 +19,16 @@ from ..op_impls.base import KERNEL_BANKS
 from ..op_impls.common_types import PORT_KIND_BUFFER
 from ..utils import sanitize_identifier
 from .base import AIEPass
-from .shared_buffer import SHARED_MEMORY, hand_over_problem, placed_buffers, placed_locations, reached
+from .shared_buffer import DMA, SHARED_MEMORY, hand_over_problem, placed_buffers, placed_locations, reached
 from .transport.dma_resources import KERNEL_BUFFERS, memtile_port_bds, pool_use, tile_port_bds
 from .transport.model import TransportUnit
 from .transport.routing import BELOW, port_tiles, route_overflow
 
 _PORT = re.compile(r'^(?P<graph>\w+)\.(?P<group>\w+)\[(?P<port>\d+)\]$')
 _PLIO = re.compile(r'^(ifm|ofm)\[\d+\]$')
+#: Two kernel outputs DMA-broadcast to more common tiles than this swap their data (AIE-ML aiesim, Vitis 2026.1.1;
+#: x86sim exact): a toolchain fault. Two PLIOs' or memory tiles' broadcasts to 8 common tiles deliver exactly.
+BROADCAST_COMMON_TILES = 4
 
 
 def _port(endpoint: str, graphs):
@@ -206,6 +209,29 @@ def verify_dma_resources(ctx) -> None:
             raise ConfigRefused(f'tile {owner}: its DMA needs {bds} BDs, beyond its {device.tile_dma.bds}.')
 
 
+def verify_broadcasts(ctx) -> None:
+    """No two kernel outputs DMA-broadcast to more than `BROADCAST_COMMON_TILES` common tiles."""
+    graphs = {sanitize_identifier(inst.name): inst for inst in ctx.ir.execution}
+    reached_by = defaultdict(set)
+    for edge in ctx.ir.physical.plan.get('direct_edges', ()):
+        if edge.get('realization') != DMA:  # a kernel output's DMA copy, not a PLIO's
+            continue
+        target = _PORT.match(edge['target'])
+        if target is None or target['graph'] not in graphs:
+            continue
+        inst, group, port = graphs[target['graph']], target['group'], int(target['port'])
+        reached_by[edge['source']] |= {(col, row) for col, row, _ in placed_locations(ctx, inst, group, port)}
+    sources = sorted(reached_by)
+    for i, first in enumerate(sources):
+        for second in sources[i + 1 :]:
+            common = reached_by[first] & reached_by[second]
+            if len(common) > BROADCAST_COMMON_TILES:
+                raise ConfigRefused(
+                    f'{first} and {second}: DMA broadcasts to {len(common)} common tiles, which the toolchain mixes up '
+                    f'beyond {BROADCAST_COMMON_TILES}.'
+                )
+
+
 def verify_tile_dma_channels(ctx, graphs, shared) -> None:
     """Every compute tile's DMA within its channels: each kernel buffer that is not shared memory takes an S2MM
     channel (input) or an MM2S channel (output) on the tile that holds it. The placer only reports an
@@ -290,5 +316,6 @@ class VerifyPhysicalPlan(AIEPass):
         verify_physical(ctx)
         verify_memory_banks(ctx)
         verify_dma_resources(ctx)
+        verify_broadcasts(ctx)
         verify_stream_routes(ctx)
         return False
