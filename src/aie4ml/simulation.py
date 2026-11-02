@@ -3,7 +3,7 @@
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -78,6 +78,7 @@ class IOPortLayout:
 class IOLayout:
     inputs: Dict[str, List[IOPortLayout]]
     outputs: Dict[str, List[IOPortLayout]]
+    host_shapes: Dict[str, Tuple[int, ...]] = field(default_factory=dict)  # LogicalIR.host_shapes
 
 
 def build_io_layout(model) -> IOLayout:
@@ -114,7 +115,7 @@ def build_io_layout(model) -> IOLayout:
     for t in outputs:
         outputs[t] = sorted(outputs[t], key=lambda p: p.port)
 
-    return IOLayout(inputs=inputs, outputs=outputs)
+    return IOLayout(inputs=inputs, outputs=outputs, host_shapes=dict(ctx.ir.logical.host_shapes))
 
 
 def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) -> Dict[str, np.ndarray]:
@@ -126,7 +127,7 @@ def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) 
 
     for tensor, ports in layout.inputs.items():
         p0 = ports[0]
-        expected = p0.numpy_boundary_shape
+        expected = tuple(layout.host_shapes.get(tensor, p0.numpy_boundary_shape))
         arr = np.asarray(X[tensor])
 
         if tuple(arr.shape) == expected:
@@ -143,6 +144,7 @@ def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) 
 
         if tuple(arr.shape[1:]) != expected:
             raise ValueError(f'{tensor}: expected input shape {expected}, got {tuple(arr.shape[1:])}')
+        arr = arr.reshape(arr.shape[0], *p0.numpy_boundary_shape)
 
         if _is_float_format(p0.dtype.format):
             prepared[tensor] = np.asarray(arr, dtype=np.float32)
@@ -203,7 +205,7 @@ def collect_outputs(output_dir: Path, sim_mode: str, layout: IOLayout) -> Dict[s
             tile = _read_output_file(data_dir / f'y_p{p.port}.txt', p)
             _insert_port_tile(out, tile, p)
 
-        outputs[tensor] = out
+        outputs[tensor] = out.reshape(out.shape[0], *layout.host_shapes.get(tensor, out.shape[1:]))
 
     return outputs
 

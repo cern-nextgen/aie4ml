@@ -482,10 +482,9 @@ def pack_host_data(model_or_ctx, X=None):
     in_tensor = next(iter(layout.inputs))
     in_ports = layout.inputs[in_tensor]
 
-    boundary = in_ports[0].numpy_boundary_shape  # full n-D shape; no (batch, feat) assumption
-
     if X is None:
-        X = np.random.default_rng(0).random(boundary, dtype=np.float64) * 2.0 - 1.0
+        shape = layout.host_shapes.get(in_tensor, in_ports[0].numpy_boundary_shape)
+        X = np.random.default_rng(0).random(shape, dtype=np.float64) * 2.0 - 1.0
 
     prepared = prepare_inputs(layout, X, iterations=1, quantize=True)[in_tensor]  # (1, *boundary)
     in_tiles = []

@@ -17,11 +17,14 @@ class AttentionConfig:
     alternating_horizontal: bool
     #: the head dimension as its buffers hold it: a Dense producer's columns, zeros past the head dimension
     columns: int
-    #: the int8 logits: round(q.k / 2^score_shift)
+    #: int16 logits (exact products: the op chose their format), else int8 (the graph's)
+    logits16: bool
+    #: the logits: round(q.k / 2^score_shift)
     score_shift: int
     #: the output: theta / sum through the division's int16 path, then round(. / 2^out_shift)
     out_shift: int
-    #: round(255 exp(-gap * 2^-logit_frac * temperature)) for logit gaps 0..255: the unnormalised probabilities
+    #: round(255 exp(-gap * step)) for logit gaps 0..255, a step of the logits in the Softmax's units: the
+    #: unnormalised probabilities
     exp_table: Tuple[int, ...]
     #: the data-memory bank width its lookup tables repeat each chunk at
     table_bank_bits: int

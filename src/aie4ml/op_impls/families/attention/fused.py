@@ -18,7 +18,8 @@ from .config import AttentionConfig
 MAX_TOKENS = 128
 #: A lookup table repeats each chunk every data-memory bank width: 128 bits on AIE-ML, 256 on AIE-MLv2.
 TABLE_BANK_BITS = {'AIE-ML': 128, 'AIE-MLV2': 256}
-#: The division: round(2^RECIP_SHIFT / n) seeds n in [2^14, 2^15) at round((n - 2^14) / 64); theta is kept / 2^THETA_SHIFT.
+#: The division: round(2^RECIP_SHIFT / n) seeds n in [2^14, 2^15) at round((n - 2^14) / 64); theta is kept
+#: / 2^THETA_SHIFT.
 RECIP_SHIFT, THETA_SHIFT = 28, 7
 RECIP_TABLE = tuple(round(2**RECIP_SHIFT / (2**14 + 64 * i)) for i in range(256))
 MICROTILE = MicrotileShape(outer=8, inner=8)
@@ -26,6 +27,8 @@ MICROTILE = MicrotileShape(outer=8, inner=8)
 ROW_BANDS = ParallelismConfig(cas_num=1)
 #: One copy of a lookup table: its 256 entries twice, in int16 slots (lut_layout).
 TABLE_BYTES = 1024
+#: The exp table's last entry rounds to zero where 255 steps span this: 255 exp(-EXP_SPAN) < 1/2.
+EXP_SPAN = math.log(510)
 
 
 def _microtile(contract) -> MicrotileShape:
@@ -56,10 +59,11 @@ def lut_layout(values, bank_bits: int, uint8: bool = False):
 
 @register_variant
 class AttentionOpImplVariant(OpImplVariant):
-    """One head's softmax(Q Kᵀ) V with the probabilities unnormalised (exp(0) = 255) and each output divided once: within
-    a code of the QDQ graph, which rounds every normalised probability to uint8 first, and as accurate. Query chains
-    split the queries; a chain is one tile, or a tile that scores the keys and hands the probabilities down the cascade
-    to one that weighs the values and divides. The exp and reciprocal are lookups, which AIE cores have none of."""
+    """One head's softmax(Q Kᵀ) V with the probabilities unnormalised (exp(0) = 255) and each output divided once:
+    within a code of the QDQ graph, which rounds every normalised probability to uint8 first, and as accurate. Query
+    chains split the queries; a chain is one tile, or a tile that scores the keys and hands the probabilities down the
+    cascade to one that weighs the values and divides. The exp and reciprocal are lookups, which AIE cores have none
+    of."""
 
     variant_id = 'attention.i8.v1'
     op_type = 'attention'
@@ -98,15 +102,24 @@ class AttentionOpImplVariant(OpImplVariant):
             for role, t in (('q', q), ('k', k), ('v', v), ('output', out))
         }
         meta = node.metadata
-        logit_frac = int(meta['logit_frac'])
-        score_shift = int(q.precision.frac) + int(k.precision.frac) - logit_frac
-        score_shift += _shift_of(float(meta['score_scale']), 'logit prescale', node)
+        products = int(q.precision.frac) + int(k.precision.frac)
+        logits16 = int(meta['logit_bits']) == 32
+        if logits16:
+            # exact products, no logit format given: int16 logits as fine as the exp table can span (its last entry
+            # zero), the score scale and the temperature both in its step
+            scale = float(meta['score_scale']) * float(meta['temperature'])
+            logit_frac = min(products, math.floor(math.log2(scale * 255 / EXP_SPAN)))
+            score_shift = products - logit_frac
+            step = 2.0**-logit_frac * scale
+        else:
+            logit_frac = int(meta['logit_frac'])
+            score_shift = products - logit_frac + _shift_of(float(meta['score_scale']), 'logit prescale', node)
+            step = 2.0**-logit_frac * float(meta['temperature'])
         # O = (theta / 2^7) 2^e y / 2^out_shift, y ~ 2^28 / (sum 2^e): theta / sum is in v's format
         out_shift = RECIP_SHIFT - THETA_SHIFT - (int(out.precision.frac) - int(v.precision.frac))
         out_shift += _shift_of(float(meta['output_scale']), 'output scale', node)
         if score_shift < 0 or out_shift < 0:
             raise ValueError(f'{node.name}: logits or output finer than their products ({score_shift}, {out_shift}).')
-        step = 2.0**-logit_frac * float(meta['temperature'])
         exp_table = tuple(round(255 * math.exp(-d * step)) for d in range(256))
 
         def view(tensor, direction, rows, microtile):
@@ -129,6 +142,7 @@ class AttentionOpImplVariant(OpImplVariant):
             io_views=io_views,
             alternating_horizontal=device.alternating_horizontal,
             columns=columns,
+            logits16=logits16,
             score_shift=score_shift,
             out_shift=out_shift,
             exp_table=exp_table,
@@ -152,6 +166,7 @@ class AttentionOpImplVariant(OpImplVariant):
             'microtile_rows': {role: int(config.io_views[name].microtile.outer) for role, name in roles.items()},
             'query_blocks': query_blocks,
             'key_blocks': tokens // 8,
+            'logits16': config.logits16,
             'score_shift': config.score_shift,
             'out_shift': config.out_shift,
             'stack_bytes': config.stack_bytes,

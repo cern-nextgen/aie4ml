@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import numpy as np
@@ -25,18 +26,18 @@ def _pin_if_unset(tensor, intent: QuantIntent, *, force_signed: bool) -> None:
 
 
 def _pin_back(tensor, intent: QuantIntent, *, force_signed: bool = False) -> None:
-    """Pin the un-quantized tensors a Quantize reaches back through a Relu, a scale, a bias add or a reshape -- a
-    Dense's accumulator behind MatMul -> Add -> Relu, say -- to its intent; signed behind a Relu, which clips the
-    sign."""
+    """Pin the un-quantized tensors a Quantize reaches back through a Relu, a scale, an add, a reshape, a slice or a
+    concat to its intent: signed behind a Relu, and behind a scale s with floor(log2 s) more fraction bits."""
     producer = tensor.producer
     if producer is None:
         return
     if producer.op_type == 'activation' and producer.metadata.get('activation') == 'relu':
         behind, force_signed = producer.inputs[:1], True
-    elif producer.op_type in ('scale', 'add', 'reshape'):
-        behind = producer.inputs if producer.op_type == 'add' else producer.inputs[:1]
+    elif producer.op_type in ('scale', 'add', 'reshape', 'slice', 'split', 'concat'):
+        behind = producer.inputs if producer.op_type in ('add', 'concat') else producer.inputs[:1]
         if producer.op_type == 'scale':
             producer.metadata['before_quantizer'] = True  # it belongs to its producer's requantization
+            intent = replace(intent, frac=int(intent.frac) + math.floor(math.log2(float(producer.metadata['scale']))))
     else:
         return
     for source in behind:
@@ -63,11 +64,13 @@ def _quantize_linear(ctx: OnnxImportContext, node, node_name: str, _directives: 
         relu_producer = (
             producer is not None and producer.op_type == 'activation' and producer.metadata.get('activation') == 'relu'
         )
+        # a ReLU's or a scale's output is a new value, which this quantizes (not its input's codes)
+        requantized = relu_producer or (producer is not None and producer.op_type == 'scale')
         if tensor.precision is None:
             _pin_back(tensor, intent)
             tensor.precision = intent
         elif tensor.precision != intent:
-            if relu_producer:
+            if requantized:
                 _pin_back(tensor, intent)
                 tensor.precision = intent
             else:

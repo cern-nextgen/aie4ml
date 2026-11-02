@@ -112,6 +112,8 @@ class LogicalIR:
     nodes: List[OpNode] = field(default_factory=list)
     input_tensor_names: List[str] = field(default_factory=list)
     output_tensor_names: List[str] = field(default_factory=list)
+    # the shape a graph input or output is given and returned in, where its tensor drops axes of extent 1
+    host_shapes: Dict[str, Tuple[int, ...]] = field(default_factory=dict)
 
     def add_tensor(self, tensor: TensorVar) -> None:
         if tensor.name in self.tensors:
@@ -179,6 +181,8 @@ class LogicalIR:
         for names in (self.input_tensor_names, self.output_tensor_names):
             if old.name in names:
                 names[names.index(old.name)] = new.name
+        if old.name in self.host_shapes:
+            self.host_shapes[new.name] = self.host_shapes.pop(old.name)
 
     def _contract_node(self, node: OpNode):
         in_tv, out_tv = node.inputs[0], node.outputs[0]

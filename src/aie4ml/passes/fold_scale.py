@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import math
+
 from ..ir import get_backend_context
 from ..ir.attributes import Scale
+from ..ir.graph import has_input_role
 from ..op_impls.family_registry import fuses
 from .base import AIEPass
 
@@ -43,7 +46,8 @@ class FoldScale(AIEPass):
                 changed = True
                 continue
 
-            if fuses(producer, 'output_scale'):
+            # A requantization scales by a shift: a power of two (a producer applies no multiplier).
+            if fuses(producer, 'output_scale') and math.log2(scale).is_integer():
                 if len(in_tensor.consumers) != 1:
                     raise NotImplementedError(
                         f'{scale_node.name}: cannot fold output scale because {in_tensor.name!r} '
@@ -54,6 +58,16 @@ class FoldScale(AIEPass):
                 changed = True
                 continue
 
+            # A scale on an operand of a product scales the product: a consumer linear in what it reads (no bias, no
+            # activation) takes it on its output. The pre-scale tensor keeps the range (`_pin_back`), so a power of two
+            # leaves every code as it was.
+            linear = consumers[0] if len(consumers) == 1 and _linear(consumers[0]) else None
+            if fuses(linear, 'output_scale'):
+                _accumulate_scale(linear, 'output_scale', scale)
+                graph.remove_node(scale_node, mode='bypass')
+                changed = True
+                continue
+
             raise NotImplementedError(
                 f'{scale_node.name}: no adjacent op absorbs this scale '
                 f'(producer={producer.op_type if producer else None}, '
@@ -61,6 +75,11 @@ class FoldScale(AIEPass):
             )
 
         return changed
+
+
+def _linear(node) -> bool:
+    """Whether `node` is linear in each input: no bias added, no activation applied."""
+    return not has_input_role(node, 'bias') and 'fused_activation' not in node.attributes
 
 
 def _accumulate_scale(node, name, scale):

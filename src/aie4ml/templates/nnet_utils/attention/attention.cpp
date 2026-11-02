@@ -4,13 +4,14 @@
 // Fused attention (attention.h). Integer throughout, rounding half to even: bit-exact across simulators.
 //
 // Per query block, transposed so the per-query work runs along lanes (lane key * 8 + query):
-//   S^T = K Q^T, int8 logits; m = their maximum
+//   S^T = K Q^T, int8 logits (int16 where the op chose their format: LOGITS16); m = their maximum
 //   P^T = exp table[m - S^T] (uint8, exp(0) = 255), unnormalised
 //   l = ones P^T, then theta^T = V^T P^T THETA_GROUP head-dimension tiles at a time on the matrix unit: an 8x8 int32
 //   accumulator is a quarter of AIE-ML's, so a whole head dimension's would spill
 // In a chain of two, the first tile hands P^T to the second. The division, O = theta / l through a reciprocal table
 // in int16, a tile at a time.
 #include <aie_api/aie_adf.hpp>
+#include <type_traits>
 #include "attention.h"
 
 namespace {
@@ -74,20 +75,26 @@ __attribute__((always_inline)) inline void probabilities(const int8* __restrict 
   i8x64 qt[NJ];
   for (int j = 0; j < NJ; ++j) chess_unroll_loop(*) qt[j] = aie::transpose(load_tile<C::Q_ROWS, NJ>(q, 0, j), 8, 8);
 
-  i8x64 s[KB], mx;
+  using logit = std::conditional_t<C::LOGITS16, int16, int8>;
+  aie::vector<logit, 64> s[KB], mx;
   for (int b = 0; b < KB; ++b) chess_unroll_loop(*) {
     score_mm acc;
     acc.mul(load_tile<C::K_ROWS, NJ>(k, b, 0), qt[0]);
     for (int j = 1; j < NJ; ++j) chess_unroll_loop(*) acc.mac(load_tile<C::K_ROWS, NJ>(k, b, j), qt[j]);
-    s[b] = acc.template to_vector<int8>(C::SCORE_SHIFT);
+    s[b] = acc.template to_vector<logit>(C::SCORE_SHIFT);
     mx = b == 0 ? s[b] : aie::max(mx, s[b]);
   }
   const auto m32 = aie::max(mx.template extract<32>(0), mx.template extract<32>(1));
   const auto m16 = aie::max(m32.template extract<16>(0), m32.template extract<16>(1));
-  const i8x16 m = aie::max(m16, aie::shuffle_down_rotate(m16, 8));
-  const i8x64 mb = aie::concat(m, m, m, m);
+  const auto m = aie::max(m16, aie::shuffle_down_rotate(m16, 8));
+  const auto mb = aie::concat(m, m, m, m);
   for (int b = 0; b < KB; ++b) chess_unroll_loop(*) {
-    const u8x64 d = aie::vector_cast<uint8>(aie::maxdiff(mb, s[b], true));
+    u8x64 d;
+    if constexpr (C::LOGITS16) {  // the gap, in 32 bits, saturated to the table's last entry
+      d = aie::sub(aie::from_vector<acc32>(mb), s[b]).template to_vector<uint8>(0);
+    } else {
+      d = aie::vector_cast<uint8>(aie::maxdiff(mb, s[b], true));
+    }
     p[b] = aie::vector_cast<uint8>(aie::concat(exp.fetch(d.template extract<32>(0)), exp.fetch(d.template extract<32>(1))));
   }
 }

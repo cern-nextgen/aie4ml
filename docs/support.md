@@ -123,8 +123,9 @@ the same model with them builds that design again, place for place.
 
 ## Add
 
-Two inputs and the output of the same shape and type; no broadcasting. Parallel chains split the rows or the
-features (`cas_num`); there is no cascade.
+Two inputs and the output of the same shape and storage type; no broadcasting. The inputs may be quantized apart (a
+residual sum): the coarser is shifted to the finer's fixed point, so the sum is exact. Parallel chains split the rows
+or the features (`cas_num`); there is no cascade.
 
 ## LayerNorm
 
@@ -149,8 +150,9 @@ it when the model was trained that way. `inv_shift` (default 15) must be 14 or 1
 
 ## Attention
 
-A head's `Q·Kᵀ` (K read transposed) -> Softmax -> `·V` fuses into one op on AIE-ML and AIE-MLv2: int8 Q, K, V and
-logits, uint8 (Q8) probabilities, int8 out, up to 128 tokens, head dimension a multiple of 8. The Softmax's name and
+A head's `Q·Kᵀ` (K read transposed) -> Softmax -> `·V` fuses into one op on AIE-ML and AIE-MLv2: int8 Q, K, V,
+int8 logits or, as exporters leave them, unquantized ones (a constant scale such as `1/sqrt(d)` folds in), uint8
+(Q8) probabilities, int8 out, up to 128 tokens, head dimension a multiple of 8. The Softmax's name and
 its `parallelism` direct it: `cas_num` splits the queries, `cas_length` 2 gives the values and the division a second
 tile. A Softmax with any other directive, or a directed matmul, keeps the three ops.
 
@@ -196,7 +198,9 @@ These never become kernels of their own:
 
 - **ONNX** (recommended): quantized QDQ graphs. Export convolutions channels-last, as `input [N,H,W,C] ->
   Transpose(0,3,1,2) -> Conv`; a graph whose input is NCHW is not reinterpreted. Opset 21 or later is needed for
-  int16 QuantizeLinear.
+  int16 QuantizeLinear. Axes of extent 1 are dropped (a sequence-first `[T, 1, D]` is `[T, D]`); inputs and outputs
+  keep their declared shapes. Attention as exporters emit it -- a packed Q, K, V projection, all heads in one op --
+  is rewritten head by head.
 - **hls4ml**: Keras 3 and QKeras v3 through hls4ml 1.4 (or the upstream commit in the README). Supported layers:
   Dense, Conv2D, DepthwiseConv2D, QConv2DBatchnorm, MaxPooling2D, Flatten, ReLU activations and LayerNormalization.
   A SeparableConv2D must be split into its depthwise and pointwise layers. Convert with `bit_exact=True`, as without

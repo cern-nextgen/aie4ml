@@ -79,9 +79,11 @@ def _head(graph, softmax: OpNode) -> Optional[Tuple[OpNode, OpNode, OpNode]]:
         return None
     if set(context.attributes) - {'output_scale'}:
         return None
-    if not all(_int(t.precision, 8, True) for t in (q, k, v, logits, context.outputs[0])):
+    if not all(_int(t.precision, 8, True) for t in (q, k, v, context.outputs[0])):
         return None
-    if not _int(p.precision, 8, False, frac=8):  # the graph's uint8 probabilities, 2^-8
+    if not (_int(logits.precision, 8, True) or _int(logits.precision, 32, True)):  # quantized, or exact products
+        return None
+    if not _int(p.precision, 8, False) or int(p.precision.frac) > 8:  # uint8 probabilities the graph never clips
         return None
     if len(q.shape) != 2 or tuple(q.shape) != tuple(k.shape) or tuple(v.shape) != tuple(k.shape):
         return None
@@ -106,6 +108,7 @@ def _attention_node(scores: OpNode, softmax: OpNode, context: OpNode) -> OpNode:
             'source_layer': softmax.metadata.get('source_layer', softmax.name),
             'fused': [scores.name, softmax.name, context.name],
             'logit_frac': int(scores.outputs[0].precision.frac),
+            'logit_bits': int(scores.outputs[0].precision.width),
             'probability_frac': int(softmax.outputs[0].precision.frac),
             'score_scale': _scale(scores, 'output_scale'),
             'temperature': _scale(softmax, 'input_scale'),

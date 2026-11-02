@@ -5,18 +5,25 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ...aie_types import QuantIntent
 from ...ir import LogicalIR, TensorVar, set_input_roles
 from ...ir.context import AIEBackendContext, ProjectConfig
 from ...model import AIEModel
 from ..common import create_context
 from . import handlers  # noqa: F401 - registers all handlers
+from .constants import fold_constants
 from .context import OnnxImportContext
+from .heads import unbatch_heads
+from .projections import split_packed_projections
 from .registry import dispatch
 from .shapes import build_shape_table
+from .units import drop_unit_axes
 from .utils import (
+    copied,
     initializer_map,
     input_maps,
     require_onnx,
@@ -56,19 +63,32 @@ def lower_onnx_model(
     graph: LogicalIR = backend.ir.logical
 
     initializers = initializer_map(graph_proto, numpy_helper)
+
+    # Normalized as exporters emit it: every node named first (a rewrite keeps the names directives use), constants
+    # folded, unit axes dropped, a packed projection split per slice of its output, heads computed together rewritten
+    # head by head.
+    def shapes(model):
+        return build_shape_table(model, initializers, input_maps(model.graph, set(initializers))[0])
+
+    model_proto = fold_constants(_named(model_proto), initializers, shapes)
+    model_proto, graph.host_shapes = drop_unit_axes(model_proto, initializers, shapes(model_proto))
+    model_proto = split_packed_projections(model_proto, initializers, shapes(model_proto))
+    model_proto = unbatch_heads(model_proto, initializers, shapes(model_proto))
+    graph_proto = model_proto.graph
+    shape_of = shapes(model_proto)
+
     input_shapes, input_dtypes = input_maps(graph_proto, set(initializers))
     for name, shape in input_shapes.items():
         if not shape:
             raise ValueError(f'{name}: scalar inputs are not supported.')
         graph.add_tensor(TensorVar(name=name, shape=tuple(int(x) for x in shape), precision=None))
         graph.mark_graph_input(name)
-
     ctx = OnnxImportContext(
         backend,
         initializers=initializers,
         input_shapes=input_shapes,
         input_dtypes=input_dtypes,
-        shape_of=build_shape_table(model_proto, initializers, input_shapes),
+        shape_of=shape_of,
         layer_directives=dict(config.get('LayerDirectives', {}) or {}),
     )
 
@@ -78,6 +98,23 @@ def lower_onnx_model(
 
     _finalize(ctx, graph_proto)
     return backend
+
+
+def _named(model_proto):
+    """The model with every unnamed node given the name it is directed by (`node_name`)."""
+    model = copied(model_proto)
+    for index, node in enumerate(model.graph.node):
+        node.name = onnx_node_name(node, index)
+    return model
+
+
+def _exact_product(node) -> None:
+    """A product of two activations no quantizer follows -- attention's scores before a Softmax, as exporters leave
+    them -- is its exact accumulator: 32 bits, its operands' fraction bits summed."""
+    out = node.outputs[0]
+    lhs, rhs = node.inputs[:2]
+    if out.precision is None and isinstance(lhs.precision, QuantIntent) and isinstance(rhs.precision, QuantIntent):
+        out.precision = replace(lhs.precision, width=32, frac=lhs.precision.frac + rhs.precision.frac, signed=True)
 
 
 def _finalize(ctx: OnnxImportContext, graph_proto) -> None:
@@ -102,6 +139,8 @@ def _finalize(ctx: OnnxImportContext, graph_proto) -> None:
         role_names = node.metadata.pop('input_roles', None)
         if role_names:
             set_input_roles(node, node.inputs, role_names)
+        if node.op_type == 'matmul':
+            _exact_product(node)
 
     for target, source in ctx.precision_mirrors:
         tensor = graph.tensors.get(target)

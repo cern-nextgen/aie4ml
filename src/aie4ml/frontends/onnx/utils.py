@@ -161,3 +161,60 @@ def window_attributes(node, node_name: str, kernel=()) -> dict:
         'dilations': tuple(int(d) for d in attr(node, 'dilations', [1, 1])),
         'pads': tuple(int(p) for p in attr(node, 'pads', [0, 0, 0, 0])),
     }
+
+
+def copied(model_proto):
+    """A copy of `model_proto` for a rewrite to change."""
+    onnx, _, _ = require_onnx()
+    model = onnx.ModelProto()
+    model.CopyFrom(model_proto)
+    return model
+
+
+def attributes(node) -> dict:
+    _, helper, _ = require_onnx()
+    return {a.name: helper.get_attribute_value(a) for a in node.attribute}
+
+
+class GraphEdit:
+    """The nodes and constants a rewrite adds to a model."""
+
+    def __init__(self):
+        self.nodes: list = []
+        self.constants: Dict[str, np.ndarray] = {}
+
+    def constant(self, name: str, value) -> str:
+        self.constants[name] = np.asarray(value)
+        return name
+
+    def emit(self, op_type: str, inputs, outputs, name: str, **attrs) -> None:
+        _, helper, _ = require_onnx()
+        self.nodes.append(helper.make_node(op_type, list(inputs), list(outputs), name=name, **attrs))
+
+    def apply(self, model, initializers: Dict[str, np.ndarray], nodes) -> None:
+        """`model` with `nodes` in graph order and this edit's constants, which `initializers` gets too."""
+        _, _, numpy_helper = require_onnx()
+        del model.graph.node[:]
+        model.graph.node.extend(topological(nodes))
+        for name, value in self.constants.items():
+            initializers[name] = value
+            model.graph.initializer.append(numpy_helper.from_array(value, name))
+
+
+def topological(nodes) -> list:
+    """`nodes` with each after the nodes writing its inputs, otherwise in their order."""
+    written = {name: node.name for node in nodes for name in node.output}
+    done, ordered = set(), []
+    pending = list(nodes)
+    while pending:
+        rest = []
+        for node in pending:
+            if all(written.get(name) in done or name not in written for name in node.input):
+                ordered.append(node)
+                done.add(node.name)
+            else:
+                rest.append(node)
+        if len(rest) == len(pending):
+            raise ValueError(f'{rest[0].name}: the rewritten graph has a cycle.')
+        pending = rest
+    return ordered
