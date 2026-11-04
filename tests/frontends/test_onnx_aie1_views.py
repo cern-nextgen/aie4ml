@@ -182,14 +182,13 @@ def test_view_backed_graph_outputs_fail_explicitly(model, message, tmp_path):
         lower(model, tmp_path, part=AIE1_PART)
 
 
-def test_view_backed_graph_input_fails_explicitly(tmp_path):
-    with pytest.raises(NotImplementedError, match=r'slice input .* is a graph input'):
-        lower(
-            _slice_model(0, 4, source_is_graph_input=True),
-            tmp_path,
-            part=AIE1_PART,
-            directives={'tail': _parallelism(1)},
-        )
+def test_a_slice_of_a_graph_input_reads_its_rows_from_the_host(tmp_path):
+    """The host carries the slice's rows of the whole input it holds."""
+    ctx = lower(
+        _slice_model(2, 6, source_is_graph_input=True), tmp_path, part=AIE1_PART, directives={'tail': _parallelism(1)}
+    )
+    (port,) = [p for p in ctx.ir.physical.plan['io_ports'] if p['direction'] == 'input']
+    assert port['staging']['io_boundary_dimension'][-1] == 8 and port['staging']['logical_origin'][-1] == 2
 
 
 def test_chained_views_fail_explicitly(tmp_path):
@@ -399,6 +398,21 @@ def test_a_transpose_never_folds_under_a_view_op():
     setattr(holder, CONTEXT_ATTR, SimpleNamespace(ir=SimpleNamespace(logical=graph)))
     with pytest.raises(NotImplementedError, match='view op'):
         FoldViewOps().transform(holder)
+
+
+@pytest.mark.requires_vitis
+def test_a_slice_of_a_graph_input_matches_onnx(tmp_path):
+    from helpers import assert_x86_matches_onnx
+
+    feeds = {'x_q': np.random.default_rng(5).integers(-8, 8, size=(8, 16), dtype=np.int8)}
+    assert_x86_matches_onnx(
+        _slice_model(2, 6, source_is_graph_input=True),
+        feeds,
+        {'tail': _parallelism(1)},
+        tmp_path,
+        max_code_diff=0,
+        part=AIE1_PART,
+    )
 
 
 @pytest.mark.requires_vitis

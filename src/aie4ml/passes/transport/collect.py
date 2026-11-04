@@ -108,6 +108,8 @@ class TransportCollector:
     ) -> Connection:
         part = view.parts[0]
         source_name = part.source
+        if source_name in self.execution.graph_inputs and self.execution.values[source_name].view is None:
+            return self._graph_input_slice_connection(consumer, slice_tensor, consumer_group, view)
         producer, producer_group = self._kernel_source(
             slice_tensor,
             source_name,
@@ -129,6 +131,21 @@ class TransportCollector:
                 ports=ports,
                 offset_base=offset_base,
             ),
+            Endpoint(consumer, slice_tensor, consumer_group),
+        )
+
+    def _graph_input_slice_connection(
+        self, consumer: OpNode, slice_tensor: str, consumer_group: str, view: ExecutionView
+    ) -> Connection:
+        """A slice of a graph input: a leg of the input itself, whose ports carry the consumer's part of it, which
+        starts at the input's `offset_base` (`boundary.graph_input_port_descs`)."""
+        part = view.parts[0]
+        port_view = self._kernel_inst(consumer).port_views[slice_tensor]
+        axis_dim = self._view_axis_to_buffer_dim(port_view, view.axis)
+        base = tuple(int(part.start) if dim == axis_dim else 0 for dim in range(port_view.rank))
+        return Connection(
+            part.source,
+            Endpoint(None, part.source, 'graph_input', offset_base=base),
             Endpoint(consumer, slice_tensor, consumer_group),
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from math import prod
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -37,10 +38,24 @@ def graph_input_port_descs(entry, execution, port_base: int) -> Dict[int, Stagin
     descs: Dict[int, StagingDescriptor] = {}
     for local_port, port in enumerate(consumer_ports):
         graph_port = int(port_base) + int(local_port)
-        descs[graph_port] = rebase_descriptor_offset(inst.staging[consumer.tensor][int(port)], consumer.offset_base)
+        desc = rebase_descriptor_offset(inst.staging[consumer.tensor][int(port)], consumer.offset_base)
+        if entry.producer.offset_base:
+            desc = _in_input(desc, entry.producer.offset_base, execution, inst, consumer.tensor)
+        descs[graph_port] = desc
         if binding.kind == PORT_KIND_STREAM:
             require_linear_stream_staging(entry.logical_tensor, descs[graph_port])
     return descs
+
+
+def _in_input(desc: StagingDescriptor, base, execution, inst, sliced: str) -> StagingDescriptor:
+    """A port's staging of a slice of a graph input, in the input's frame: its data where the slice starts (`base`),
+    the input's whole extent along the slice's axis, which the host holds."""
+    view = execution.values[sliced].view
+    source = next(t for t in inst.node.inputs if t.name == sliced).producer.inputs[0]  # the folded slice's input
+    bound = list(desc.io_boundary_dimension)
+    bound[inst.port_views[sliced].buffer_order.index(view.axis)] = int(source.shape[view.axis])
+    origin = tuple(o + b for o, b in zip(desc.logical_origin, base))
+    return dataclasses.replace(desc, logical_origin=origin, io_boundary_dimension=tuple(bound))
 
 
 def require_linear_stream_staging(tensor: str, staging: StagingDescriptor) -> None:

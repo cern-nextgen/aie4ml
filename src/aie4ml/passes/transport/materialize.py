@@ -287,7 +287,8 @@ class _MemoryPlanMaterializer:
         for port in p_ports:
             if producer.node is None:
                 port_staging = graph_input_port_descriptor(entry, port)
-                writers.append((port, host_visible_input_staging(port_staging), host_layout(port_staging)))
+                layout = host_layout(port_staging).shifted(producer.offset_base)  # a slice's: in its own frame
+                writers.append((port, host_visible_input_staging(port_staging), layout))
             else:
                 inst = self._kernel_inst(producer.node)
                 staging = inst.staging[producer.tensor][port]

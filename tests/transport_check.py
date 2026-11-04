@@ -116,7 +116,10 @@ class _Plan:
     def _consumer(self, endpoint, producer, port):
         inst = self.execution.get(endpoint.node.name)
         staging = inst.staging[endpoint.tensor][port]
-        return port_layout(staging).shifted(endpoint.offset_base), staging.boundary_dimension is not None
+        layout = port_layout(staging).shifted(endpoint.offset_base)
+        if producer.node is None:  # a slice of a graph input: in the input's frame, which the host's tags are in
+            layout = layout.shifted(tuple(-b for b in producer.offset_base))
+        return layout, staging.boundary_dimension is not None
 
     def _tags(self, producer, host_port=None):
         """The tags of a leg's tensor: the span of its producer's data, or the graph input's extent."""
