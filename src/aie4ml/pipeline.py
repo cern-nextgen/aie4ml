@@ -19,6 +19,7 @@ from .passes import (
     PlaceKernels,
     Resolve,
     VerifyPhysicalPlan,
+    absorb_projections,
 )
 
 DEFAULT_PIPELINE = (
@@ -41,3 +42,7 @@ DEFAULT_PIPELINE = (
     CompactBufferRank,
     VerifyPhysicalPlan,
 )
+
+# Rewrites the design search weighs (ChooseParallelism): each graph is searched with and without it, and the better
+# ranking design kept.
+SEARCHED_REWRITES = (absorb_projections,)

@@ -23,6 +23,9 @@ A hand-off is direct only where producer and consumer write and read the same bl
 for the graph, not per layer: one search with every layer's own microtile, and one per height the layers offer
 (`_block_heights`), each layer offering it taking it -- none repeating another's constraint program. Their designs are
 built in one order, of their bounds (`_best_buildable`).
+
+A rewrite that pays only in some designs (`pipeline.SEARCHED_REWRITES`) is searched with and without, the better design
+kept (`ctx.ir.optimizer['rewrites']`); the graph before it stays in `ctx.ir.plain` for a rerun.
 """
 
 from __future__ import annotations
@@ -306,6 +309,29 @@ def _refuse_unfused(ctx) -> None:
         )
 
 
+def _best_design(ctx, mode: str, max_tiles: int) -> Tuple['_Search', '_Design', Any]:
+    """The best design of the graph in `ctx` the rest of the pipeline builds, of a search per block height: its
+    search, the design and the context it was built in (`_best_buildable`)."""
+    shared = _Shared(logical_values(ctx.ir.logical))
+    searches, programs, refusal = [], [], None
+    for height in (None, *_block_heights(ctx)):
+        search = _Search(ctx, mode, max_tiles, shared, height)
+        if height is not None and search.microtiling == {}:
+            continue  # no layer offers this height: the pass would repeat the first
+        try:
+            search.alternatives = search._alternatives()
+        except ConfigRefused as failure:
+            refusal = refusal or failure
+            continue
+        program = _program(search.alternatives)
+        if program not in programs:  # else the layers offering the height take it already
+            searches.append(search)
+            programs.append(program)
+    if not searches:
+        raise refusal
+    return _best_buildable(searches)
+
+
 def _block_heights(ctx) -> List[int]:
     """The row heights the layers' microtile candidates offer. A hand-off is direct only where producer and consumer
     share a block, so besides the layers' own microtiles, the search tries each height shared by every layer that
@@ -326,6 +352,8 @@ class ChooseParallelism(AIEPass):
         self.name = 'choose_parallelism'
 
     def transform(self, model_or_ctx) -> bool:
+        from ..pipeline import DEFAULT_PIPELINE, SEARCHED_REWRITES
+
         ctx = get_backend_context(model_or_ctx)
         mode = optimize_mode(ctx)
         device = ctx.device
@@ -336,6 +364,9 @@ class ChooseParallelism(AIEPass):
             raise ValueError(f'AIEConfig MaxTiles={max_tiles} must be positive.')
 
         # a previous run's choice must not steer this one
+        if ctx.ir.plain is not None:  # its rewrites undone, the passes before this one run again as configured now
+            ctx.ir.logical, ctx.ir.plain = ctx.ir.plain, None
+            run_aie_passes(ctx, [cls() for cls in DEFAULT_PIPELINE[: DEFAULT_PIPELINE.index(ChooseParallelism)]])
         ctx.ir.optimizer = {}
         ctx.ir.physical.reset()
         for node in ctx.ir.logical:
@@ -345,24 +376,28 @@ class ChooseParallelism(AIEPass):
             f"[aie4ml] Searching for a '{mode}' design within {max_tiles} AIE tiles; this can take a minute...",
             flush=True,
         )
-        shared = _Shared(logical_values(ctx.ir.logical))
-        searches, programs, refusal = [], [], None
-        for height in (None, *_block_heights(ctx)):
-            search = _Search(ctx, mode, max_tiles, shared, height)
-            if height is not None and search.microtiling == {}:
-                continue  # no layer offers this height: the pass would repeat the first
+        graphs = [(ctx, ())]
+        for rewrite in SEARCHED_REWRITES:
+            trial = copy.deepcopy(ctx)
+            if rewrite(trial):
+                graphs.append((trial, (rewrite.__name__,)))
+        found, failures = [], []
+        for graph, rewrites in graphs:
             try:
-                search.alternatives = search._alternatives()
-            except ConfigRefused as failure:
-                refusal = refusal or failure
-                continue
-            program = _program(search.alternatives)
-            if program not in programs:  # else the layers offering the height take it already
-                searches.append(search)
-                programs.append(program)
-        if not searches:
-            raise refusal
-        search, design, built = _best_buildable(searches)
+                found.append((graph, rewrites, *_best_design(graph, mode, max_tiles)))
+            except (ConfigRefused, SearchLimit) as failure:
+                failures.append((rewrites, failure))
+        if not found:
+            (_, first), *rest = failures
+            if not rest:
+                raise first
+            lines = [str(first), *(f'With {", ".join(rewrites)}: {failure}' for rewrites, failure in rest)]
+            raise type(first)('\n'.join(lines)) from first
+        graph, rewrites, search, design, built = min(found, key=lambda f: f[2].rank(f[3]))  # the plain graph on a tie
+        if graph is not ctx:
+            ctx.ir.plain, ctx.ir.logical = ctx.ir.logical, graph.ir.logical
+        shared = search.shared
+        tried = sum(f[2].shared.built for f in found)
         doubts = list(dict.fromkeys(shared.doubts))  # each reason once
         if shared.unplaced_fill is not None:  # the fills the searches halved (`_Search._fill`)
             doubts.append(
@@ -370,7 +405,7 @@ class ChooseParallelism(AIEPass):
                 f'{shared.unplaced_fill} found no placement within AIEConfig PlacerTime'
             )
         print(
-            f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {shared.built} built'
+            f'[aie4ml] Design found: {design.tiles} AIE tiles, the best of {tried} built'
             f'{"" if not doubts else ", not proven the best: " + doubts[0]}.',
             flush=True,
         )
@@ -379,7 +414,8 @@ class ChooseParallelism(AIEPass):
             'max_tiles': max_tiles,
             'tiles': design.tiles,
             'memtile_legs': design.memtile,
-            'designs_tried': shared.built,
+            'designs_tried': tried,
+            'rewrites': list(rewrites),
             'proven': not doubts,
             'doubts': doubts,
         }
@@ -431,8 +467,8 @@ class _Search:
         self.max_tiles = max_tiles
         # the solver's deterministic time per solve, in its own units (about a second of one worker's search each)
         self.search_time = float(ctx.aie_config.get('SearchTime', 300))
-        # the designs the searches of one pass build at most: placement alone tells hand-overs some placement shares
-        # each from those it shares together, so a bound may rank many designs better than they place
+        # the designs the searches of one graph build at most (`_best_design`): placement alone tells hand-overs some
+        # placement shares each from those it shares together, so a bound may rank many designs better than they place
         self.builds = int(ctx.aie_config.get('SearchBuilds', 4))
         if self.builds < 1:
             raise ValueError(f'AIEConfig SearchBuilds={self.builds} must be positive.')

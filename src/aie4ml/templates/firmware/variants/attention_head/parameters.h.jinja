@@ -1,0 +1,30 @@
+{% set P = L.op_impl.parameters %}
+{% from 'variants/placement.jinja' import buffer_locations %}
+struct {{L.struct_name}} {
+  static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
+  static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}};
+  static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};
+  static constexpr int HEAD_DIM = {{P.columns}};
+  static constexpr int OUT_DIM = {{P.out_columns}};  // O's columns as the Dense after it reads them
+  static constexpr int MODEL_DIM = {{P.model_dim}};  // as x's two halves store it: zero columns meet zero weight rows
+  static constexpr int QUERY_BLOCKS = {{P.query_blocks}};
+  static constexpr int KEY_BLOCKS = {{P.key_blocks}};
+  static constexpr int LOOKED_BLOCKS = {{P.looked_blocks}};  // looked up by a chain's first tile, the rest by its last
+  static constexpr int K_ROWS = 8, V_ROWS = 8, O_ROWS = {{P.o_rows}};
+  static constexpr int Q_SHIFT = {{P.projection_shifts.q}}, K_SHIFT = {{P.projection_shifts.k}}, V_SHIFT = {{P.projection_shifts.v}};
+  static constexpr bool LOGITS16 = {{ 'true' if P.logits16 else 'false' }};
+  static constexpr int SCORE_SHIFT = {{P.score_shift}};
+  static constexpr int OUT_SHIFT = {{P.out_shift}};
+  static constexpr int STACK_BYTES = {{P.stack_bytes}};
+  static constexpr int TABLE_SIZE = {{P.exp_table | length}};
+{{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
+{{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
+  inline static constexpr int16_t EXP_TABLE[TABLE_SIZE] = { {%- for v in P.exp_table -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
+  inline static constexpr int16_t RECIP_TABLE[TABLE_SIZE] = { {%- for v in P.recip_table -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
+{% for role in ('q', 'k', 'v') %}
+  inline static constexpr int8_t W{{ role | upper }}[MODEL_DIM * HEAD_DIM] = { {%- for v in P['w' ~ role] -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
+  inline static constexpr int32_t B{{ role | upper }}[HEAD_DIM] = { {%- for v in P['b' ~ role] -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
+{% endfor %}
+  static constexpr int col_placement = {{L.placement.col}};
+  static constexpr int row_placement = {{L.placement.row}};
+};

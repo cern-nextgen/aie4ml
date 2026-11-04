@@ -64,9 +64,8 @@ def lower_onnx_model(
 
     initializers = initializer_map(graph_proto, numpy_helper)
 
-    # Normalized as exporters emit it: every node named first (a rewrite keeps the names directives use), constants
-    # folded, unit axes dropped, a packed projection split per slice of its output, heads computed together rewritten
-    # head by head.
+    # Normalized as exporters emit it: nodes named (directives use the names), constants folded, unit axes dropped,
+    # packed projections split, batched heads rewritten head by head, then their projections split per head.
     def shapes(model):
         return build_shape_table(model, initializers, input_maps(model.graph, set(initializers))[0])
 
@@ -74,6 +73,7 @@ def lower_onnx_model(
     model_proto, graph.host_shapes = drop_unit_axes(model_proto, initializers, shapes(model_proto))
     model_proto = split_packed_projections(model_proto, initializers, shapes(model_proto))
     model_proto = unbatch_heads(model_proto, initializers, shapes(model_proto))
+    model_proto = split_packed_projections(model_proto, initializers, shapes(model_proto))
     graph_proto = model_proto.graph
     shape_of = shapes(model_proto)
 

@@ -34,16 +34,16 @@ AIE_MLV2 = 'xc2ve3858-ssva2112-2MP-e-S'
 FEATURES, QKV_FRAC, OUT_FRAC = 16, 4, 5
 
 
-def _dense(nodes, inits, x, name, head_dim, seed):
+def _dense(nodes, inits, x, name, head_dim, seed, features=FEATURES):
     w = f'{name}_w'
     dq(nodes, f'{w}_q', w, w)
     nodes.append(helper.make_node('MatMul', [x, w], [f'{name}_mm'], name=name))
     qdq(nodes, f'{name}_mm', name, f'{name}o')
-    weights = np.random.default_rng(seed).integers(-3, 4, size=(FEATURES, head_dim), dtype=np.int8)
+    weights = np.random.default_rng(seed).integers(-3, 4, size=(features, head_dim), dtype=np.int8)
     inits += [*qparams(w), *qparams(f'{name}o', frac=QKV_FRAC), numpy_helper.from_array(weights, f'{w}_q')]
 
 
-def _head(tokens: int, head_dim: int, exported: bool = False):
+def _head(tokens: int, head_dim: int, exported: bool = False, features: int = FEATURES):
     """x -> Q, K, V Dense -> Q·Kᵀ (int8 logits, 2^-3) -> Softmax (uint8, 2^-8) -> ·V (int8, 2^-5).
 
     exported: as PyTorch exports it -- batch-first ends around sequence-first (T, 1, D) tensors, Q divided by
@@ -57,7 +57,7 @@ def _head(tokens: int, head_dim: int, exported: bool = False):
         nodes.append(helper.make_node('Transpose', ['x'], ['x_seq'], perm=[1, 0, 2], name='to_seq'))
         x = 'x_seq'
     for seed, name in enumerate('qkv', 1):
-        _dense(nodes, inits, x, name, head_dim, seed)
+        _dense(nodes, inits, x, name, head_dim, seed, features)
     lhs, k_t, v = 'q', 'k_t', 'v'
     if exported:
         inits += [*qparams('qs', frac=6), numpy_helper.from_array(np.float32(np.sqrt(head_dim)), 'root')]
@@ -80,7 +80,7 @@ def _head(tokens: int, head_dim: int, exported: bool = False):
     return make_model(
         'fused_attention_head',
         nodes=nodes,
-        inputs=[('x_q', TensorProto.INT8, [*batch, tokens, FEATURES])],
+        inputs=[('x_q', TensorProto.INT8, [*batch, tokens, features])],
         outputs=[('c', TensorProto.FLOAT, [*batch, tokens, head_dim])],
         initializers=inits,
     )
@@ -134,11 +134,17 @@ CASES = {
 
 @pytest.mark.parametrize('case', CASES)
 def test_the_head_fuses_into_one_op(case, tmp_path):
+    """Its projections too, where no Dense is directed."""
     part, tokens, head_dim, directives, *exported = CASES[case]
     ctx = lower(_head(tokens, head_dim, *exported), tmp_path, directives, part=part)
-    assert [n.op_type for n in ctx.ir.logical.nodes] == ['dense', 'dense', 'dense', 'attention']
+    projections = [] if set(directives) == {'attn'} else ['dense', 'dense', 'dense']
+    assert [n.op_type for n in ctx.ir.logical.nodes] == [*projections, 'attention']
     par = config_of(ctx, 'attn_aie').parallelism
     assert (par.cas_num, par.cas_length) == tuple(directives['attn']['parallelism'].values())
+    if not projections:  # x in two halves of its columns for the chains' first tiles, then for their last
+        inst = ctx.ir.execution.get('attn_aie')
+        halves = inst.ports.inputs[input_tensor_for_role(inst.node, 'x').name].endpoints
+        assert [len(tiles) for tiles in halves] == [par.cas_num] * (2 * par.cas_length)
 
 
 def test_a_dense_padded_head_dimension_hands_over_directly(tmp_path):
@@ -157,11 +163,35 @@ def test_a_chain_is_one_tile_or_two(tmp_path):
 
 
 def test_a_lone_tile_past_a_bank_is_refused_and_a_pair_fits(tmp_path):
-    """128 keys and values of head dimension 64 fill a 16 KB bank before a lone tile's output; a pair keeps the keys on
-    one tile, the values and output on the other."""
+    """128 keys and values of head dimension 64 handed over fill a 16 KB bank before a lone tile's output; a pair keeps
+    the keys on one tile, the values and output on the other."""
+    handed_over = {'v': parallelism(1)}  # a directed Dense: no projection fuses
     with pytest.raises(ConfigRefused, match='B of buffers'):
+        lower(_head(128, 64), tmp_path / 'one', {**handed_over, 'attn': parallelism(8)}, part=AIE_ML)
+    lower(_head(128, 64), tmp_path / 'two', {**handed_over, 'attn': parallelism(8, cas_length=2)}, part=AIE_ML)
+
+
+def test_a_lone_tile_projecting_keys_and_values_past_its_stack_is_refused_and_a_pair_fits(tmp_path):
+    """Projected, 128 keys and values of head dimension 64 are 16 KB of scratch on a lone tile, which leaves its stack
+    too little; a pair keeps the keys on one tile, the values on the other."""
+    with pytest.raises(ConfigRefused, match='token scratches'):
         lower(_head(128, 64), tmp_path / 'one', {'attn': parallelism(8)}, part=AIE_ML)
-    lower(_head(128, 64), tmp_path / 'two', {'attn': parallelism(8, cas_length=2)}, part=AIE_ML)
+    ctx = lower(_head(128, 64), tmp_path / 'two', {'attn': parallelism(8, cas_length=2)}, part=AIE_ML)
+    assert [n.op_type for n in ctx.ir.logical.nodes] == ['attention']
+
+
+def test_a_head_whose_scratch_fits_no_chains_keeps_its_projections(tmp_path):
+    """128 keys of head dimension 80 leave even a pair's first tile too little stack to project them: the Dense ops
+    stay, and the attention reads their Q, K and V."""
+    ctx = lower(_head(128, 80), tmp_path, {}, part=AIE_ML)
+    assert [n.op_type for n in ctx.ir.logical.nodes] == ['dense', 'dense', 'dense', 'attention']
+
+
+def test_x_reaches_eight_tiles_from_its_plios_directly(tmp_path):
+    """x's halves, panels of 8 columns a DMA walks at once, each broadcast from a PLIO to 4 chains of 2: no memory
+    tile, and no refusal (two PLIOs' broadcasts deliver exactly, unlike two kernels')."""
+    ctx = lower(_head(32, 8, features=64), tmp_path, {'attn': parallelism(4, cas_length=2)}, part=AIE_ML)
+    assert 'x_q' not in memtiles(ctx)
 
 
 def test_k_and_v_broadcast_to_more_than_four_common_chains_are_refused(tmp_path):

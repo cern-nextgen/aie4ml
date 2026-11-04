@@ -572,6 +572,7 @@ class AIEPipelineIR:
     execution: ExecutionIR = field(default_factory=ExecutionIR)
     physical: PhysicalIR = field(default_factory=PhysicalIR)
     optimizer: Dict[str, Any] = field(default_factory=dict)  # the design search's report, when it ran
+    plain: Optional[LogicalIR] = None  # the graph before the searched rewrites the search kept: a rerun's start
 
     def verify(self) -> None:
         self.logical.verify()
@@ -582,3 +583,4 @@ class AIEPipelineIR:
         self.execution = ExecutionIR()
         self.physical = PhysicalIR()
         self.optimizer = {}
+        self.plain = None

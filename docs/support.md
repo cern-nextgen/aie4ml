@@ -154,7 +154,10 @@ A head's `Q·Kᵀ` (K read transposed) -> Softmax -> `·V` fuses into one op on 
 int8 logits or, as exporters leave them, unquantized ones (a constant scale such as `1/sqrt(d)` folds in), uint8
 (Q8) probabilities, int8 out, up to 128 tokens, head dimension a multiple of 8. The Softmax's name and
 its `parallelism` direct it: `cas_num` splits the queries, `cas_length` 2 gives the values and the division a second
-tile. A Softmax with any other directive, or a directed matmul, keeps the three ops.
+tile. A Softmax with any other directive, or a directed matmul, keeps the three ops. Where Q, K and V are Dense
+projections of one int8 x (with a bias at most, none directed), the design search also weighs fusing them in: each
+chain then projects the keys, the values and its queries itself, so no Dense tiles or hand-overs come before the
+attention.
 
 It is not bit-exact with the QDQ graph: the graph rounds each normalised probability to uint8 before `·V`; the op
 keeps them unnormalised and divides each output once. An output can differ from the graph's by about a code;

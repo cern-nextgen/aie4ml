@@ -5,6 +5,7 @@ struct {{L.struct_name}} {
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}};
   static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};
   static constexpr int HEAD_DIM = {{P.columns}};  // as stored: a padding Dense's zero columns included
+  static constexpr int OUT_DIM = HEAD_DIM;
   static constexpr int QUERY_BLOCKS = {{P.query_blocks}};
   static constexpr int KEY_BLOCKS = {{P.key_blocks}};
   static constexpr int Q_ROWS = {{P.microtile_rows.q}}, K_ROWS = {{P.microtile_rows.k}}, V_ROWS = {{P.microtile_rows.v}}, O_ROWS = {{P.microtile_rows.output}};

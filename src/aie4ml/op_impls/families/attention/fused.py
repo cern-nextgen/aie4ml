@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import math
-from typing import ClassVar
+from typing import Any, ClassVar, Dict, Tuple
 
 from ....errors import ConfigRefused
-from ....ir.graph import OpNode, input_tensor_for_role
+from ....ir.graph import OpNode, has_input_role, input_tensor_for_role
 from ...base import PING_PONG_BANKS, BufferLocation, OpImplVariant, row_flow
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
@@ -31,13 +31,17 @@ TABLE_BYTES = 1024
 EXP_SPAN = math.log(510)
 
 
-def _microtile(contract) -> MicrotileShape:
+def tokens_of(node: OpNode) -> int:
+    return int(node.outputs[0].shape[0])
+
+
+def stored_microtile(contract) -> MicrotileShape:
     """The microtile a producer stores the tensor in where the kernel reads it (8 wide, 4 or 8 rows), else 8x8."""
     mt = microtile_from_staging(contract.port_staging[0]) if contract is not None and contract.port_staging else None
     return mt if mt is not None and mt.inner == 8 and mt.outer in (4, 8) else MICROTILE
 
 
-def _shift_of(scale: float, what: str, node: OpNode) -> int:
+def shift_of(scale: float, what: str, node: OpNode) -> int:
     """-log2(scale) of a power-of-two scale <= 1."""
     shift = -math.log2(scale) if scale > 0 else math.nan
     if not (shift >= 0 and shift == int(shift)):
@@ -73,11 +77,10 @@ class AttentionOpImplVariant(OpImplVariant):
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism'})
 
     def matches(self, node: OpNode, device, _directives) -> bool:
-        return device.generation in TABLE_BANK_BITS and int(input_tensor_for_role(node, 'q').shape[0]) <= MAX_TOKENS
+        return has_input_role(node, 'q') and device.generation in TABLE_BANK_BITS and tokens_of(node) <= MAX_TOKENS
 
     def resolve(self, node: OpNode, device, directives, input_contracts) -> AttentionConfig:
-        par = dict(directives.get('parallelism') or {})
-        cas_num, cas_length = int(par.get('cas_num', 1)), int(par.get('cas_length', 1))
+        cas_num, cas_length = chains(node, device, directives)
         q, k, v = (input_tensor_for_role(node, role) for role in ('q', 'k', 'v'))
         out = node.outputs[0]
         tokens, head_dim = (int(x) for x in q.shape)
@@ -85,42 +88,14 @@ class AttentionOpImplVariant(OpImplVariant):
         # kernel reads as more of the head dimension (zero scores, zero outputs), so the hand-overs stay direct
         contracts = [input_contracts.get(t.name) for t in (q, k, v)]
         columns = max([head_dim, *(int(c.view.full_inner) for c in contracts if c is not None and c.view is not None)])
-        if cas_length not in (1, 2):
-            raise ConfigRefused(f'{node.name}: a chain is one tile or two, not {cas_length}.')
-        if (tokens // 8) % cas_num:
-            raise ConfigRefused(f'{node.name}: {tokens} tokens split into whole 8s, not {cas_num}.')
-        if cas_num > int(device.rows) - int(device.row_start):
-            raise ConfigRefused(f'{node.name}: {cas_num} query chains need a row each, the array has {device.rows}.')
         # in each ping-pong bank: every key on a chain's first tile, every value and the chain's output on its last (on
         # one tile, all three)
-        bank = int(device.bank_mem_bytes)
-        ping = (3 - cas_length) * tokens * columns + tokens // cas_num * columns
-        if ping > bank:
-            raise ConfigRefused(f'{node.name}: {ping} B of buffers in a bank of {bank}.')
+        check_bank(node, device, (3 - cas_length) * tokens * columns + tokens // cas_num * columns)
         precision = {
             role: resolve_exact_storage_dtype(t.precision, namespace=role, layer_name=node.name)
             for role, t in (('q', q), ('k', k), ('v', v), ('output', out))
         }
-        meta = node.metadata
-        products = int(q.precision.frac) + int(k.precision.frac)
-        logits16 = int(meta['logit_bits']) == 32
-        if logits16:
-            # exact products, no logit format given: int16 logits as fine as the exp table can span (its last entry
-            # zero), the score scale and the temperature both in its step
-            scale = float(meta['score_scale']) * float(meta['temperature'])
-            logit_frac = min(products, math.floor(math.log2(scale * 255 / EXP_SPAN)))
-            score_shift = products - logit_frac
-            step = 2.0**-logit_frac * scale
-        else:
-            logit_frac = int(meta['logit_frac'])
-            score_shift = products - logit_frac + _shift_of(float(meta['score_scale']), 'logit prescale', node)
-            step = 2.0**-logit_frac * float(meta['temperature'])
-        # O = (theta / 2^7) 2^e y / 2^out_shift, y ~ 2^28 / (sum 2^e): theta / sum is in v's format
-        out_shift = RECIP_SHIFT - THETA_SHIFT - (int(out.precision.frac) - int(v.precision.frac))
-        out_shift += _shift_of(float(meta['output_scale']), 'output scale', node)
-        if score_shift < 0 or out_shift < 0:
-            raise ValueError(f'{node.name}: logits or output finer than their products ({score_shift}, {out_shift}).')
-        exp_table = tuple(round(255 * math.exp(-d * step)) for d in range(256))
+        fracs = [int(t.precision.frac) for t in (q, k, v, out)]
 
         def view(tensor, direction, rows, microtile):
             return build_tensor_view(
@@ -129,7 +104,7 @@ class AttentionOpImplVariant(OpImplVariant):
             )  # fmt: skip
 
         # each buffer in its producer's microtile; O in Q's, its rows the same
-        mq, mk, mv = (_microtile(c) for c in contracts)
+        mq, mk, mv = (stored_microtile(c) for c in contracts)
         io_views = {
             q.name: view(q, 'inputs', tokens // cas_num, mq),
             k.name: view(k, 'inputs', tokens, mk),
@@ -142,36 +117,18 @@ class AttentionOpImplVariant(OpImplVariant):
             io_views=io_views,
             alternating_horizontal=device.alternating_horizontal,
             columns=columns,
-            logits16=logits16,
-            score_shift=score_shift,
-            out_shift=out_shift,
-            exp_table=exp_table,
+            **softmax_arithmetic(node, *fracs),
             table_bank_bits=TABLE_BANK_BITS[device.generation],
-            # the stack bank holds the stack and one copy of each table: the spilled scores and probabilities grow
-            # with the keys and head dimension (4.6 KB measured at 64 keys, head dimension 32)
-            stack_bytes=bank - (2 if cas_length == 1 else 1) * TABLE_BYTES - 1024,
+            stack_bytes=stack_bytes(device, cas_length),
             int8_macs_per_cycle=int(device.int8_macs_per_cycle),
         )
 
     def kernel_params(self, node: OpNode, config: AttentionConfig):
         roles = {role: input_tensor_for_role(node, role).name for role in ('q', 'k', 'v')}
         roles['output'] = node.outputs[0].name
-        tokens = int(input_tensor_for_role(node, 'q').shape[0])
-        par = config.parallelism
-        query_blocks = tokens // par.cas_num // 8
         return {
-            'parallelism': par,
-            'alternating_horizontal': config.alternating_horizontal,
-            'columns': config.columns,
+            **attention_params(node, config),
             'microtile_rows': {role: int(config.io_views[name].microtile.outer) for role, name in roles.items()},
-            'query_blocks': query_blocks,
-            'key_blocks': tokens // 8,
-            'logits16': config.logits16,
-            'score_shift': config.score_shift,
-            'out_shift': config.out_shift,
-            'stack_bytes': config.stack_bytes,
-            'exp_table': lut_layout(config.exp_table, config.table_bank_bits, uint8=True),
-            'recip_table': lut_layout(RECIP_TABLE, config.table_bank_bits),
         }
 
     def build_ports(self, node: OpNode, config: AttentionConfig) -> PortMap:
@@ -220,13 +177,99 @@ class AttentionOpImplVariant(OpImplVariant):
         return tuple(locations)
 
     def work(self, node: OpNode, config: AttentionConfig) -> int:
-        """Cycles of a chain's slower tile per call, as multiply-accumulates at the core's peak: per query block, fitted
-        to the kernels' AIE-ML profiles at 32 and 64 tokens, head dimensions 8 to 64 (AIE-MLv2 runs them faster)."""
-        tokens = int(input_tensor_for_role(node, 'q').shape[0])
-        par = config.parallelism
-        qb, kb, nj = tokens // par.cas_num // 8, tokens // 8, config.columns // 8
-        if par.cas_length == 1:
-            block = 18 * kb + 10 * kb * nj + 144
-        else:  # the probabilities' tile or the values'
-            block = max(48 * kb + 6 * kb * nj - 50, 14 * kb * nj + 4 * nj + 10)
-        return (25 + qb * block) * config.int8_macs_per_cycle
+        return ranked_cycles(attention_cycles(node, config), config) * config.int8_macs_per_cycle
+
+
+def chains(node: OpNode, device, directives) -> Tuple[int, int]:
+    """(cas_num, cas_length) as directed: query chains of one tile or two, a whole number of 8 queries each."""
+    par = dict(directives.get('parallelism') or {})
+    cas_num, cas_length = int(par.get('cas_num', 1)), int(par.get('cas_length', 1))
+    tokens = int(node.outputs[0].shape[0])
+    if cas_length not in (1, 2):
+        raise ConfigRefused(f'{node.name}: a chain is one tile or two, not {cas_length}.')
+    if (tokens // 8) % cas_num:
+        raise ConfigRefused(f'{node.name}: {tokens} tokens split into whole 8s, not {cas_num}.')
+    if cas_num > int(device.rows) - int(device.row_start):
+        raise ConfigRefused(f'{node.name}: {cas_num} query chains need a row each, the array has {device.rows}.')
+    return cas_num, cas_length
+
+
+def check_bank(node: OpNode, device, ping: int) -> None:
+    if ping > int(device.bank_mem_bytes):
+        raise ConfigRefused(f'{node.name}: {ping} B of buffers in a bank of {int(device.bank_mem_bytes)}.')
+
+
+def stack_bytes(device, cas_length: int) -> int:
+    """The stack bank holds the stack and one copy of each table: the spilled scores and probabilities grow with the
+    keys and head dimension (4.6 KB measured at 64 keys, head dimension 32)."""
+    return int(device.bank_mem_bytes) - (2 if cas_length == 1 else 1) * TABLE_BYTES - 1024
+
+
+def softmax_arithmetic(node: OpNode, q_frac: int, k_frac: int, v_frac: int, out_frac: int) -> Dict[str, Any]:
+    """The logits' format and shifts, the exp table and the output's shift, from Q's, K's, V's and O's fixed points."""
+    meta = node.metadata
+    products = q_frac + k_frac
+    logits16 = int(meta['logit_bits']) == 32
+    if logits16:
+        # exact products, no logit format given: int16 logits as fine as the exp table can span (its last entry
+        # zero), the score scale and the temperature both in its step
+        scale = float(meta['score_scale']) * float(meta['temperature'])
+        logit_frac = min(products, math.floor(math.log2(scale * 255 / EXP_SPAN)))
+        score_shift = products - logit_frac
+        step = 2.0**-logit_frac * scale
+    else:
+        logit_frac = int(meta['logit_frac'])
+        score_shift = products - logit_frac + shift_of(float(meta['score_scale']), 'logit prescale', node)
+        step = 2.0**-logit_frac * float(meta['temperature'])
+    # O = (theta / 2^7) 2^e y / 2^out_shift, y ~ 2^28 / (sum 2^e): theta / sum is in v's format
+    out_shift = RECIP_SHIFT - THETA_SHIFT - (out_frac - v_frac)
+    out_shift += shift_of(float(meta['output_scale']), 'output scale', node)
+    if score_shift < 0 or out_shift < 0:
+        raise ValueError(f'{node.name}: logits or output finer than their products ({score_shift}, {out_shift}).')
+    return {
+        'logits16': logits16,
+        'score_shift': score_shift,
+        'out_shift': out_shift,
+        'exp_table': tuple(round(255 * math.exp(-d * step)) for d in range(256)),
+    }
+
+
+def attention_params(node: OpNode, config: AttentionConfig) -> Dict[str, Any]:
+    tokens = int(node.outputs[0].shape[0])
+    par = config.parallelism
+    return {
+        'parallelism': par,
+        'alternating_horizontal': config.alternating_horizontal,
+        'columns': config.columns,
+        'query_blocks': tokens // par.cas_num // 8,
+        'key_blocks': tokens // 8,
+        'logits16': config.logits16,
+        'score_shift': config.score_shift,
+        'out_shift': config.out_shift,
+        'stack_bytes': config.stack_bytes,
+        'exp_table': lut_layout(config.exp_table, config.table_bank_bits, uint8=True),
+        'recip_table': lut_layout(RECIP_TABLE, config.table_bank_bits),
+    }
+
+
+# The estimate charges a chain a cascade hand-over per further tile (`estimate.CASCADE_HOP_CYCLES`); a chain of two
+# here works on successive frames, so the hand-over is latency, not interval: `work` leaves it out.
+CHAIN_HANDOVER_CYCLES = 30
+
+
+def ranked_cycles(cycles: float, config) -> int:
+    """A chain's slower tile's cycles as `work` reports them, the hand-over of a chain of two left out."""
+    return round(cycles - (CHAIN_HANDOVER_CYCLES if config.parallelism.cas_length == 2 else 0))
+
+
+def attention_cycles(node: OpNode, config: AttentionConfig) -> int:
+    """Cycles of a chain's slower tile per call: per query block, fitted to the kernels' AIE-ML profiles at 32 and 64
+    tokens, head dimensions 16 to 64 (AIE-MLv2 runs them faster)."""
+    tokens = int(node.outputs[0].shape[0])
+    par = config.parallelism
+    qb, kb, nj = tokens // par.cas_num // 8, tokens // 8, config.columns // 8
+    if par.cas_length == 1:
+        block = 38 * kb + 12.3 * kb * nj + 21
+    else:  # the probabilities' tile or the values'
+        block = max(48 * kb + 6 * kb * nj - 50, 14 * kb * nj + 4 * nj + 10)
+    return round(25 + qb * block)

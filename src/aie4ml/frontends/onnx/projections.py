@@ -1,13 +1,11 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""A packed projection, as exporters emit one for attention's Q, K and V, split into one per slice of its output.
+"""A packed projection split per slice of its output, so each part is a Dense of its own (Q, K, V; a head's):
 
-    MatMul(x, W) [+ bias] -> Slice(..., a:b, last axis) ...   becomes   MatMul(x, W[:, a:b]) [+ bias[a:b]] ...
+    MatMul(x, W) [+ bias] [-> f] -> Slice(..., a:b, last axis)   becomes   MatMul(x, W[:, a:b]) [+ bias[a:b]] [-> f]
 
-W is a constant through its DequantizeLinear (and a Transpose); each part is then a Dense of its own, quantized as
-its slice is downstream. Dead nodes left behind are removed.
-"""
+with W a dequantized constant and f per-tensor ops (a QDQ, a scalar scale), copied per part."""
 
 from __future__ import annotations
 
@@ -15,13 +13,11 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .utils import attr, require_onnx, topological
+from .utils import GraphEdit, attr, attributes, copied
 
 
 def split_packed_projections(model_proto, initializers: Dict[str, np.ndarray], shape_of: Dict[str, Tuple[int, ...]]):
-    onnx, helper, numpy_helper = require_onnx()
-    model = onnx.ModelProto()
-    model.CopyFrom(model_proto)
+    model = copied(model_proto)
     graph = model.graph
     writer = {name: node for node in graph.node for name in node.output}
     readers: Dict[str, List] = {}
@@ -30,7 +26,7 @@ def split_packed_projections(model_proto, initializers: Dict[str, np.ndarray], s
             readers.setdefault(name, []).append(node)
     outputs = {value.name for value in graph.output}
 
-    added, removed, constants = [], set(), {}
+    edit, removed = GraphEdit(), set()
     for matmul in graph.node:
         if matmul.op_type != 'MatMul':
             continue
@@ -38,36 +34,29 @@ def split_packed_projections(model_proto, initializers: Dict[str, np.ndarray], s
         if weight is None:
             continue
         add, bias = _bias(matmul.output[0], readers, writer, initializers)
-        result = (add or matmul).output[0]
+        chain = _per_tensor_chain((add or matmul).output[0], readers, initializers)
+        result = (chain[-1] if chain else add or matmul).output[0]
         slices = [_last_axis_slice(node, initializers, shape_of) for node in readers.get(result, [])]
         if not slices or any(s is None for s in slices) or result in outputs:
             continue
         for node, (start, end) in slices:
             base = f'{node.name}_part'
-            w = _dequantized(weight, start, end, f'{base}_w', initializers, constants, added, helper)
-            mm = f'{base}_mm'
-            added.append(helper.make_node('MatMul', [matmul.input[0], w], [mm if add else node.output[0]], name=base))
+            ops = [matmul, *([add] if add else []), *chain]
+            values = [f'{base}_{op.name}' for op in ops[:-1]] + [node.output[0]]
+            w = _dequantized(weight, start, end, f'{base}_w', initializers, edit)
+            edit.emit('MatMul', [matmul.input[0], w], [values[0]], base)
             if add:
-                b = _dequantized(bias, start, end, f'{base}_b', initializers, constants, added, helper)
-                added.append(
-                    helper.make_node(
-                        'Add',
-                        [mm, b] if add.input[1] == matmul.output[0] else [b, mm],
-                        [node.output[0]],
-                        name=f'{base}_bias',
-                    )
-                )
+                b = _dequantized(bias, start, end, f'{base}_b', initializers, edit)
+                inputs = [values[0], b] if add.input[1] == matmul.output[0] else [b, values[0]]
+                edit.emit('Add', inputs, [values[1]], f'{base}_bias')
+            for at, op in enumerate(chain, start=len(ops) - len(chain)):
+                inputs = [values[at - 1], *op.input[1:]]
+                edit.emit(op.op_type, inputs, [values[at]], f'{base}_{op.name}', **attributes(op))
             removed.add(node.name)
-        removed.update(n.name for n in (matmul, add) if n is not None)
+        removed.update(n.name for n in (matmul, add, *chain) if n is not None)
 
-    if not added:
-        return model
-    nodes = [node for node in graph.node if node.name not in removed] + added
-    del graph.node[:]
-    graph.node.extend(topological(_live(nodes, outputs)))
-    for name, value in constants.items():
-        initializers[name] = value
-        graph.initializer.append(numpy_helper.from_array(value, name))
+    if edit.nodes:
+        edit.apply(model, initializers, _live([n for n in graph.node if n.name not in removed] + edit.nodes, outputs))
     return model
 
 
@@ -99,6 +88,23 @@ def _bias(name, readers, writer, initializers):
     return add, {'node': node, 'transposed': False, 'columns': 0}
 
 
+PER_TENSOR = frozenset({'QuantizeLinear', 'DequantizeLinear', 'Mul', 'Div'})
+
+
+def _per_tensor_chain(name, readers, initializers) -> List:
+    """The ops after `name`, each its value's only reader, that act on every element alike: a QDQ, a scalar scale."""
+    chain = []
+    while len(readers.get(name, [])) == 1:
+        node = readers[name][0]
+        if node.op_type not in PER_TENSOR or node.input[0] != name:
+            break
+        if any(c and (c not in initializers or np.asarray(initializers[c]).size != 1) for c in node.input[1:]):
+            break
+        chain.append(node)
+        name = node.output[0]
+    return chain
+
+
 def _last_axis_slice(node, initializers, shape_of) -> Optional[Tuple[object, Tuple[int, int]]]:
     if node.op_type != 'Slice' or node.input[0] not in shape_of:
         return None
@@ -114,28 +120,22 @@ def _last_axis_slice(node, initializers, shape_of) -> Optional[Tuple[object, Tup
     return (node, (start, end)) if start < end else None
 
 
-def _dequantized(source: dict, start: int, end: int, name: str, initializers, constants, added, helper) -> str:
+def _dequantized(source: dict, start: int, end: int, name: str, initializers, edit: GraphEdit) -> str:
     """The columns start:end of a dequantized constant (W or a bias), as a new constant and its DequantizeLinear."""
     node = source['node']
-    constants[f'{name}_q'] = np.take(initializers[node.input[0]], np.arange(start, end), axis=source['columns'])
-    inputs = [f'{name}_q', *node.input[1:]]
+    quantized = np.take(initializers[node.input[0]], np.arange(start, end), axis=source['columns'])
+    inputs = [edit.constant(f'{name}_q', quantized), *node.input[1:]]
     sliced_axis = int(attr(node, 'axis', 1)) % np.asarray(initializers[node.input[0]]).ndim == source['columns']
     for i, param in enumerate(node.input[1:], start=1):
         value = np.asarray(initializers[param])
         if value.size > 1 and sliced_axis:  # per-axis parameters along the split axis follow its slice
-            constants[f'{name}_p{i}'] = value[start:end]
-            inputs[i] = f'{name}_p{i}'
+            inputs[i] = edit.constant(f'{name}_p{i}', value[start:end])
     out = f'{name}_dq'
-    added.append(helper.make_node('DequantizeLinear', inputs, [out], name=f'{name}_dequantize', **_attributes(node)))
+    edit.emit('DequantizeLinear', inputs, [out], f'{name}_dequantize', **attributes(node))
     if source['transposed']:
-        added.append(helper.make_node('Transpose', [out], [f'{out}_t'], name=f'{name}_transpose', perm=[1, 0]))
+        edit.emit('Transpose', [out], [f'{out}_t'], f'{name}_transpose', perm=[1, 0])
         out = f'{out}_t'
     return out
-
-
-def _attributes(node) -> dict:
-    _, helper, _ = require_onnx()
-    return {a.name: helper.get_attribute_value(a) for a in node.attribute}
 
 
 def _live(nodes, outputs) -> List:

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
-from ..aie_types import QuantIntent
+from ..aie_types import QuantIntent, RoundingMode, SaturationMode
 from ..ir import get_backend_context
-from ..ir.graph import OpNode, input_tensor_for_role
+from ..ir.graph import OpNode, has_input_role, input_tensor_for_role
 from ..op_impls.registry import get_op_impl_registry
 from .base import AIEPass
 
@@ -36,10 +36,32 @@ class FuseAttention(AIEPass):
             if chain is None:
                 continue
             fused = _attention_node(*chain)
-            if any(v.matches(fused, ctx.device, {}) for v in get_op_impl_registry().candidates(ATTENTION)):
-                _replace(graph, chain, fused)
-                changed = True
+            if not _implemented(fused, ctx.device):
+                continue
+            _replace(graph, chain, fused)
+            changed = True
         return changed
+
+
+def absorb_projections(model_or_ctx) -> bool:
+    """Fold into each attention op the Dense ops projecting its Q, K and V from one x (`_projections`), where an
+    attention variant implements the result: the op then reads x and their weights. A Dense directed at all stays as
+    it is, and so does its head. A rewrite the design search weighs (`pipeline.SEARCHED_REWRITES`): a head reading x
+    computes every key's K and V in each of its chains, which the Dense ops compute once."""
+    ctx = get_backend_context(model_or_ctx)
+    graph = ctx.ir.logical
+    changed = False
+    for attention in [node for node in graph.nodes if node.op_type == ATTENTION and has_input_role(node, 'q')]:
+        denses = _projections(graph, attention)
+        head = None if denses is None else _head_node(attention, denses)
+        if head is not None and _implemented(head, ctx.device):
+            _absorb(graph, attention, denses, head)
+            changed = True
+    return changed
+
+
+def _implemented(node: OpNode, device) -> bool:
+    return any(v.matches(node, device, {}) for v in get_op_impl_registry().candidates(ATTENTION))
 
 
 def _single_reader(graph, tensor, reader_type: str) -> Optional[OpNode]:
@@ -131,3 +153,68 @@ def _replace(graph, chain: Tuple[OpNode, OpNode, OpNode], fused: OpNode) -> None
     graph.nodes[at] = fused
     for node in (scores, softmax):
         graph.nodes.remove(node)
+
+
+def _projections(graph, attention: OpNode) -> Optional[Dict[str, OpNode]]:
+    """The Dense writing each of the head's Q, K and V, where all three read one int8 x through int8 weights, carry
+    only a bias and an output scale, round half to even with saturation, and feed nothing else."""
+    denses = {}
+    for role in ('q', 'k', 'v'):
+        tensor = input_tensor_for_role(attention, role)
+        dense = tensor.producer
+        if dense is None or dense.op_type != 'dense' or dense.directives or set(dense.attributes) - {'output_scale'}:
+            return None
+        if len(tensor.consumers) != 1 or tensor.name in graph.output_tensor_names:
+            return None
+        if tensor.precision.rounding != RoundingMode.RND_CONV or tensor.precision.saturation != SaturationMode.SAT:
+            return None
+        if not _int(input_tensor_for_role(dense, 'rhs').precision, 8, True):
+            return None
+        denses[role] = dense
+    x = {input_tensor_for_role(dense, 'lhs').name: input_tensor_for_role(dense, 'lhs') for dense in denses.values()}
+    if len(x) != 1 or not _int(next(iter(x.values())).precision, 8, True):
+        return None
+    return denses
+
+
+def _head_node(attention: OpNode, denses: Dict[str, OpNode]) -> Optional[OpNode]:
+    """The attention reading x and the projections' weights and biases, or None where two share a constant."""
+    x = input_tensor_for_role(denses['q'], 'lhs')
+    inputs, roles = [x], {x.name: 'x'}
+    for role, dense in denses.items():
+        for kind, name in (('rhs', f'w{role}'), ('bias', f'b{role}')):
+            if has_input_role(dense, kind):
+                tensor = input_tensor_for_role(dense, kind)
+                inputs.append(tensor)
+                roles[tensor.name] = name
+    if len(roles) != len(inputs):
+        return None
+    projections = {
+        role: {'frac': int(dense.outputs[0].precision.frac), 'output_scale': _scale(dense, 'output_scale')}
+        for role, dense in denses.items()
+    }
+    return OpNode(
+        name=attention.name,
+        op_type=ATTENTION,
+        inputs=inputs,
+        outputs=list(attention.outputs),
+        metadata={
+            **attention.metadata,
+            'fused': [dense.name for dense in denses.values()] + list(attention.metadata['fused']),
+            'projections': projections,
+        },
+        directives=dict(attention.directives),
+        roles=roles,
+    )
+
+
+def _absorb(graph, attention: OpNode, denses: Dict[str, OpNode], head: OpNode) -> None:
+    absorbed = [*denses.values(), attention]
+    for tensor in head.inputs:
+        tensor.consumers = [node for node in tensor.consumers if node not in absorbed] + [head]
+    for tensor in head.outputs:
+        tensor.producer = head
+    for dense in denses.values():
+        del graph.tensors[dense.outputs[0].name]
+        graph.nodes.remove(dense)
+    graph.nodes[graph.nodes.index(attention)] = head

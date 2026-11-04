@@ -32,3 +32,15 @@ class AttentionConfig:
     stack_bytes: int
     #: the core's peak int8 multiply-accumulates a cycle: the unit of `work`
     int8_macs_per_cycle: int
+
+
+@dataclass(frozen=True)
+class AttentionHeadConfig(AttentionConfig):
+    #: x's columns as its two halves hold them (zeros past the model dimension, whose weight rows are zero too)
+    model_dim: int
+    #: O's columns as its buffer holds them: the head dimension, then zeros to what the Dense after it reads
+    out_columns: int
+    #: the key blocks a chain's first tile looks the probabilities up for: half of them in a pair, the rest its last
+    looked_blocks: int
+    #: each projection's accumulator to int8, as its Dense's: (q, k, v)
+    projection_shifts: Tuple[int, int, int]
