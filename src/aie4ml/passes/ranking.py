@@ -236,7 +236,10 @@ class _Reached(cp_model.CpSolverSolutionCallback):
 
     def on_solution_callback(self):
         self.best = round(self.ObjectiveValue())
-        self.bound(self.BestObjectiveBound())
+        # a solution its bound proves optimal ends the solve; stopping it then aborts CP-SAT 9.15 (a failed CHECK in
+        # its postsolve)
+        if math.ceil(self.BestObjectiveBound()) < self.best:
+            self.bound(self.BestObjectiveBound())
 
     def bound(self, bound: float) -> None:
         """The solver's bound rose to `bound` (`CpSolver.best_bound_callback`), or a solution came."""

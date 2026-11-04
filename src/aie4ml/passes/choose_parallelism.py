@@ -421,6 +421,7 @@ class _Shared:
     placed_fill: int = 0
     unplaced_fill: Optional[int] = None
     built: int = 0  # designs built, by the searches of every block height (AIEConfig SearchBuilds)
+    refused: int = 0  # designs a check refused once built, which SearchBuilds does not count
 
 
 class _Search:
@@ -1160,9 +1161,14 @@ class _Search:
         which placement then spares ranking; a design placement proves it cannot place with every design placement
         sees alike (`_Placed`); both in every search (`_Shared`). One placement finds no placement for in its time
         halves the fills tried (`_fill`), which leaves the design found not proven the best; any other refusal is cut
-        alone."""
+        alone, and takes none of the builds AIEConfig SearchBuilds allows."""
         alternatives, shared = self.alternatives, self.shared
         built = self._build(bound, best)
+        if isinstance(built, ConfigRefused) and not isinstance(built, (PlacementOutranked, PlacementInfeasibleError)):
+            self.cuts.append(_groups(alternatives, _keys(alternatives, picks, id), id))
+            shared.unbuilt[str(built)] += 1
+            shared.refused += 1
+            return None
         shared.built += 1
         if isinstance(built, PlacementOutranked):  # no better than the best, nor is any design ranking no better
             shared.cut.append(_keys(alternatives, picks, _alike))
@@ -1177,10 +1183,6 @@ class _Search:
                 full = bound.tiles + bound.reserved
                 shared.unplaced_fill = full if shared.unplaced_fill is None else min(shared.unplaced_fill, full)
             return None
-        if isinstance(built, ConfigRefused):
-            self.cuts.append(_groups(alternatives, _keys(alternatives, picks, id), id))
-            shared.unbuilt[str(built)] += 1
-            return None
         # every design placed alike in each layer and costing no less places no better than this one
         shared.cut.append(_keys(alternatives, picks, _alike))
         shared.placed_fill = max(shared.placed_fill, bound.tiles + bound.reserved)
@@ -1188,10 +1190,9 @@ class _Search:
 
     def refused(self) -> ConfigRefused:
         """Why no design was built, where no search of the pass built one."""
-        if self.shared.built:
-            return ConfigRefused(
-                self._failure(f'none of the {self.shared.built} designs within the tile budget can be built')
-            )
+        tried = self.shared.built + self.shared.refused
+        if tried:
+            return ConfigRefused(self._failure(f'none of the {tried} designs within the tile budget can be built'))
         kernels = _least(self.alternatives, lambda alt: alt.tiles)
         filled = _least(self.alternatives, lambda alt: alt.tiles + alt.reserved)
         return ConfigRefused(
