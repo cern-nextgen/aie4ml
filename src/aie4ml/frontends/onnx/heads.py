@@ -1,26 +1,21 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Attention computed for every head at once, as exporters emit it, rewritten head by head.
-
-An exporter splits the features into heads with a Reshape (..., D) -> (..., H, D / H), moves the head axis about with
-Transposes, multiplies, scales, quantizes and normalizes all heads in one op each, and merges them back with a Reshape
-(..., H, D / H) -> (..., D). Rewritten, each head is a Slice of the features through its own copy of every op, and the
-heads a Concat: what the per-head lowerings (a head's attention, a Dense) read. A region with an op this does not
-rewrite is left as it is.
-"""
+"""Attention of every head at once, as exporters emit it (a Reshape splitting the features into heads, each op on all
+heads, a Reshape merging them), rewritten head by head: each head a Slice of the features through its own copy of each
+op, the heads merged by a Concat. A region with an op this does not rewrite is kept."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .utils import attr, require_onnx, topological
+from .utils import GraphEdit, attr, attributes, copied
 
 COPIED = frozenset({'QuantizeLinear', 'DequantizeLinear', 'Div', 'Mul', 'Add', 'Sub'})
-"""Copied per head where every operand but the batched one is a scalar constant."""
+"""Copied per head where every operand but the batched one is a scalar constant, or for an Add the heads' bias."""
 
 
 @dataclass(frozen=True)
@@ -31,32 +26,17 @@ class Batched:
     heads: Tuple[str, ...]
 
 
-def unbatch_heads(model_proto, initializers: Dict[str, np.ndarray], shape_of: Dict[str, Tuple[int, ...]]):
-    """The model with each region of batched heads rewritten head by head (module docstring)."""
-    onnx, helper, numpy_helper = require_onnx()
-    model = onnx.ModelProto()
-    model.CopyFrom(model_proto)
+def unbatch_heads(
+    model_proto, initializers: Dict[str, np.ndarray], shapes: Callable[[object], Dict[str, Tuple[int, ...]]]
+):
+    """The model with each region of batched heads rewritten head by head; `shapes(model)` infers a model's shapes."""
+    model = copied(model_proto)
     while True:
-        rewrite = _first_region(model.graph, initializers, shape_of, helper, numpy_helper)
-        if rewrite is None:
+        region = _first_region(model.graph, initializers, shapes(model))
+        if region is None:
             return model
-        removed, added, constants = rewrite
-        nodes = [node for node in model.graph.node if node.name not in removed] + added
-        del model.graph.node[:]
-        model.graph.node.extend(topological(nodes))
-        for name, value in constants.items():
-            initializers[name] = value
-            model.graph.initializer.append(numpy_helper.from_array(value, name))
-        _infer(model, shape_of)
-
-
-def _infer(model, shape_of) -> None:
-    onnx, _, _ = require_onnx()
-    inferred = onnx.shape_inference.infer_shapes(model)
-    for value_info in list(inferred.graph.value_info) + list(inferred.graph.output):
-        dims = value_info.type.tensor_type.shape.dim
-        if dims and all(dim.HasField('dim_value') for dim in dims):
-            shape_of[value_info.name] = tuple(int(dim.dim_value) for dim in dims)
+        kept = [node for node in model.graph.node if node.name not in region.removed]
+        region.apply(model, initializers, kept + region.nodes)
 
 
 def _split(node, initializers, shape_of) -> Optional[Tuple[int, int]]:
@@ -69,36 +49,26 @@ def _split(node, initializers, shape_of) -> Optional[Tuple[int, int]]:
     return int(out[-2]), int(out[-1])
 
 
-def _first_region(graph, initializers, shape_of, helper, numpy_helper):
-    """The region of the first head split, with every other split of as many heads of the same size (Q's, K's and V's
-    meet in the products), rewritten: (names of the nodes it replaces, the nodes replacing them, new constants); None
-    where no region rewrites."""
+def _first_region(graph, initializers, shape_of) -> Optional['_Region']:
+    """The region of the first head split and every split like it (Q's, K's and V's), rewritten; None if it is not."""
     splits = [(node, _split(node, initializers, shape_of)) for node in graph.node]
     splits = [(node, heads) for node, heads in splits if heads is not None]
     if not splits:
         return None
     heads = splits[0][1]
-    entries = {node.name for node, other in splits if other == heads}
-    return _Region(entries, heads, graph, initializers, shape_of, helper).rewrite()
+    region = _Region({node.name for node, other in splits if other == heads}, heads, graph, initializers, shape_of)
+    return region if region.rewrite() else None
 
 
-class _Region:
-    def __init__(self, entries, heads, graph, initializers, shape_of, helper):
+class _Region(GraphEdit):
+    def __init__(self, entries, heads, graph, initializers, shape_of):
+        super().__init__()
         self.entries, (self.count, self.size) = entries, heads
-        self.graph, self.initializers, self.shape_of, self.helper = graph, initializers, shape_of, helper
-        self.nodes: List = []
-        self.constants: Dict[str, np.ndarray] = {}
+        self.graph, self.initializers, self.shape_of = graph, initializers, shape_of
         self.batched: Dict[str, Batched] = {}
         self.removed = set()
 
-    def constant(self, name: str, value) -> str:
-        self.constants[name] = np.asarray(value)
-        return name
-
-    def emit(self, op_type: str, inputs, outputs, name: str, **attrs) -> None:
-        self.nodes.append(self.helper.make_node(op_type, list(inputs), list(outputs), name=name, **attrs))
-
-    def rewrite(self):
+    def rewrite(self) -> bool:
         """Every node in graph order, so a node's batched operands are rewritten before it."""
         exits = 0
         for node in self.graph.node:
@@ -107,15 +77,13 @@ class _Region:
             elif any(name in self.batched for name in node.input):
                 result = self.node(node)
                 if result is None:
-                    return None
+                    return False
                 exits += result == 'exit'
             else:
                 continue
             self.removed.add(node.name)
         outputs = {value.name for value in self.graph.output}
-        if not exits or any(name in outputs for name in self.batched):
-            return None
-        return self.removed, self.nodes, self.constants
+        return bool(exits) and not any(name in outputs for name in self.batched)
 
     def split(self, entry) -> None:
         """A head split: each head a Slice of the features."""
@@ -188,18 +156,48 @@ class _Region:
         if len(batched) != 1:
             return None
         b = batched[0]
-        for name, other in zip(node.input, ins):
+        rank = len(self.shape_of[node.input[ins.index(b)]])
+        per_head = {}  # by operand: each head's part of a bias
+        for i, (name, other) in enumerate(zip(node.input, ins)):
             scalar = name in self.initializers and np.asarray(self.initializers[name]).size == 1
             if other is None and name and not scalar:
-                return None
+                parts = self.bias(name, b, rank) if node.op_type == 'Add' else None
+                if parts is None:
+                    return None
+                per_head[i] = parts
         heads = []
         for h, src in enumerate(b.heads):
             out = f'{node.name}_h{h}_out'
-            inputs = [src if other is not None else name for name, other in zip(node.input, ins)]
-            self.emit(node.op_type, inputs, [out], f'{node.name}_h{h}', **_attributes(node))
+            inputs = [
+                src if other is not None else per_head[i][h] if i in per_head else name
+                for i, (name, other) in enumerate(zip(node.input, ins))
+            ]
+            self.emit(node.op_type, inputs, [out], f'{node.name}_h{h}', **attributes(node))
             heads.append(out)
         self.batched[node.output[0]] = Batched(b.axis, tuple(heads))
         return [node.output[0]]
+
+    def bias(self, name: str, b: Batched, rank: int) -> Optional[List[str]]:
+        """Each head's part of a tensor added to `b`: itself without a head axis (a 2D mask), the head's rows of a
+        (heads, queries, keys) one; else None."""
+        shape = self.shape_of.get(name)
+        if shape is None:
+            return None
+        if b.axis < rank - len(shape):
+            return [name] * self.count
+        if b.axis - (rank - len(shape)) != 0 or len(shape) != 3 or shape[0] != self.count:
+            return None
+        rows = f'{name}_rows'  # the heads' rows one after another
+        parts = [f'{name}_h{h}' for h in range(self.count)]
+        if rows in self.shape_of:  # an earlier attention's, which every layer adding this bias shares
+            return parts
+        self.emit('Reshape', [name, self.constant(f'{rows}_shape', [shape[0] * shape[1], shape[2]])], [rows], rows)
+        self.shape_of[rows] = (shape[0] * shape[1], shape[2])
+        for h, base in enumerate(parts):
+            bounds = [(n, v) for n, v in (('starts', h * shape[1]), ('ends', (h + 1) * shape[1]), ('axes', 0))]
+            self.emit('Slice', [rows, *(self.constant(f'{base}_{n}', [v]) for n, v in bounds)], [base], base)
+            self.shape_of[base] = tuple(shape[1:])
+        return parts
 
     def matmul(self, node, ins: List[Optional[Batched]]):
         lhs, rhs = ins
@@ -228,8 +226,3 @@ class _Region:
             heads.append(out)
         self.batched[node.output[0]] = Batched(b.axis, tuple(heads))
         return [node.output[0]]
-
-
-def _attributes(node) -> dict:
-    _, helper, _ = require_onnx()
-    return {a.name: helper.get_attribute_value(a) for a in node.attribute}

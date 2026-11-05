@@ -5,10 +5,8 @@ import numpy as np
 from ....ir import input_tensor_for_role
 from ....ir.graph import has_input_role
 from ...family_registry import FamilyResolver, family_resolver
-
-
-def _divisors(n: int):
-    return [d for d in range(1, n + 1) if n % d == 0]
+from ...utils.math import divisors
+from ...utils.tiling import band_microtiling_candidates
 
 
 @family_resolver('attention')
@@ -21,8 +19,13 @@ class AttentionFamilyResolver(FamilyResolver):
         blocks = int(node.outputs[0].shape[0]) // 8
         rows = max(1, int(device.rows) - int(device.row_start))
         return tuple(
-            {'contract': 'outer', 'cas_num': n, 'cas_length': c} for n in _divisors(blocks) if n <= rows for c in (1, 2)
+            {'contract': 'outer', 'cas_num': n, 'cas_length': c} for n in divisors(blocks) if n <= rows for c in (1, 2)
         )
+
+    def microtiling_candidates(self, node, device):
+        """The row bands a head projecting its own Q may write O in, so the Dense after it reads O directly; O is in
+        Q's microtile otherwise."""
+        return band_microtiling_candidates(node, device) if has_input_role(node, 'x') else ()
 
     def macs(self, node) -> int:
         tokens, head_dim = (int(x) for x in node.outputs[0].shape)
@@ -47,3 +50,7 @@ class AttentionFamilyResolver(FamilyResolver):
                 )
         if len(out) != 2 or out[0] % 8 or out[1] % 8:
             raise ValueError(f'{node.name}: attention needs tokens and head_dim in whole 8s, got {out}.')
+        if has_input_role(node, 'bias'):
+            u = tuple(int(d) for d in input_tensor_for_role(node, 'bias').shape)
+            if u != (out[0], out[0]):
+                raise ValueError(f'{node.name}: attention adds a bias of (tokens, tokens) to its logits, got {u}.')

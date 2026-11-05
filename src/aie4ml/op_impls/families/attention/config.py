@@ -26,12 +26,16 @@ class AttentionConfig:
     #: round(255 exp(-gap * step)) for logit gaps 0..255, a step of the logits in the Softmax's units: the
     #: unnormalised probabilities
     exp_table: Tuple[int, ...]
-    #: the data-memory bank width its lookup tables repeat each chunk at
+    #: the width its lookup tables repeat each chunk at (`DeviceSpec.lookup_bank_bits`)
     table_bank_bits: int
     #: each tile's stack: what its stack bank leaves
     stack_bytes: int
     #: the core's peak int8 multiply-accumulates a cycle: the unit of `work`
     int8_macs_per_cycle: int
+    #: the logits' additive bias, 8 or 16 bits (0: none), which starts their accumulator shifted to the products'
+    #: fixed point by bias_shift
+    bias_bits: int
+    bias_shift: int
 
 
 @dataclass(frozen=True)

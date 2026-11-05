@@ -1,12 +1,13 @@
-"""Fuse each attention head, Q·Kᵀ -> Softmax -> ·V, into one 'attention' op."""
+"""Fuse each attention head, Q·Kᵀ [+ U] -> Softmax -> ·V, into one 'attention' op."""
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional
 
 from ..aie_types import QuantIntent, RoundingMode, SaturationMode
 from ..ir import get_backend_context
 from ..ir.graph import OpNode, has_input_role, input_tensor_for_role
+from ..op_impls.family_registry import fusions_of
 from ..op_impls.registry import get_op_impl_registry
 from .base import AIEPass
 
@@ -14,15 +15,10 @@ ATTENTION = 'attention'
 
 
 class FuseAttention(AIEPass):
-    """Replace a matmul reading K transposed, the Softmax over its rows and the matmul of the probabilities with V
-    by one 'attention' op reading Q, K and V, where an attention variant implements it on the device.
-
-    Runs after FoldScale and FoldViewOps: the logits' prescale is the scores matmul's output_scale, a temperature the
-    Softmax's input_scale, and K's transpose the scores matmul's io_view. The op keeps the probabilities unnormalised
-    where the graph rounds them to uint8, so its output is within about a code of the QDQ model's. It takes the
-    Softmax's name and its directives: a 'parallelism' there directs the attention; a Softmax directed otherwise (its
-    approximation, layout, microtiling), or a matmul directed at all, stays as it is.
-    """
+    """Fuse a matmul reading K transposed, the Softmax over its rows and the matmul with V, and an Add of a logits bias
+    U before the Softmax, into one 'attention' op where a variant implements it. Runs after FoldScale and FoldViewOps,
+    which leave the scales and K's transpose as attributes. The op takes the Softmax's name and directives; a Softmax
+    directed beyond 'parallelism', or a directed matmul or Add, stays as it is."""
 
     def __init__(self):
         self.name = 'fuse_attention'
@@ -32,22 +28,20 @@ class FuseAttention(AIEPass):
         graph = ctx.ir.logical
         changed = False
         for softmax in [node for node in graph.nodes if node.op_type == 'softmax']:
-            chain = _head(graph, softmax)
-            if chain is None:
+            head = _head(graph, softmax)
+            if head is None:
                 continue
-            fused = _attention_node(*chain)
+            fused = _attention_node(head)
             if not _implemented(fused, ctx.device):
                 continue
-            _replace(graph, chain, fused)
+            _replace(graph, head, fused)
             changed = True
         return changed
 
 
 def absorb_projections(model_or_ctx) -> bool:
-    """Fold into each attention op the Dense ops projecting its Q, K and V from one x (`_projections`), where an
-    attention variant implements the result: the op then reads x and their weights. A Dense directed at all stays as
-    it is, and so does its head. A rewrite the design search weighs (`pipeline.SEARCHED_REWRITES`): a head reading x
-    computes every key's K and V in each of its chains, which the Dense ops compute once."""
+    """Fold into each attention the undirected Dense ops projecting its Q, K and V from one x (`_projections`), where a
+    variant implements the result. The design search weighs it (`pipeline.SEARCHED_REWRITES`)."""
     ctx = get_backend_context(model_or_ctx)
     graph = ctx.ir.logical
     changed = False
@@ -61,7 +55,8 @@ def absorb_projections(model_or_ctx) -> bool:
 
 
 def _implemented(node: OpNode, device) -> bool:
-    return any(v.matches(node, device, {}) for v in get_op_impl_registry().candidates(ATTENTION))
+    variants = get_op_impl_registry().candidates(ATTENTION)
+    return any(fusions_of(node) <= v.supported_fusions and v.matches(node, device, {}) for v in variants)
 
 
 def _single_reader(graph, tensor, reader_type: str) -> Optional[OpNode]:
@@ -81,11 +76,38 @@ def _int(precision, width: int, signed: bool, frac: Optional[int] = None) -> boo
     )
 
 
-def _head(graph, softmax: OpNode) -> Optional[Tuple[OpNode, OpNode, OpNode]]:
-    """(scores, softmax, context) of one head, or None where the three do not form one."""
+class _Head(NamedTuple):
+    scores: OpNode
+    softmax: OpNode
+    context: OpNode
+    add: Optional[OpNode]  # the Add of the bias, if any
+    bias: Optional[object]  # its U
+
+    @property
+    def nodes(self):
+        return [node for node in (self.scores, self.add, self.softmax) if node is not None] + [self.context]
+
+
+def _head(graph, softmax: OpNode) -> Optional[_Head]:
+    """The ops of one head, or None where they do not form one."""
     logits = softmax.inputs[0]
+    if _single_reader(graph, logits, 'softmax') is not softmax:
+        return None
+    add, bias, reader = logits.producer, None, softmax
+    if add is not None and add.op_type == 'add':  # logits + U
+        if add.directives or add.attributes:
+            return None
+        lhs, rhs = input_tensor_for_role(add, 'lhs'), input_tensor_for_role(add, 'rhs')
+        logits, bias = (lhs, rhs) if lhs.producer is not None and lhs.producer.op_type == 'matmul' else (rhs, lhs)
+        if bias.is_parameter or not (_int(bias.precision, 8, True) or _int(bias.precision, 16, True)):
+            return None
+        if not _exact_or_int8(softmax.inputs[0]) or tuple(bias.shape) != (logits.shape[0], logits.shape[0]):
+            return None
+        reader = add
+    else:
+        add = None
     scores = logits.producer
-    if scores is None or scores.op_type != 'matmul' or _single_reader(graph, logits, 'softmax') is not softmax:
+    if scores is None or scores.op_type != 'matmul' or _single_reader(graph, logits, reader.op_type) is not reader:
         return None
     context = _single_reader(graph, softmax.outputs[0], 'matmul')
     if context is None or scores.directives or context.directives or set(softmax.directives) - {'parallelism'}:
@@ -101,15 +123,18 @@ def _head(graph, softmax: OpNode) -> Optional[Tuple[OpNode, OpNode, OpNode]]:
         return None
     if set(context.attributes) - {'output_scale'}:
         return None
-    if not all(_int(t.precision, 8, True) for t in (q, k, v, context.outputs[0])):
-        return None
-    if not (_int(logits.precision, 8, True) or _int(logits.precision, 32, True)):  # quantized, or exact products
+    if not all(_int(t.precision, 8, True) for t in (q, k, v, context.outputs[0])) or not _exact_or_int8(logits):
         return None
     if not _int(p.precision, 8, False) or int(p.precision.frac) > 8:  # uint8 probabilities the graph never clips
         return None
     if len(q.shape) != 2 or tuple(q.shape) != tuple(k.shape) or tuple(v.shape) != tuple(k.shape):
         return None
-    return scores, softmax, context
+    return _Head(scores, softmax, context, add, bias)
+
+
+def _exact_or_int8(logits) -> bool:
+    """Quantized int8 logits, or exact int32 ones (exact products, or their sum with a bias)."""
+    return _int(logits.precision, 8, True) or _int(logits.precision, 32, True)
 
 
 def _scale(node: OpNode, name: str) -> float:
@@ -117,41 +142,43 @@ def _scale(node: OpNode, name: str) -> float:
     return 1.0 if scale is None else float(scale.scale)
 
 
-def _attention_node(scores: OpNode, softmax: OpNode, context: OpNode) -> OpNode:
+def _attention_node(head: _Head) -> OpNode:
+    scores, softmax, context = head.scores, head.softmax, head.context
     q, k = input_tensor_for_role(scores, 'lhs'), input_tensor_for_role(scores, 'rhs')
     v = input_tensor_for_role(context, 'rhs')
+    logits = softmax.inputs[0]  # the Softmax's input format: the logits', or their sum's with the bias
+    bias = [] if head.bias is None else [head.bias]
     return OpNode(
         name=softmax.name,
         op_type=ATTENTION,
-        inputs=[q, k, v],
+        inputs=[q, k, v, *bias],
         outputs=list(context.outputs),
         metadata={
             'layer_class': 'Attention',
             'source_layer': softmax.metadata.get('source_layer', softmax.name),
-            'fused': [scores.name, softmax.name, context.name],
-            'logit_frac': int(scores.outputs[0].precision.frac),
-            'logit_bits': int(scores.outputs[0].precision.width),
+            'fused': [node.name for node in head.nodes],
+            'logit_frac': int(logits.precision.frac),
+            'logit_bits': int(logits.precision.width),
             'probability_frac': int(softmax.outputs[0].precision.frac),
             'score_scale': _scale(scores, 'output_scale'),
             'temperature': _scale(softmax, 'input_scale'),
             'output_scale': _scale(context, 'output_scale'),
         },
         directives=dict(softmax.directives),
-        roles={q.name: 'q', k.name: 'k', v.name: 'v'},
+        roles={q.name: 'q', k.name: 'k', v.name: 'v', **({head.bias.name: 'bias'} if bias else {})},
     )
 
 
-def _replace(graph, chain: Tuple[OpNode, OpNode, OpNode], fused: OpNode) -> None:
-    scores, softmax, context = chain
+def _replace(graph, head: _Head, fused: OpNode) -> None:
+    nodes = head.nodes
     for tensor in fused.inputs:
-        tensor.consumers = [node for node in tensor.consumers if node not in chain] + [fused]
+        tensor.consumers = [node for node in tensor.consumers if node not in nodes] + [fused]
     for tensor in fused.outputs:
         tensor.producer = fused
-    for tensor in (scores.outputs[0], softmax.outputs[0]):
-        del graph.tensors[tensor.name]
-    at = graph.nodes.index(context)
-    graph.nodes[at] = fused
-    for node in (scores, softmax):
+    for node in nodes[:-1]:
+        del graph.tensors[node.outputs[0].name]
+    graph.nodes[graph.nodes.index(head.context)] = fused
+    for node in nodes[:-1]:
         graph.nodes.remove(node)
 
 
@@ -178,7 +205,8 @@ def _projections(graph, attention: OpNode) -> Optional[Dict[str, OpNode]]:
 
 
 def _head_node(attention: OpNode, denses: Dict[str, OpNode]) -> Optional[OpNode]:
-    """The attention reading x and the projections' weights and biases, or None where two share a constant."""
+    """The attention reading x, the projections' weights and biases, and the logits' bias if any; or None where two
+    share a constant."""
     x = input_tensor_for_role(denses['q'], 'lhs')
     inputs, roles = [x], {x.name: 'x'}
     for role, dense in denses.items():
@@ -187,6 +215,10 @@ def _head_node(attention: OpNode, denses: Dict[str, OpNode]) -> Optional[OpNode]
                 tensor = input_tensor_for_role(dense, kind)
                 inputs.append(tensor)
                 roles[tensor.name] = name
+    if has_input_role(attention, 'bias'):
+        u = input_tensor_for_role(attention, 'bias')
+        inputs.append(u)
+        roles[u.name] = 'bias'
     if len(roles) != len(inputs):
         return None
     projections = {

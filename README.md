@@ -28,6 +28,7 @@ The full constraints are in [docs/support.md](docs/support.md).
 | Add | ✅ | ✅ | ✅ | Both inputs and the output of one type | Same shapes; no broadcasting. |
 | LayerNorm | ✅ | ✅ | ✅ | int8 | Last axis. |
 | Softmax | ✅ | ✅ | ✅ | int8 in, uint8 or int16 out | Last axis. Accurate exponential (beta), or a faster surrogate for models trained with it. |
+| Attention (Q·Kᵀ → Softmax → ·V) | ✖️ | ✅ | ✅ | int8 Q, K, V and output; uint8 probabilities | One op per head, up to 128 tokens, head dimension a multiple of 8. Fuses an int8 or int16 bias added to the logits (a mask, for instance) and, where it ranks better, the Q, K, V projections. Multi-head exports are split head by head. Within about a code of the QDQ graph. |
 | ReduceMean, ReduceSum | ✖️ | ✅ | ✅ | int8 | Pooling over sets: over the axes between the first and the last, fused into the Dense before it. |
 | Flatten / Reshape | ✅ | ✅ | ✅ | — | One sample to `[1, K]`, from a Conv2D into a Dense; or rows regrouped, the last axis kept, into a fused pool. No data is copied. |
 | Transpose | ✖️ | ✅ | ✅ | — | Of the last two axes. |

@@ -72,7 +72,7 @@ def lower_onnx_model(
     model_proto = fold_constants(_named(model_proto), initializers, shapes)
     model_proto, graph.host_shapes = drop_unit_axes(model_proto, initializers, shapes(model_proto))
     model_proto = split_packed_projections(model_proto, initializers, shapes(model_proto))
-    model_proto = unbatch_heads(model_proto, initializers, shapes(model_proto))
+    model_proto = unbatch_heads(model_proto, initializers, shapes)
     model_proto = split_packed_projections(model_proto, initializers, shapes(model_proto))
     graph_proto = model_proto.graph
     shape_of = shapes(model_proto)
@@ -108,13 +108,15 @@ def _named(model_proto):
     return model
 
 
-def _exact_product(node) -> None:
-    """A product of two activations no quantizer follows -- attention's scores before a Softmax, as exporters leave
-    them -- is its exact accumulator: 32 bits, its operands' fraction bits summed."""
+def _exact_result(node) -> None:
+    """A product or sum of two activations no quantizer follows (attention's scores and their bias, as exporters leave
+    them) is exact in 32 bits: at the operands' fraction bits summed, or the finer operand's."""
     out = node.outputs[0]
     lhs, rhs = node.inputs[:2]
     if out.precision is None and isinstance(lhs.precision, QuantIntent) and isinstance(rhs.precision, QuantIntent):
-        out.precision = replace(lhs.precision, width=32, frac=lhs.precision.frac + rhs.precision.frac, signed=True)
+        fracs = (int(lhs.precision.frac), int(rhs.precision.frac))
+        frac = sum(fracs) if node.op_type == 'matmul' else max(fracs)
+        out.precision = replace(lhs.precision, width=32, frac=frac, signed=True)
 
 
 def _finalize(ctx: OnnxImportContext, graph_proto) -> None:
@@ -139,8 +141,8 @@ def _finalize(ctx: OnnxImportContext, graph_proto) -> None:
         role_names = node.metadata.pop('input_roles', None)
         if role_names:
             set_input_roles(node, node.inputs, role_names)
-        if node.op_type == 'matmul':
-            _exact_product(node)
+        if node.op_type in ('matmul', 'add'):
+            _exact_result(node)
 
     for target, source in ctx.precision_mirrors:
         tensor = graph.tensors.get(target)

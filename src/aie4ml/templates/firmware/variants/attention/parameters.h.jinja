@@ -18,6 +18,11 @@ struct {{L.struct_name}} {
 {{ buffer_locations('IN2_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in2') | list) }}
 {{ buffer_locations('IN3_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in3') | list) }}
 {{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
+{% if P.bias_bits %}
+  using bias_t = {{P.bias_type}};
+  static constexpr int BIAS_SHIFT = {{P.bias_shift}};  // the bias up to the products' fixed point
+{{ buffer_locations('IN4_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in4') | list) }}
+{% endif %}
   inline static constexpr int16_t EXP_TABLE[TABLE_SIZE] = { {%- for v in P.exp_table -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
   inline static constexpr int16_t RECIP_TABLE[TABLE_SIZE] = { {%- for v in P.recip_table -%}{{ v }}{{ ", " if not loop.last }}{%- endfor -%} };
   static constexpr int col_placement = {{L.placement.col}};

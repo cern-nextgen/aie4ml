@@ -188,6 +188,14 @@ def resolve_bias_dtype(node, precision: Dict[str, AIEDataType]) -> AIEDataType:
     return AIEDataType(format='int32', frac=frac)
 
 
+def scale_shift(scale: float) -> Optional[int]:
+    """The right-shift applying a power-of-two scale in (0, 1]; None for any other scale."""
+    if not 0.0 < scale <= 1.0:
+        return None
+    shift = int(round(-math.log2(scale)))
+    return shift if math.isclose(scale, math.ldexp(1.0, -shift), rel_tol=0.0, abs_tol=1e-12) else None
+
+
 def resolve_output_scale_shift(node, *, is_float: bool) -> int:
     folded = node.attributes.get('output_scale')
     if folded is None:
@@ -197,8 +205,8 @@ def resolve_output_scale_shift(node, *, is_float: bool) -> int:
         raise NotImplementedError(f'{node.name}: fused output scaling is not implemented for float MatMul-family ops.')
     if scale <= 0.0 or scale > 1.0:
         raise ValueError(f'{node.name}: fused output scale must be in the range (0, 1], got {scale}.')
-    shift = int(round(-math.log2(scale)))
-    if not math.isclose(scale, math.ldexp(1.0, -shift), rel_tol=0.0, abs_tol=1e-12):
+    shift = scale_shift(scale)
+    if shift is None:
         raise NotImplementedError(
             f'{node.name}: fused output scale {scale} is not a power of two; '
             'fixed-point multiplier scaling is not implemented.'

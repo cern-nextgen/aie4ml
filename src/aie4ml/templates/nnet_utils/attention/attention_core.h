@@ -1,11 +1,12 @@
 // Copyright 2025 D. Danopoulos, aie4ml
 // SPDX-License-Identifier: Apache-2.0
 
-// The device code every attention kernel shares (attention.cpp, attention_head.cpp). Integer throughout, rounding half
-// to even: bit-exact across simulators.
+// The device code every attention kernel shares (attention.cpp, attention_head.cpp and their bias flavours). Integer
+// throughout, rounding half to even: bit-exact across simulators.
 //
 // Per query block, transposed so the per-query work runs along lanes (lane key * 8 + query):
-//   S^T = K Q^T, int8 logits (int16 where the op chose their format: LOGITS16); m = their maximum
+//   S^T = K Q^T (+ U^T, an additive bias), int8 logits (int16 where the op chose their format: LOGITS16); m = their
+//   maximum
 //   P^T = exp table[m - S^T] (uint8, exp(0) = 255), unnormalised
 //   l = ones P^T, then theta^T = V^T P^T THETA_GROUP head-dimension tiles at a time on the matrix unit: an 8x8 int32
 //   accumulator is a quarter of AIE-ML's, so a whole head dimension's would spill
@@ -25,9 +26,56 @@ using i16x16 = aie::vector<int16, 16>;
 using i16x32 = aie::vector<int16, 32>;
 using acc32x16 = aie::accum<acc32, 16>;
 using acc32x64 = aie::accum<acc32, 64>;
-using score_mm = aie::mmul<8, 8, 8, int8, int8, acc32>;
-using value_mm = aie::mmul<8, 8, 8, int8, uint8, acc32>;
-using sum_mm = aie::mmul<8, 8, 8, uint8, uint8, acc32>;
+#if __AIE_ARCH__ == 20
+// AIE-ML has no 8x8x8 int8 mode: aie::mmul<8, 8, 8> forms rows 4-7 from a shuffle of A. A 4x8x8 product per half of A
+// needs none, into the same accumulator (rows 0-3, then 4-7).
+template <typename TA, typename TB>
+struct mmul8 {
+  aie::mmul<4, 8, 8, TA, TB, acc32> lo, hi;
+
+  mmul8() = default;
+  explicit mmul8(const acc32x64& acc) : lo(acc.template extract<32>(0)), hi(acc.template extract<32>(1)) {}
+  void mul(const aie::vector<TA, 64>& a, const aie::vector<TB, 64>& b)
+  {
+    lo.mul(a.template extract<32>(0), b);
+    hi.mul(a.template extract<32>(1), b);
+  }
+  void mac(const aie::vector<TA, 64>& a, const aie::vector<TB, 64>& b)
+  {
+    lo.mac(a.template extract<32>(0), b);
+    hi.mac(a.template extract<32>(1), b);
+  }
+  acc32x64 to_accum() const { return aie::concat(lo.to_accum(), hi.to_accum()); }
+  template <typename T>
+  aie::vector<T, 64> to_vector(int shift = 0) const
+  {
+    return to_accum().template to_vector<T>(shift);
+  }
+};
+
+// A buffer every query block reads alike (K, V, the query projection's weights). The compiler would hoist those reads
+// out of the query loop and park them on the stack; through chess_copy each block, they stay in the loop.
+template <typename T>
+struct reread {
+  const T* data;
+
+  __attribute__((always_inline)) const T* operator()() { return data = chess_copy(data); }
+};
+#else
+template <typename TA, typename TB>
+using mmul8 = aie::mmul<8, 8, 8, TA, TB, acc32>;
+
+// AIE-MLv2 runs faster with those reads hoisted.
+template <typename T>
+struct reread {
+  const T* data;
+
+  __attribute__((always_inline)) const T* operator()() const { return data; }
+};
+#endif
+using score_mm = mmul8<int8, int8>;
+using value_mm = mmul8<int8, uint8>;
+using sum_mm = mmul8<uint8, uint8>;
 using exp_lookup = aie::parallel_lookup<uint8, aie::lut<4, int8>>;
 using recip_lookup = aie::parallel_lookup<uint8, aie::lut<4, int16>>;
 
@@ -88,10 +136,13 @@ __attribute__((always_inline)) inline u8x64 lookup(exp_lookup& exp, const u8x64&
 }
 
 // P^T of a query block from its Q^T (the 8 queries twice in every 16 lanes of the maximum): the first LOOKED key
-// blocks' probabilities, the gaps of the rest for the next tile to look up.
-template <typename C, int LOOKED = shape<C>::KB>
+// blocks' probabilities, the gaps of the rest for the next tile to look up. With a bias B (attention_bias.h), u is the
+// block's: an 8x8 tile of 8 queries by 8 keys a key block, which starts the scores' accumulator at the products' fixed
+// point (BIAS_SHIFT), so logits and bias round once.
+template <typename C, int LOOKED = shape<C>::KB, typename B = void>
 __attribute__((always_inline)) inline void probabilities(const i8x64 (&qt)[shape<C>::NJ], const int8* __restrict k,
-                                                         exp_lookup& exp, u8x64 (&p)[shape<C>::KB])
+                                                         exp_lookup& exp, u8x64 (&p)[shape<C>::KB],
+                                                         const B* __restrict u = nullptr)
 {
   constexpr int NJ = shape<C>::NJ, KB = shape<C>::KB;
 
@@ -99,7 +150,14 @@ __attribute__((always_inline)) inline void probabilities(const i8x64 (&qt)[shape
   aie::vector<logit, 64> s[KB], mx;
   for (int b = 0; b < KB; ++b) chess_unroll_loop(*) {
     score_mm acc;
-    acc.mul(load_tile<C::K_ROWS, NJ>(k + tile_at<C::K_ROWS, NJ>(b, 0)), qt[0]);
+    if constexpr (std::is_void_v<B>) {
+      acc.mul(load_tile<C::K_ROWS, NJ>(k + tile_at<C::K_ROWS, NJ>(b, 0)), qt[0]);
+    } else {
+      acc32x64 bias;
+      bias.from_vector(aie::transpose(aie::load_v<64>(u + 64 * b), 8, 8), C::BIAS_SHIFT);
+      acc = score_mm(bias);
+      acc.mac(load_tile<C::K_ROWS, NJ>(k + tile_at<C::K_ROWS, NJ>(b, 0)), qt[0]);
+    }
     for (int j = 1; j < NJ; ++j) chess_unroll_loop(*) acc.mac(load_tile<C::K_ROWS, NJ>(k + tile_at<C::K_ROWS, NJ>(b, j)), qt[j]);
     s[b] = acc.template to_vector<logit>(C::SCORE_SHIFT);
     mx = b == 0 ? s[b] : aie::max(mx, s[b]);

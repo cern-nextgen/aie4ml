@@ -122,12 +122,6 @@ def _supported_microtile_options(generation: str, lhs_dtype, rhs_dtype):
     return list(MICROTILE_OPTIONS[generation].get(key, []))
 
 
-def default_lhs_microtile(generation: str, lhs_dtype, rhs_dtype) -> MicrotileShape:
-    """The microtile a Dense reads its input in where nothing else decides it (`_resolve_tile_cfg`)."""
-    m, k, _ = _supported_microtile_options(generation, lhs_dtype, rhs_dtype)[0]
-    return MicrotileShape(outer=int(m), inner=int(k))
-
-
 def _resolve_tile_cfg(
     node,
     device,

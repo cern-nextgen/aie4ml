@@ -157,7 +157,10 @@ its `parallelism` direct it: `cas_num` splits the queries, `cas_length` 2 gives 
 tile. A Softmax with any other directive, or a directed matmul, keeps the three ops. Where Q, K and V are Dense
 projections of one int8 x (with a bias at most, none directed), the design search also weighs fusing them in: each
 chain then projects the keys, the values and its queries itself, so no Dense tiles or hand-overs come before the
-attention.
+attention. An Add of an int8 or int16 bias U to the logits before the Softmax (an attention mask or a relative-position
+bias) fuses in too, where U is no finer than the products and the logits' scale a power of two (head
+dimensions 16 and 64 as exporters scale them); each chain reads its queries' rows of U. In a multi-head graph U is
+every head's (2D) or one a head (3D, heads first), whose rows each head's chains read from the graph input.
 
 It is not bit-exact with the QDQ graph: the graph rounds each normalised probability to uint8 before `·V`; the op
 keeps them unnormalised and divides each output once. An output can differ from the graph's by about a code;

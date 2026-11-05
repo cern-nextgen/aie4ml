@@ -62,6 +62,9 @@ class DeviceSpec:
     packet_ordered_merge: bool  # whether ADF's pktorderedmerge gathers several streams into one buffer in order
     cascade_width_bits: int
     bank_mem_bytes: int
+    # The width an aie::lut table repeats each chunk at, a data-memory bank's; None where the core has no parallel
+    # lookups (AIE1).
+    lookup_bank_bits: Optional[int]
     max_mem_in_ports: int
     max_mem_out_ports: int
     vector_bytes: int
@@ -135,6 +138,7 @@ class DeviceSpec:
             },
             cascade_width_bits=int(require(cfg, 'CascadeWidthBits')),
             bank_mem_bytes=int(require(require(cfg, 'Memory'), 'BankMemBytes')),
+            lookup_bank_bits=require(require(cfg, 'Memory'), 'LookupBankBits'),
             packet_ordered_merge=bool(require(cfg, 'PacketOrderedMerge')),
             max_mem_in_ports=int(require(cfg, 'MaxMemTileInPorts')),
             max_mem_out_ports=int(require(cfg, 'MaxMemTileOutPorts')),

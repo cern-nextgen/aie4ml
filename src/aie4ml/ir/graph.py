@@ -112,7 +112,8 @@ class LogicalIR:
     nodes: List[OpNode] = field(default_factory=list)
     input_tensor_names: List[str] = field(default_factory=list)
     output_tensor_names: List[str] = field(default_factory=list)
-    # the shape a graph input or output is given and returned in, where its tensor drops axes of extent 1
+    # the shape a graph input or output is given and returned in, where its tensor's differs: axes of extent 1
+    # dropped, or an input's leading axes merged into its rows
     host_shapes: Dict[str, Tuple[int, ...]] = field(default_factory=dict)
 
     def add_tensor(self, tensor: TensorVar) -> None:

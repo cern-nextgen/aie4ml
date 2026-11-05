@@ -7,6 +7,7 @@ import numpy as np
 from ..aie_types import QuantIntent
 from ..ir import get_backend_context
 from ..ir.attributes import FusedActivation, FusedPool, OutputView
+from ..ir.graph import VIEW_REGROUP_ROWS
 from ..op_impls.family_registry import fuses, get_family_resolver_registry
 from .base import AIEPass
 
@@ -111,6 +112,13 @@ class FuseOps(AIEPass):
         source, out_tv = node.inputs[0], node.outputs[0]
         producer = source.producer
         kind = node.metadata['view']
+        order = _row_permutation(source.shape, node.metadata['axis_order'])
+        if producer is None and kind == VIEW_REGROUP_ROWS and order is None and len(source.consumers) == 1:
+            # a graph input's rows regroup on the host, which writes them in order: the input takes the view's shape
+            graph.host_shapes.setdefault(source.name, tuple(source.shape))
+            source.shape = tuple(out_tv.shape)
+            graph.remove_node(node, mode='bypass')
+            return True
         if not fuses(producer, kind):
             raise NotImplementedError(
                 f'{node.name}: {kind} must be written by its producer, but '
@@ -129,7 +137,6 @@ class FuseOps(AIEPass):
             )
         out_tv.precision = source.precision  # the producer's rounding is what the view carries
 
-        order = _row_permutation(source.shape, node.metadata['axis_order'])
         if order is not None:
             for consumer in list(out_tv.consumers):
                 get_family_resolver_registry().get(consumer.op_type).reorder_reduction_rows(consumer, out_tv, order)

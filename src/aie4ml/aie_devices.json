@@ -6,7 +6,8 @@
       "TileMemBytes": 32768,
       "BankCount": 4,
       "Memory": {
-        "BankMemBytes": 8192
+        "BankMemBytes": 8192,
+        "LookupBankBits": null
       },
       "CoreStreamInputs": 2,
       "CoreStreamOutputs": 2,
@@ -32,7 +33,8 @@
       "TileMemBytes": 65536,
       "BankCount": 4,
       "Memory": {
-        "BankMemBytes": 16384
+        "BankMemBytes": 16384,
+        "LookupBankBits": 128
       },
       "CoreStreamInputs": 1,
       "CoreStreamOutputs": 1,
@@ -59,7 +61,8 @@
       "TileMemBytes": 65536,
       "BankCount": 4,
       "Memory": {
-        "BankMemBytes": 16384
+        "BankMemBytes": 16384,
+        "LookupBankBits": 256
       },
       "CoreStreamInputs": 1,
       "CoreStreamOutputs": 1,

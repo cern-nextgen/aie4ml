@@ -7,12 +7,8 @@ import math
 from ....ir.graph import VIEW_FLATTEN_2D, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import SpatialAccess2D
-from ...utils.math import align_up
+from ...utils.math import align_up, divisors
 from .common import CHANNEL_BLOCK, fused_pool_of, spatial_access_of
-
-
-def _divisors(n: int) -> list[int]:
-    return [d for d in range(1, n + 1) if n % d == 0]
 
 
 @family_resolver('conv2d')
@@ -30,8 +26,8 @@ class Conv2dFamilyResolver(FamilyResolver):
         return tuple(
             {'contract': contract, 'cas_num': cas_num, 'cas_length': cas_length}
             for contract, extent in (('inner', out_blocks), ('outer', out_rows))
-            for cas_num in _divisors(extent)
-            for cas_length in _divisors(in_blocks)
+            for cas_num in divisors(extent)
+            for cas_length in divisors(in_blocks)
         )
 
     def fallback_kernels(self, node, _device):
