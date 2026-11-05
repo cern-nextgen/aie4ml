@@ -30,7 +30,8 @@ using head_weights = int8 (&)[ConfigT::MODEL_DIM * ConfigT::HEAD_DIM];
 template <typename ConfigT>
 using head_bias = int32 (&)[ConfigT::HEAD_DIM];
 
-#define ATTENTION_HEAD_TOKENS(name) alignas(32) int8 name[ConfigT::KEY_BLOCKS * ConfigT::HEAD_DIM * 8];
+#define ATTENTION_HEAD_TOKENS(name) \
+  alignas(aie::vector_decl_align) int8 name[ConfigT::KEY_BLOCKS * ConfigT::HEAD_DIM * 8];
 
 // A chain of one tile: all three projections, every key, and the division.
 template <typename ConfigT>

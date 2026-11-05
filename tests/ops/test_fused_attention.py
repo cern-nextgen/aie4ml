@@ -128,6 +128,7 @@ def _onnx(model, feeds, names):
 CASES = {
     'aie-ml-exported-pair': (AIE_ML, 32, 32, {'attn': parallelism(2, cas_length=2)}, True),
     'aie-mlv2-single': (AIE_MLV2, 32, 16, {'attn': parallelism(4)}),
+    'aie-mlv2-pair': (AIE_MLV2, 32, 16, {'attn': parallelism(2, cas_length=2)}),
     'aie-ml-padded-head-dim': (AIE_ML, 32, 8, {'q': parallelism(4, contract='outer'), 'attn': parallelism(4)}),
 }
 
