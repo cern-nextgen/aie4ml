@@ -10,7 +10,8 @@ Quantization is static and per tensor. Scales are powers of two, so rescaling is
 ### Parallelism
 
 Each compute kernel that is not fused (Dense/MatMul, Conv2D, etc.) can span several AI Engine tiles. The compiler chooses every layer's split for the whole model at once, keeping the hand-overs between layers direct where it can and falling back to a memory tile
-where it must (`AIEConfig`):
+where it must, or where a skip connection waits on two or more kernels (a direct hand-over holds two frames, a memory
+tile two more) (`AIEConfig`):
 
 - `Optimize: 'resource'` (default) uses the fewest tiles that fit, then the fewest memory-tile hand-overs, then the
   lowest latency.

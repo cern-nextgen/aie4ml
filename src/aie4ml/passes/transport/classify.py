@@ -136,17 +136,37 @@ def classify_connection(leg: Connection, execution, device, *, merge: bool) -> T
             raise ConfigRefused(f'{tensor}: io_route=memtile requested on a device without memory tiles.')
         realization = 'memtile'
     else:
-        if staging_compatible:
-            realization = 'direct'
-        elif not can_memtile:
+        if not staging_compatible and not can_memtile:
             memtile = restage_failure if has_memtile else 'the device has no memory tile'
             raise ConfigRefused(
                 f'{tensor}: cannot connect directly ({direct_failure}), nor through a memory tile ({memtile}); '
                 'relay/relayout is not implemented.'
             )
-        else:
-            realization = 'memtile'
+        realization = 'memtile' if can_memtile and (not staging_compatible or _outrun(leg)) else 'direct'
     return TransportDecision(realization, staging_compatible)
+
+
+def _outrun(leg: Connection) -> bool:
+    """Whether the consumer also reads the producer through two or more kernels. A direct leg holds two frames, so
+    the producer would wait on that longer path every other frame; a memory tile holds two more."""
+    producer, consumer = leg.producer.node.name, leg.consumer.node
+    others = [t.producer for t in consumer.inputs if t.name != leg.consumer.tensor and t.producer is not None]
+    kernels = {producer: 0}  # by node: the most kernels on a path from the producer up to it, -1 where none reaches it
+    stack = list(others)
+    while stack:  # depth first, each node once its producers are known
+        node = stack[-1]
+        if node.name in kernels:
+            stack.pop()
+            continue
+        sources = [t.producer for t in node.inputs if t.producer is not None]
+        pending = [source for source in sources if source.name not in kernels]
+        if pending:
+            stack.extend(pending)
+            continue
+        most = max((kernels[source.name] for source in sources), default=-1)
+        kernels[node.name] = most + (not node.is_folded_view) if most >= 0 else -1
+        stack.pop()
+    return max((kernels[node.name] for node in others), default=-1) >= 2
 
 
 def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:

@@ -478,7 +478,8 @@ def test_row_chains_gather_through_ordered_merges(tmp_path):
     }  # fmt: skip
     ctx = lower(_encoder_model(), tmp_path, directives)
     plan = ctx.ir.physical.plan
-    assert [buffer['tensor'] for buffer in plan['buffers']] == ['ln1_ln']
+    # and the residual around the MLP, its skip held by a memory tile (below)
+    assert [buffer['tensor'] for buffer in plan['buffers']] == ['ln1_ln', 'res1_sum']
     assert sorted((m['tensor'], len(m['writers']), len(m['readers'])) for m in plan['merges']) == [
         ('k_mm', 2, 1),
         ('v_mm', 2, 1),
@@ -495,6 +496,33 @@ def test_row_chains_gather_through_ordered_merges(tmp_path):
         ((0, 0), (1, 0)),
     )
     assert direct_pairing(ctx.ir.execution, leg.logical_tensor, leg.producer, leg.consumer, merge=False)[0]
+
+
+def _residual_model(depth: int, tokens=16, features=64):
+    """d0 = Dense(x), then d0 + `depth` Dense after d0."""
+    nodes, inits = [], [*qparams('x'), *qparams('res_o')]
+    dq(nodes, 'x_q', 'x', 'x')
+    skip = branch = _sized_dense(nodes, inits, 'x', 'd0', features, features, 0, 5)
+    for i in range(1, depth + 1):
+        branch = _sized_dense(nodes, inits, branch, f'd{i}', features, features, i, 5)
+    nodes.append(helper.make_node('Add', [skip, branch], ['res_sum'], name='res'))
+    qdq(nodes, 'res_sum', 'y', 'res_o')
+    return make_model(
+        'residual',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [tokens, features])],
+        outputs=[('y', TensorProto.FLOAT, [tokens, features])],
+        initializers=inits,
+    )
+
+
+@pytest.mark.parametrize('depth', [1, 2])
+def test_a_skip_around_two_kernels_takes_a_memory_tile(tmp_path, depth):
+    """A direct leg holds two frames, so d0 would wait on its longer path into the Add every other frame: around two
+    kernels the skip takes a memory tile, which holds two more; around one it stays direct."""
+    ctx = lower(_residual_model(depth), tmp_path)
+    readers = [r['target'] for b in ctx.ir.physical.plan['buffers'] if b['tensor'] == 'd0_mm' for r in b['readers']]
+    assert any(target.startswith('res_aie') for target in readers) == (depth == 2)
 
 
 def test_a_direct_route_one_end_asks_for_is_honoured(tmp_path):
