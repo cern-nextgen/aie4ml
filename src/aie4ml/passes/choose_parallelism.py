@@ -365,7 +365,10 @@ class ChooseParallelism(AIEPass):
 
         # a previous run's choice must not steer this one
         if ctx.ir.plain is not None:  # its rewrites undone, the passes before this one run again as configured now
+            live = {node.name: node.directives for node in ctx.ir.logical}
             ctx.ir.logical, ctx.ir.plain = ctx.ir.plain, None
+            for node in ctx.ir.logical:
+                node.directives = live.get(node.name, node.directives)
             run_aie_passes(ctx, [cls() for cls in DEFAULT_PIPELINE[: DEFAULT_PIPELINE.index(ChooseParallelism)]])
         ctx.ir.optimizer = {}
         ctx.ir.physical.reset()

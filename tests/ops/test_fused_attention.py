@@ -175,6 +175,17 @@ def test_the_head_fuses_into_one_op(case, tmp_path):
         assert len(inst.ports.inputs[input_tensor_for_role(inst.node, 'bias').name].endpoints) == par.cas_num
 
 
+def test_a_rerun_keeps_the_directives_set_on_an_absorbed_head(tmp_path):
+    """The search reruns from the graph before it absorbed the projections, with the head's directives as set since."""
+    config = {'Part': AIE_ML, 'AIEConfig': {'Iterations': 1}, 'LayerDirectives': PAIRS}
+    model = from_onnx(_head(32, 16), config, output_dir=tmp_path, project_name='proj').run_pipeline()
+    head = next(node for node in model.context.ir.logical if node.op_type == 'attention')
+    head.directives = SINGLES['attn']
+    model.run_pipeline()
+    par = config_of(model.context, 'attn_aie').parallelism
+    assert (par.cas_num, par.cas_length) == (4, 1)
+
+
 def test_a_dense_padded_head_dimension_hands_over_directly(tmp_path):
     """Q split like the queries: the Dense's 4x8 microtiles and its head dimension padded to 16 columns are read in its
     memory, the zero columns as more of the head dimension."""
