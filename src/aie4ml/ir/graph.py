@@ -15,9 +15,9 @@ if TYPE_CHECKING:  # pragma: no cover - runtime circular import guard
     from ..op_impls.utils import StagingDescriptor
 
 
-@dataclass
+@dataclass(eq=False)
 class TensorVar:
-    """Logical tensor value with producer/consumer connectivity.
+    """Logical tensor value with producer/consumer connectivity, compared and hashed by identity.
 
     Parameter tensors (weights, biases) have data set and producer=None.
     Activation tensors have data=None and a producer node.
@@ -35,21 +35,10 @@ class TensorVar:
         return self.data is not None
 
 
-def _deep_copy(value: Any) -> Any:
-    """A plain copy of the physical plan, as JSON holds it: an ADF traversal step as its fields."""
-    if isinstance(value, dict):
-        return {k: _deep_copy(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_deep_copy(v) for v in value]
-    if dataclasses.is_dataclass(value):
-        return dataclasses.asdict(value)
-    return value
-
-
-@dataclass
+@dataclass(eq=False)
 class OpNode:
     """
-    Logical IR node capturing semantic computation only.
+    Logical IR node capturing semantic computation only, compared and hashed by identity.
     """
 
     name: str
@@ -159,7 +148,7 @@ class LogicalIR:
         node.inputs.clear()
         node.outputs.clear()
 
-    def sole_reader(self, tensor: TensorVar) -> Optional[OpNode]:
+    def sole_consumer(self, tensor: TensorVar) -> Optional[OpNode]:
         """The one op reading `tensor`, where the graph does not return it too."""
         if len(tensor.consumers) != 1 or tensor.name in self.output_tensor_names:
             return None
@@ -168,24 +157,24 @@ class LogicalIR:
     def replace_ops(self, ops: Sequence[OpNode], op: OpNode) -> None:
         """Replace `ops` by `op`, in the last one's place: `op` reads what they read from outside them and writes some
         of their outputs; the others, which nothing else may read, go."""
-        group = {id(node) for node in ops}
-        written = {id(tensor) for tensor in op.outputs}
-        dropped = [tensor for node in ops for tensor in node.outputs if id(tensor) not in written]
+        group, written = set(ops), set(op.outputs)
+        dropped = [tensor for node in ops for tensor in node.outputs if tensor not in written]
         for tensor in dropped:
-            if any(id(c) not in group for c in tensor.consumers) or tensor.name in self.output_tensor_names:
+            if set(tensor.consumers) - group or tensor.name in self.output_tensor_names:
                 raise ValueError(f'{op.name}: {tensor.name} is read beyond the ops it replaces.')
-        for tensor in {id(t): t for node in ops for t in node.inputs}.values():
-            tensor.consumers = [c for c in tensor.consumers if id(c) not in group]
+        for tensor in {tensor for node in ops for tensor in node.inputs}:
+            tensor.consumers = [c for c in tensor.consumers if c not in group]
         for tensor in op.inputs:
             tensor.consumers.append(op)
         for tensor in op.outputs:
             tensor.producer = op
         for tensor in dropped:
             del self.tensors[tensor.name]
-        last = max(i for i, node in enumerate(self.nodes) if id(node) in group)
-        self.nodes[:] = [
-            op if i == last else node for i, node in enumerate(self.nodes) if i == last or id(node) not in group
-        ]
+        self.nodes[max(self.nodes.index(node) for node in ops)] = op
+        self.nodes[:] = [node for node in self.nodes if node not in group]
+        for node in ops:
+            node.inputs.clear()
+            node.outputs.clear()
 
     def _bypass_node(self, node: OpNode):
         in_tv, out_tv = node.inputs[0], node.outputs[0]
@@ -284,7 +273,7 @@ class LogicalIR:
                     )
 
     def _verify_connectivity(self) -> None:
-        nodes = {id(node) for node in self.nodes}
+        nodes = set(self.nodes)
         for node in self.nodes:
             for tensor in (*node.inputs, *node.outputs):
                 if self.tensors.get(tensor.name) is not tensor:
@@ -301,9 +290,9 @@ class LogicalIR:
                         f'{tensor.producer.name if tensor.producer else None!r}.'
                     )
         for tensor in self.tensors.values():
-            if tensor.producer is not None and (tensor.is_parameter or id(tensor.producer) not in nodes):
+            if tensor.producer is not None and (tensor.is_parameter or tensor.producer not in nodes):
                 raise RuntimeError(f'{tensor.name}: its producer {tensor.producer.name!r} is not a node of this graph.')
-            if len({id(consumer) for consumer in tensor.consumers}) != len(tensor.consumers):
+            if len(set(tensor.consumers)) != len(tensor.consumers):
                 raise RuntimeError(f'{tensor.name}: lists a consumer more than once.')
             for consumer in tensor.consumers:
                 if tensor not in consumer.inputs:
@@ -564,6 +553,17 @@ class ExecutionIR:
 
     def __iter__(self):
         return iter(self.instances.values())
+
+
+def _deep_copy(value: Any) -> Any:
+    """A plain copy of the physical plan, as JSON holds it: an ADF traversal step as its fields."""
+    if isinstance(value, dict):
+        return {k: _deep_copy(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_deep_copy(v) for v in value]
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    return value
 
 
 @dataclass

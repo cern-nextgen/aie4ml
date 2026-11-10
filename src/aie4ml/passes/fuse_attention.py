@@ -60,8 +60,8 @@ def _implemented(node: OpNode, device) -> bool:
     return any(fusions_of(node) <= v.supported_fusions and v.matches(node, device, {}) for v in variants)
 
 
-def _single_reader(graph, tensor, reader_type: str) -> Optional[OpNode]:
-    reader = graph.sole_reader(tensor)
+def _sole_consumer(graph, tensor, reader_type: str) -> Optional[OpNode]:
+    reader = graph.sole_consumer(tensor)
     return reader if reader is not None and reader.op_type == reader_type else None
 
 
@@ -80,7 +80,7 @@ class _Head(NamedTuple):
 def _head(graph, softmax: OpNode) -> Optional[_Head]:
     """The ops of one head, or None where they do not form one."""
     logits = softmax.inputs[0]
-    if _single_reader(graph, logits, 'softmax') is not softmax:
+    if _sole_consumer(graph, logits, 'softmax') is not softmax:
         return None
     add, bias, reader = logits.producer, None, softmax
     if add is not None and add.op_type == 'add':  # logits + U
@@ -94,9 +94,9 @@ def _head(graph, softmax: OpNode) -> Optional[_Head]:
     else:
         add = None
     scores = logits.producer
-    if scores is None or scores.op_type != 'matmul' or _single_reader(graph, logits, reader.op_type) is not reader:
+    if scores is None or scores.op_type != 'matmul' or _sole_consumer(graph, logits, reader.op_type) is not reader:
         return None
-    context = _single_reader(graph, softmax.outputs[0], 'matmul')
+    context = _sole_consumer(graph, softmax.outputs[0], 'matmul')
     if context is None or scores.directives or context.directives or set(softmax.directives) - {'parallelism'}:
         return None
     q, k = input_tensor_for_role(scores, 'lhs'), input_tensor_for_role(scores, 'rhs')
@@ -165,7 +165,7 @@ def _projections(graph, attention: OpNode) -> Optional[Dict[str, OpNode]]:
         dense = tensor.producer
         if dense is None or dense.op_type != 'dense' or dense.directives or set(dense.attributes) - {'output_scale'}:
             return None
-        if graph.sole_reader(tensor) is None:
+        if graph.sole_consumer(tensor) is None:
             return None
         if tensor.precision.rounding != RoundingMode.RND_CONV or tensor.precision.saturation != SaturationMode.SAT:
             return None
