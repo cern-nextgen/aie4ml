@@ -79,7 +79,7 @@ class FuseOps(AIEPass):
                 f'{pool.name}: its {kind} pool runs fused into the op producing its input, but '
                 f'{producer.op_type if producer else "the graph input"} does not fuse it.'
             )
-        if len(producer.outputs) != 1 or len(source.consumers) != 1 or source.name in graph.output_tensor_names:
+        if len(producer.outputs) != 1 or graph.sole_reader(source) is None:
             raise NotImplementedError(
                 f'{pool.name}: {producer.name} writes only the pooled tensor, but {source.name!r} is also '
                 f'read elsewhere ({len(source.consumers)} consumers, or a graph output).'

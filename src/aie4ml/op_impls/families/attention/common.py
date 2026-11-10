@@ -7,11 +7,13 @@ from ....errors import ConfigRefused
 from ....ir.graph import OpNode, has_input_role, input_tensor_for_role
 from ...base import PING_PONG_BANKS, BufferLocation, row_flow
 from ...utils import MicrotileShape, ParallelismConfig, build_tensor_view
-from ...utils.precision import resolve_exact_storage_dtype, scale_shift
+from ...utils.precision import is_int, resolve_exact_storage_dtype, scale_shift
 from ...utils.tensor_view import microtile_from_staging
 
 #: The row sums of the uint8 exp (255 at a row's maximum) stay in int16 up to 128 keys.
 MAX_TOKENS = 128
+#: The roles the kernels read as int8: Q, K and V, or x and the projections' weights.
+INT8_ROLES = ('q', 'k', 'v', 'x', 'wq', 'wk', 'wv')
 #: The division: round(2^RECIP_SHIFT / n) seeds n in [2^14, 2^15) at round((n - 2^14) / 64); theta is kept
 #: / 2^THETA_SHIFT.
 RECIP_SHIFT, THETA_SHIFT = 28, 7
@@ -42,8 +44,17 @@ def tokens_of(node: OpNode) -> int:
 
 
 def attends(node: OpNode, device) -> bool:
-    """Whether the attention variants take the node on the device, a bias aside: their tables need parallel lookups."""
-    return device.lookup_bank_bits is not None and tokens_of(node) <= MAX_TOKENS
+    """Whether the attention variants take the node on the device, a bias's shift aside: int8 operands, weights and
+    output, an int8 or int16 bias streamed in, and parallel lookups for their tables."""
+    if device.lookup_bank_bits is None or tokens_of(node) > MAX_TOKENS:
+        return False
+    eights = [node.outputs[0], *(input_tensor_for_role(node, r) for r in INT8_ROLES if has_input_role(node, r))]
+    if not all(is_int(t.precision, 8, True) for t in eights):
+        return False
+    if not has_input_role(node, 'bias'):
+        return True
+    u = input_tensor_for_role(node, 'bias')
+    return not u.is_parameter and (is_int(u.precision, 8, True) or is_int(u.precision, 16, True))
 
 
 def shift_of(scale: float, what: str, node: OpNode) -> int:

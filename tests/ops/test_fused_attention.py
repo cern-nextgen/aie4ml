@@ -20,6 +20,7 @@ from helpers import (
     make_model,
     memtiles,
     numpy_helper,
+    onnx_session,
     parallelism,
     qdq,
     qparams,
@@ -124,14 +125,10 @@ def _oracle(q, k, v, cfg, u=None):
 
 
 def _onnx(model, feeds, names):
-    import onnxruntime as ort
-
     probe = onnx.ModelProto()
     probe.CopyFrom(model)
     probe.graph.output.extend(helper.make_tensor_value_info(n, TensorProto.FLOAT, None) for n in names[1:])
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    sess = ort.InferenceSession(probe.SerializeToString(), options, providers=['CPUExecutionProvider'])
+    sess = onnx_session(probe)
     return dict(zip(names, sess.run(names, feeds)))
 
 

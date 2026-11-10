@@ -6,7 +6,7 @@ full rank (a Conv's) keeps its shape, and an op this cannot rewrite gets Reshape
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -31,23 +31,25 @@ def _kept(shape) -> List[Optional[int]]:
     return [None] * (2 - len(kept)) + kept
 
 
-def drop_unit_axes(model_proto, initializers: Dict[str, np.ndarray], shape_of: Dict[str, Tuple[int, ...]]):
-    """(the model with its activations squeezed, the declared shape of each graph input and output it changed)."""
+def drop_unit_axes(
+    model_proto, initializers: Dict[str, np.ndarray], shapes: Callable[[object], Dict[str, Tuple[int, ...]]]
+):
+    """The model with its activations squeezed, graph inputs and outputs too; `shapes(model)` infers a model's
+    shapes."""
+    shape_of = shapes(model_proto)
     model = copied(model_proto)
     graph = model.graph
     io = {value.name: value for value in (*graph.input, *graph.output)}
     rewrite = _Rewrite(graph, initializers, shape_of)
     rewrite.apply(model, initializers, rewrite.run(graph, set(io)))
     del graph.value_info[:]
-    declared = {}
     for name, value in io.items():
         if rewrite.changed(name):
-            declared[name] = tuple(int(d) for d in shape_of[name])
             dims = value.type.tensor_type.shape.dim
             del dims[:]
             for d in rewrite.new[name]:
                 dims.add().dim_value = int(d)
-    return model, declared
+    return model
 
 
 def _fixed(graph, initializers, shape_of) -> set:

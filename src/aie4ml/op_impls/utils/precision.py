@@ -31,6 +31,11 @@ def to_quant_intent(precision: Any) -> QuantIntent:
     raise TypeError(f'Unsupported precision representation {type(precision)}')
 
 
+def is_int(precision: Any, width: int, signed: bool) -> bool:
+    """Whether `precision` quantizes to `width`-bit integers of that signedness."""
+    return isinstance(precision, QuantIntent) and int(precision.width) == width and bool(precision.signed) == signed
+
+
 def resolve_storage_width(width: int, *, allowed: Tuple[int, ...], namespace: str, layer_name: str) -> int:
     width = int(width)
     if width <= 0:

@@ -65,17 +65,19 @@ def lower_onnx_model(
     initializers = initializer_map(graph_proto, numpy_helper)
 
     # Normalized as exporters emit it: nodes named (directives use the names), constants folded, unit axes dropped,
-    # packed projections split, batched heads rewritten head by head, then their projections split per head.
+    # packed projections split, batched heads rewritten head by head, then their projections split per head. The host
+    # keeps each graph input's and output's shape.
     def shapes(model):
         return build_shape_table(model, initializers, input_maps(model.graph, set(initializers))[0])
 
     model_proto = fold_constants(_named(model_proto), initializers, shapes)
-    model_proto, graph.host_shapes = drop_unit_axes(model_proto, initializers, shapes(model_proto))
-    model_proto = split_packed_projections(model_proto, initializers, shapes(model_proto))
-    model_proto = unbatch_heads(model_proto, initializers, shapes)
-    model_proto = split_packed_projections(model_proto, initializers, shapes(model_proto))
+    declared = shapes(model_proto)
+    for rewrite in (drop_unit_axes, split_packed_projections, unbatch_heads, split_packed_projections):
+        model_proto = rewrite(model_proto, initializers, shapes)
     graph_proto = model_proto.graph
     shape_of = shapes(model_proto)
+    io = [value.name for value in (*graph_proto.input, *graph_proto.output) if value.name in declared]
+    graph.host_shapes = {name: declared[name] for name in io if shape_of.get(name) != declared[name]}
 
     input_shapes, input_dtypes = input_maps(graph_proto, set(initializers))
     for name, shape in input_shapes.items():
@@ -92,9 +94,8 @@ def lower_onnx_model(
         layer_directives=dict(config.get('LayerDirectives', {}) or {}),
     )
 
-    for index, node in enumerate(graph_proto.node):
-        name = onnx_node_name(node, index)
-        dispatch(ctx, node, name, ctx.take_directives(name))
+    for node in graph_proto.node:
+        dispatch(ctx, node, node.name, ctx.take_directives(node.name))
 
     _finalize(ctx, graph_proto)
     return backend

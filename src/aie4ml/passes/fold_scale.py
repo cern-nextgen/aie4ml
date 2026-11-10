@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import math
-
 from ..ir import get_backend_context
 from ..ir.attributes import Scale
 from ..ir.graph import has_input_role
 from ..op_impls.family_registry import fuses
+from ..op_impls.utils.precision import scale_shift
 from .base import AIEPass
 
 
@@ -46,8 +45,8 @@ class FoldScale(AIEPass):
                 changed = True
                 continue
 
-            # A requantization scales by a shift: a power of two (a producer applies no multiplier).
-            if fuses(producer, 'output_scale') and math.log2(scale).is_integer():
+            # A requantization scales by a right shift: a power of two up to 1 (a producer applies no multiplier).
+            if fuses(producer, 'output_scale') and scale_shift(scale) is not None:
                 if len(in_tensor.consumers) != 1:
                     raise NotImplementedError(
                         f'{scale_node.name}: cannot fold output scale because {in_tensor.name!r} '

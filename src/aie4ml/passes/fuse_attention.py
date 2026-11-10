@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Dict, NamedTuple, Optional
 
-from ..aie_types import QuantIntent, RoundingMode, SaturationMode
+from ..aie_types import RoundingMode, SaturationMode
 from ..ir import get_backend_context
 from ..ir.graph import OpNode, has_input_role, input_tensor_for_role
 from ..op_impls.family_registry import fusions_of
 from ..op_impls.registry import get_op_impl_registry
+from ..op_impls.utils.precision import is_int
 from .base import AIEPass
 
 ATTENTION = 'attention'
@@ -34,7 +35,7 @@ class FuseAttention(AIEPass):
             fused = _attention_node(head)
             if not _implemented(fused, ctx.device):
                 continue
-            _replace(graph, head, fused)
+            graph.replace_ops(head.nodes, fused)
             changed = True
         return changed
 
@@ -49,7 +50,7 @@ def absorb_projections(model_or_ctx) -> bool:
         denses = _projections(graph, attention)
         head = None if denses is None else _head_node(attention, denses)
         if head is not None and _implemented(head, ctx.device):
-            _absorb(graph, attention, denses, head)
+            graph.replace_ops([*denses.values(), attention], head)
             changed = True
     return changed
 
@@ -60,20 +61,8 @@ def _implemented(node: OpNode, device) -> bool:
 
 
 def _single_reader(graph, tensor, reader_type: str) -> Optional[OpNode]:
-    """The one op reading `tensor`, when it is of `reader_type` and the tensor is no graph output."""
-    if len(tensor.consumers) != 1 or tensor.name in graph.output_tensor_names:
-        return None
-    reader = tensor.consumers[0]
-    return reader if reader.op_type == reader_type else None
-
-
-def _int(precision, width: int, signed: bool, frac: Optional[int] = None) -> bool:
-    return (
-        isinstance(precision, QuantIntent)
-        and int(precision.width) == width
-        and bool(precision.signed) == signed
-        and (frac is None or int(precision.frac) == frac)
-    )
+    reader = graph.sole_reader(tensor)
+    return reader if reader is not None and reader.op_type == reader_type else None
 
 
 class _Head(NamedTuple):
@@ -99,8 +88,6 @@ def _head(graph, softmax: OpNode) -> Optional[_Head]:
             return None
         lhs, rhs = input_tensor_for_role(add, 'lhs'), input_tensor_for_role(add, 'rhs')
         logits, bias = (lhs, rhs) if lhs.producer is not None and lhs.producer.op_type == 'matmul' else (rhs, lhs)
-        if bias.is_parameter or not (_int(bias.precision, 8, True) or _int(bias.precision, 16, True)):
-            return None
         if not _exact_or_int8(softmax.inputs[0]) or tuple(bias.shape) != (logits.shape[0], logits.shape[0]):
             return None
         reader = add
@@ -123,9 +110,9 @@ def _head(graph, softmax: OpNode) -> Optional[_Head]:
         return None
     if set(context.attributes) - {'output_scale'}:
         return None
-    if not all(_int(t.precision, 8, True) for t in (q, k, v, context.outputs[0])) or not _exact_or_int8(logits):
+    if not _exact_or_int8(logits):
         return None
-    if not _int(p.precision, 8, False) or int(p.precision.frac) > 8:  # uint8 probabilities the graph never clips
+    if not is_int(p.precision, 8, False) or int(p.precision.frac) > 8:  # uint8 probabilities the graph never clips
         return None
     if len(q.shape) != 2 or tuple(q.shape) != tuple(k.shape) or tuple(v.shape) != tuple(k.shape):
         return None
@@ -134,7 +121,7 @@ def _head(graph, softmax: OpNode) -> Optional[_Head]:
 
 def _exact_or_int8(logits) -> bool:
     """Quantized int8 logits, or exact int32 ones (exact products, or their sum with a bias)."""
-    return _int(logits.precision, 8, True) or _int(logits.precision, 32, True)
+    return is_int(logits.precision, 8, True) or is_int(logits.precision, 32, True)
 
 
 def _scale(node: OpNode, name: str) -> float:
@@ -169,37 +156,21 @@ def _attention_node(head: _Head) -> OpNode:
     )
 
 
-def _replace(graph, head: _Head, fused: OpNode) -> None:
-    nodes = head.nodes
-    for tensor in fused.inputs:
-        tensor.consumers = [node for node in tensor.consumers if node not in nodes] + [fused]
-    for tensor in fused.outputs:
-        tensor.producer = fused
-    for node in nodes[:-1]:
-        del graph.tensors[node.outputs[0].name]
-    graph.nodes[graph.nodes.index(head.context)] = fused
-    for node in nodes[:-1]:
-        graph.nodes.remove(node)
-
-
 def _projections(graph, attention: OpNode) -> Optional[Dict[str, OpNode]]:
-    """The Dense writing each of the head's Q, K and V, where all three read one int8 x through int8 weights, carry
-    only a bias and an output scale, round half to even with saturation, and feed nothing else."""
+    """The Dense writing each of the head's Q, K and V, where all three read one x, carry only a bias and an output
+    scale, round half to even with saturation, and feed nothing else."""
     denses = {}
     for role in ('q', 'k', 'v'):
         tensor = input_tensor_for_role(attention, role)
         dense = tensor.producer
         if dense is None or dense.op_type != 'dense' or dense.directives or set(dense.attributes) - {'output_scale'}:
             return None
-        if len(tensor.consumers) != 1 or tensor.name in graph.output_tensor_names:
+        if graph.sole_reader(tensor) is None:
             return None
         if tensor.precision.rounding != RoundingMode.RND_CONV or tensor.precision.saturation != SaturationMode.SAT:
             return None
-        if not _int(input_tensor_for_role(dense, 'rhs').precision, 8, True):
-            return None
         denses[role] = dense
-    x = {input_tensor_for_role(dense, 'lhs').name: input_tensor_for_role(dense, 'lhs') for dense in denses.values()}
-    if len(x) != 1 or not _int(next(iter(x.values())).precision, 8, True):
+    if len({input_tensor_for_role(dense, 'lhs').name for dense in denses.values()}) != 1:
         return None
     return denses
 
@@ -238,15 +209,3 @@ def _head_node(attention: OpNode, denses: Dict[str, OpNode]) -> Optional[OpNode]
         directives=dict(attention.directives),
         roles=roles,
     )
-
-
-def _absorb(graph, attention: OpNode, denses: Dict[str, OpNode], head: OpNode) -> None:
-    absorbed = [*denses.values(), attention]
-    for tensor in head.inputs:
-        tensor.consumers = [node for node in tensor.consumers if node not in absorbed] + [head]
-    for tensor in head.outputs:
-        tensor.producer = head
-    for dense in denses.values():
-        del graph.tensors[dense.outputs[0].name]
-        graph.nodes.remove(dense)
-    graph.nodes[graph.nodes.index(attention)] = head

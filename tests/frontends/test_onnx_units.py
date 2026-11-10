@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from helpers import TensorProto, helper, make_model, numpy_helper
+from helpers import TensorProto, helper, make_model, numpy_helper, onnx_session
 
 from aie4ml.frontends.onnx.shapes import build_shape_table
 from aie4ml.frontends.onnx.units import drop_unit_axes
 from aie4ml.frontends.onnx.utils import initializer_map, input_maps
 
-ort = pytest.importorskip('onnxruntime')
+pytest.importorskip('onnxruntime')
 T, D = 8, 16
 
 
@@ -21,18 +21,26 @@ def _const(inits, name, value):
 
 def _rewritten(model):
     initializers = initializer_map(model.graph, numpy_helper)
-    shapes = build_shape_table(model, initializers, input_maps(model.graph, set(initializers))[0])
-    rewritten, host = drop_unit_axes(model, initializers, shapes)
+
+    def shapes(m):
+        return build_shape_table(m, initializers, input_maps(m.graph, set(initializers))[0])
+
+    rewritten = drop_unit_axes(model, initializers, shapes)
     del rewritten.graph.initializer[:]
     rewritten.graph.initializer.extend(numpy_helper.from_array(np.asarray(v), k) for k, v in initializers.items())
-    inputs = input_maps(rewritten.graph, set(initializers))[0]
-    return rewritten, host, build_shape_table(rewritten, initializers, inputs)
+    return rewritten, shapes(rewritten)
+
+
+def _io(model):
+    """Each graph input's and output's declared shape."""
+    return {
+        v.name: tuple(d.dim_value for d in v.type.tensor_type.shape.dim)
+        for v in (*model.graph.input, *model.graph.output)
+    }
 
 
 def _run(model, x):
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    sess = ort.InferenceSession(model.SerializeToString(), options, providers=['CPUExecutionProvider'])
+    sess = onnx_session(model)
     shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
     return sess.run(None, {model.graph.input[0].name: x.reshape(shape)})[0]
 
@@ -63,10 +71,10 @@ def test_a_sequence_first_block_drops_its_unit_axes():
         outputs=[('y', TensorProto.FLOAT, [1, T, D])],
         initializers=inits,
     )
-    rewritten, host, shapes = _rewritten(model)
+    rewritten, shapes = _rewritten(model)
     x = rng.normal(size=(T, D)).astype(np.float32)
     np.testing.assert_array_equal(_run(rewritten, x).reshape(T, D), _run(model, x).reshape(T, D))
-    assert host == {'x': (1, T, D), 'y': (1, T, D)}
+    assert _io(rewritten) == {'x': (T, D), 'y': (T, D)}
     assert all(1 not in shapes[name] for node in rewritten.graph.node for name in node.output)
     assert 'Transpose' not in {node.op_type for node in rewritten.graph.node}
 
@@ -86,5 +94,5 @@ def test_an_nhwc_input_a_conv_reads_keeps_its_rank():
         outputs=[('y', TensorProto.FLOAT, [1, 4, 6, 6])],
         initializers=inits,
     )
-    rewritten, host, _ = _rewritten(model)
-    assert host == {} and [n.op_type for n in rewritten.graph.node] == ['Transpose', 'Conv']
+    rewritten, _ = _rewritten(model)
+    assert _io(rewritten) == _io(model) and [n.op_type for n in rewritten.graph.node] == ['Transpose', 'Conv']

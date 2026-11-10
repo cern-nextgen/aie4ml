@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from helpers import PART, TensorProto, dq, helper, lower, make_model, numpy_helper, qdq, qparams
+from helpers import PART, TensorProto, dq, helper, lower, make_model, numpy_helper, onnx_session, qdq, qparams
 
 from aie4ml.frontends.onnx.constants import fold_constants
 from aie4ml.frontends.onnx.heads import unbatch_heads
@@ -15,7 +15,7 @@ from aie4ml.frontends.onnx.units import drop_unit_axes
 from aie4ml.frontends.onnx.utils import initializer_map, input_maps
 from aie4ml.ir.graph import has_input_role
 
-ort = pytest.importorskip('onnxruntime')
+pytest.importorskip('onnxruntime')
 T, D, H = 16, 32, 2
 HD = D // H
 
@@ -75,9 +75,7 @@ def _mha(bias: str = ''):
 
 
 def _run(model, x, u=None):
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    sess = ort.InferenceSession(model.SerializeToString(), options, providers=['CPUExecutionProvider'])
+    sess = onnx_session(model)
     shape = [d.dim_value for d in model.graph.input[0].type.tensor_type.shape.dim]
     return sess.run(None, {'x_q': x.reshape(shape), **({} if u is None else {'u_q': u})})[0]
 
@@ -90,10 +88,8 @@ def _rewritten(model):
         return build_shape_table(m, initializers, input_maps(m.graph, set(initializers))[0])
 
     rewritten = fold_constants(_named(model), initializers, shapes)
-    rewritten, _ = drop_unit_axes(rewritten, initializers, shapes(rewritten))
-    rewritten = split_packed_projections(rewritten, initializers, shapes(rewritten))
-    rewritten = unbatch_heads(rewritten, initializers, shapes)
-    rewritten = split_packed_projections(rewritten, initializers, shapes(rewritten))
+    for rewrite in (drop_unit_axes, split_packed_projections, unbatch_heads, split_packed_projections):
+        rewritten = rewrite(rewritten, initializers, shapes)
     del rewritten.graph.initializer[:]
     rewritten.graph.initializer.extend(numpy_helper.from_array(np.asarray(v), k) for k, v in initializers.items())
     return rewritten
@@ -118,6 +114,8 @@ def test_each_head_lowers_to_one_attention_with_its_projections(bias, tmp_path):
     assert ops == ['attention'] * H + ['dense']
     heads = [n for n in ctx.ir.logical if n.op_type == 'attention']
     assert all(has_input_role(n, 'x') and has_input_role(n, 'bias') == bool(bias) for n in heads)
+    host = {'x_q': (1, T, D), 'y': (1, T, D), **({'u_q': (H, T, T)} if bias == 'heads' else {})}
+    assert ctx.ir.logical.host_shapes == host  # x and y unit axes dropped, a head's U rows read in one
 
 
 def _two_layers():

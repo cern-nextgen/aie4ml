@@ -9,14 +9,18 @@ with W a dequantized constant and f per-tensor ops (a QDQ, a scalar scale), copi
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .utils import GraphEdit, attr, attributes, copied
 
 
-def split_packed_projections(model_proto, initializers: Dict[str, np.ndarray], shape_of: Dict[str, Tuple[int, ...]]):
+def split_packed_projections(
+    model_proto, initializers: Dict[str, np.ndarray], shapes: Callable[[object], Dict[str, Tuple[int, ...]]]
+):
+    """`shapes(model)` infers a model's shapes."""
+    shape_of = shapes(model_proto)
     model = copied(model_proto)
     graph = model.graph
     writer = {name: node for node in graph.node for name in node.output}

@@ -159,6 +159,34 @@ class LogicalIR:
         node.inputs.clear()
         node.outputs.clear()
 
+    def sole_reader(self, tensor: TensorVar) -> Optional[OpNode]:
+        """The one op reading `tensor`, where the graph does not return it too."""
+        if len(tensor.consumers) != 1 or tensor.name in self.output_tensor_names:
+            return None
+        return tensor.consumers[0]
+
+    def replace_ops(self, ops: Sequence[OpNode], op: OpNode) -> None:
+        """Replace `ops` by `op`, in the last one's place: `op` reads what they read from outside them and writes some
+        of their outputs; the others, which nothing else may read, go."""
+        group = {id(node) for node in ops}
+        written = {id(tensor) for tensor in op.outputs}
+        dropped = [tensor for node in ops for tensor in node.outputs if id(tensor) not in written]
+        for tensor in dropped:
+            if any(id(c) not in group for c in tensor.consumers) or tensor.name in self.output_tensor_names:
+                raise ValueError(f'{op.name}: {tensor.name} is read beyond the ops it replaces.')
+        for tensor in {id(t): t for node in ops for t in node.inputs}.values():
+            tensor.consumers = [c for c in tensor.consumers if id(c) not in group]
+        for tensor in op.inputs:
+            tensor.consumers.append(op)
+        for tensor in op.outputs:
+            tensor.producer = op
+        for tensor in dropped:
+            del self.tensors[tensor.name]
+        last = max(i for i, node in enumerate(self.nodes) if id(node) in group)
+        self.nodes[:] = [
+            op if i == last else node for i, node in enumerate(self.nodes) if i == last or id(node) not in group
+        ]
+
     def _bypass_node(self, node: OpNode):
         in_tv, out_tv = node.inputs[0], node.outputs[0]
 
