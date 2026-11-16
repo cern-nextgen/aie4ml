@@ -4,13 +4,13 @@ Exactly the kernel graphs are placed, each buffer where its graph lists it or, a
 reaches, and every edge the execution graph requires in shared memory is realised
 as one on each of its ports: a direct hand-over per port, legal by the rule placement searched under
 (`shared_buffer`), its two ports pinned to the same memory, recorded as `shared_memory`, and carrying no
-DMA access pattern.
+DMA access pattern. A kernel port's access pattern shapes every copy it sends, so a port carrying one sends one.
 """
 
 from __future__ import annotations
 
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from itertools import zip_longest
 
 from ..errors import ConfigRefused
@@ -74,6 +74,16 @@ def verify_physical(ctx) -> None:
         for access in physical.plan.get(key, ())
     }
     edges = physical.plan.get('direct_edges', ())
+    sends = Counter(edge['source'] for edge in edges)
+    sends.update(writer['source'] for buffer in physical.plan.get('buffers', ()) for writer in buffer['writers'])
+    sends.update(writer for merge in physical.plan.get('merges', ()) for writer in merge['writers'])
+    for source, count in sends.items():
+        port = _PORT.match(source)
+        if count < 2 or port is None or port['graph'] not in graphs:
+            continue
+        walked = accessed & _kernel_ports(*_port(source, graphs), 'outputs')
+        if walked:
+            raise RuntimeError(f'{source}: sends {count} copies, but {sorted(walked)} carry a DMA access pattern.')
     for inst in execution:
         for item in inst.inputs:
             if not item.shared_memory:

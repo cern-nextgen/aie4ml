@@ -672,7 +672,7 @@ class _Search:
             # an ordered merge where transport makes one, over the graph's reads of the tensor
             tensor, reads = leg.producer.tensor, self._reads(leg)
             merge = sink is not None and gathers(self.ctx.device, tensor, reads, self.graph_outputs)
-            realization = classify_connection(leg, execution, self.ctx.device, merge=merge).realization
+            realization = classify_connection(leg, execution, self.ctx.device, merge=merge, reads=reads).realization
             if realization == 'memtile':
                 check_memtile_leg(leg, execution, self.ctx.device)
             if sink is not None and (realization == 'memtile' or source is None):

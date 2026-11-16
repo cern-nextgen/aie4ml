@@ -985,7 +985,7 @@ def test_float_like_attention_dense_chain_x86_code_diff(tmp_path, mode):
 @pytest.mark.aie_ir
 @pytest.mark.requires_vitis
 def test_bf16_dense_chain_probe_x86_code_diff(tmp_path):
-    """Expose the first dense output and the final output to localize where bf16 chaining first diverges."""
+    """The first dense output, exported, and the second dense reading it: both match."""
     _require_vitis()
     pytest.importorskip('onnx')
     from aie4ml.frontends.onnx import from_onnx
@@ -1029,8 +1029,6 @@ def test_bf16_dense_chain_probe_x86_code_diff(tmp_path):
     mid_code_diff = _float_like_max_code_diff(mid_aie, mid_ref, mode='bf16')
     final_code_diff = _float_like_max_code_diff(y_aie, y_ref, mode='bf16')
     assert mid_code_diff <= 1
-    if final_code_diff > 1:
-        pytest.xfail('a tensor both exported and consumed reaches its consumer in host order')
     assert final_code_diff <= 1
 
 

@@ -31,10 +31,9 @@ class ClassifyTransportEntries(AIEPass):
             self._validate_entry(entry)
             leg = entry.consumers[0] if entry.consumers else Connection(entry.logical_tensor, entry.producer, None)
             tensor = leg.producer.tensor
-            merge = leg.consumer is not None and gathers(
-                ctx.device, tensor, collector.reads(tensor), execution.graph_outputs
-            )
-            decision = classify_connection(leg, ctx.ir.execution, ctx.device, merge=merge)
+            reads = collector.reads(tensor)
+            merge = leg.consumer is not None and gathers(ctx.device, tensor, reads, execution.graph_outputs)
+            decision = classify_connection(leg, ctx.ir.execution, ctx.device, merge=merge, reads=reads)
             if entry.producer.node is None and decision.realization == 'direct':
                 _warn_inner_padding(leg, execution)
             changed = changed or entry.decision != decision
@@ -81,10 +80,13 @@ def direct_unit(execution, leg: Connection, *, merge: bool) -> TransportUnit:
     return TransportUnit(tuple(p for p, _ in edges), tuple(c for _, c in edges))
 
 
-def classify_connection(leg: Connection, execution, device, *, merge: bool) -> TransportDecision:
+def classify_connection(
+    leg: Connection, execution, device, *, merge: bool, reads: Sequence[Tuple[str, str]]
+) -> TransportDecision:
     """How one transport leg is realised; `leg.consumer` is None for a graph output. Reads only the resolved
     instances and contracts in `execution`, so the parallelism search decides every leg by this rule too. `merge`:
-    whether the leg may gather through an ordered packet merge (`gathers`)."""
+    whether the leg may gather through an ordered packet merge (`gathers`); `reads`: every read of the leg's tensor
+    over the whole graph (`TransportCollector.reads`)."""
     tensor, producer, consumer = leg.logical_tensor, leg.producer, leg.consumer
     shards_failure = _inner_shards_failure(leg, execution)
     if shards_failure is not None:
@@ -114,12 +116,20 @@ def classify_connection(leg: Connection, execution, device, *, merge: bool) -> T
     if is_boundary:
         if route == 'memtile' and not has_memtile:
             raise ConfigRefused(f'{tensor}: io_route=memtile requested on a device without memory tiles.')
+        shared_walk = _shared_port_walk(leg, execution, reads)
         if route == 'direct' or not can_memtile:
+            if shared_walk is not None:
+                memtile = 'io_route=direct is requested' if route == 'direct' else restage_failure
+                raise ConfigRefused(
+                    f'{tensor}: cannot leave directly ({shared_walk}), '
+                    f'nor through a memory tile ({memtile or "the device has none"}).'
+                )
             realization = 'direct'
         elif route == 'memtile':
             realization = 'memtile'
         else:  # a memory tile adds a stage; take it only where it must
-            realization = 'direct' if _direct_boundary_failure(leg, execution, device) is None else 'memtile'
+            direct = shared_walk is None and _direct_boundary_failure(leg, execution, device) is None
+            realization = 'direct' if direct else 'memtile'
         return TransportDecision(realization, True if realization == 'direct' else None)
 
     direct_failure = direct_transport_failure(execution, leg.logical_tensor, leg.producer, leg.consumer, merge=merge)
@@ -199,6 +209,31 @@ def _direct_boundary_failure(leg: Connection, execution, device) -> str | None:
                 f'{endpoint.node.name}.{endpoint.group}[{port}] walks its layout with {bds} BDs, beside '
                 f'{neighbours} other buffer port(s), past a tile of {device.tile_dma.bds}'
             )
+    return None
+
+
+def _shared_port_walk(leg: Connection, execution, reads) -> str | None:
+    """Why a graph output cannot leave its producer's ports directly, or None: a port's DMA walk shapes every copy it
+    sends, so one that orders the output for the host would reorder a kernel's copy of that port too."""
+    if leg.consumer is not None or not reads:
+        return None
+    endpoint = leg.producer
+    collector = TransportCollector(execution)
+    read = {port for value, _ in reads for port in collector.ports_read(value, endpoint.tensor)}
+    inst = execution.get(endpoint.node.name)
+    element = inst.variant.output_precision(inst.config)
+    for port in endpoint.selected_ports(inst.ports.outputs[endpoint.tensor].count):
+        if port not in read:
+            continue
+        staging = inst.staging[endpoint.tensor][port]
+        try:
+            access, _ = direct_boundary_access(
+                staging, staging.io_tiling_dimension, element_bits=element.width, output=True
+            )
+        except ConfigRefused as refusal:
+            return str(refusal)
+        if not describes_natural_order(access):
+            return f'{endpoint.node.name}.{endpoint.group}[{port}] would order it for the host, and a kernel reads it'
     return None
 
 

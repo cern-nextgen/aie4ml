@@ -26,6 +26,7 @@ from helpers import (
 
 ROWS, COLS = 32, 64
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
+AIE_MLV2_PART = 'xc2ve3858-ssva2112-2MP-e-S'
 
 
 @pytest.fixture
@@ -223,8 +224,9 @@ def test_an_add_tile_leaves_room_for_the_stack_beside_its_second_operand(tmp_pat
     assert config_of(lower(model, tmp_path), 'add_aie').parallelism.cas_num == 2
 
 
-def _dense_chain(features):
-    """x -> dense to `features` -> dense: the second reads the first's output whole or in slices."""
+def _dense_chain(features, *, export_hidden=False):
+    """x -> dense to `features` -> dense: the second reads the first's output whole or in slices, which
+    `export_hidden` also makes a graph output."""
     rng = np.random.default_rng(5)
     nodes: list = []
     dq(nodes, 'x_i8', 'x', 'x')
@@ -238,7 +240,7 @@ def _dense_chain(features):
         'dense_chain',
         nodes=nodes,
         inputs=[('x_i8', TensorProto.INT8, [8, 32])],
-        outputs=[('y', TensorProto.FLOAT, [8, 16])],
+        outputs=[('h', TensorProto.FLOAT, [8, features])] * export_hidden + [('y', TensorProto.FLOAT, [8, 16])],
         initializers=[
             *qparams('x'),
             *qparams('w1'),
@@ -265,3 +267,27 @@ def test_a_split_that_leaves_a_stage_no_data_is_refused(tmp_path):
     """15 features padded to two slices of 16: the second cascade stage would hold nothing."""
     with pytest.raises(ConfigRefused, match='does not tile it'):
         lower(_dense_chain(15), tmp_path, {'d2': parallelism(1, cas_length=2)}, part=PART)
+
+
+@pytest.mark.parametrize('part', [PART, AIE_MLV2_PART], ids=['aie-ml', 'aie-mlv2'])
+def test_an_exported_tensor_a_kernel_also_reads_leaves_through_a_memtile(tmp_path, part):
+    """A port's DMA walk shapes every copy it sends: ordering the hidden tensor for the host on d1's ports would
+    reorder d2's copy too, so the host reads it from a memory tile and d1's ports send it in their own order."""
+    ctx = lower(_dense_chain(32, export_hidden=True), tmp_path, part=part)
+    plan = ctx.ir.physical.plan
+    assert not [a for a in plan['kernel_read_accesses'] if a['endpoint'].startswith('d1_aie.')]
+    host = [r for b in plan['buffers'] if b['tensor'] == 'h' for r in b['readers'] if r['target'].startswith('ofm')]
+    assert host
+
+    from aie4ml.passes.verify_physical import verify_physical
+
+    d1 = ctx.ir.execution.get('d1_aie')
+    plan['kernel_read_accesses'].append({'endpoint': f"d1_aie.{d1.ports.outputs['h'].endpoints[0][0]}"})
+    with pytest.raises(RuntimeError, match='copies'):
+        verify_physical(ctx)
+
+
+def test_an_exported_tensor_a_kernel_also_reads_is_refused_without_a_memtile(tmp_path):
+    """AIE1 has no memory tile to order the host's copy apart from d2's."""
+    with pytest.raises(ConfigRefused, match='cannot leave directly'):
+        lower(_dense_chain(32, export_hidden=True), tmp_path, part=AIE1_PART)
