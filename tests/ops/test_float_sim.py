@@ -2,60 +2,26 @@
 
 import os
 
+import ml_dtypes
 import numpy as np
 import pytest
 
-# fp8 <-> float32 reference (AMD Vitis float8 E4M3 encoding)
+# References round half to even, as the AIE converts float results.
 
 
-def _float32_to_fp8(f: np.float32) -> np.uint8:
-    """Convert scalar float32 to AMD Vitis float8 (E4M3)."""
-    h = int(np.float32(f).view(np.uint32))
-    h = (h + 0x00080000) & 0xFFFFFFFF
-    e = (h & 0x7F800000) >> 23
-    m = h & 0x007FFFFF
-    sign = (h & 0x80000000) >> 24
-    if e > 135:
-        result = sign | 0x7F
-    elif e > 120:
-        result = sign | (((e - 120) << 3) & 0x78) | (m >> 20)
-    elif e > 116:
-        result = sign | (((0x00780000 + m) >> (140 - e)) + 1) >> 1
-    else:
-        result = sign
-    return np.uint8(result & 0xFF)
-
-
-def _fp8_to_float32(b: np.uint8) -> np.float32:
-    """Convert AMD Vitis float8 (E4M3) to float32."""
-    v = int(b)
-    e = (v & 0x78) >> 3
-    m = (v & 0x07) << 20
-    sign = (v & 0x80) << 24
-    if e != 0:
-        bits = np.uint32(sign | ((e + 120) << 23) | m)
-    elif m != 0:
-        temp_f = float(m)
-        nv = int(np.float32(temp_f).view(np.uint32) >> 23)
-        bits = np.uint32(sign | ((nv - 29) << 23) | ((m << (150 - nv)) & 0x00700000))
-    else:
-        bits = np.uint32(sign)
-    return bits.view(np.float32)
-
-
-_vfloat32_to_fp8 = np.vectorize(_float32_to_fp8, otypes=[np.uint8])
-_vfp8_to_float32 = np.vectorize(_fp8_to_float32, otypes=[np.float32])
+def _fp8_codes(x) -> np.ndarray:
+    """fp8 E4M3 storage codes of float32 values."""
+    return np.asarray(x, dtype=np.float32).astype(ml_dtypes.float8_e4m3fn).view(np.uint8)
 
 
 def _fp8_round(x: np.ndarray) -> np.ndarray:
-    """Round float32 array through fp8 E4M3 encoding (vectorised)."""
-    return _vfp8_to_float32(_vfloat32_to_fp8(x.astype(np.float32)))
+    """Round float32 array to fp8 E4M3 precision."""
+    return np.asarray(x, dtype=np.float32).astype(ml_dtypes.float8_e4m3fn).astype(np.float32)
 
 
 def _bf16_round(x: np.ndarray) -> np.ndarray:
     """Round float32 array to bfloat16 precision."""
-    arr = np.asarray(x, dtype=np.float32)
-    return ((arr.view(np.uint32) >> 16) << 16).view(np.float32)
+    return np.asarray(x, dtype=np.float32).astype(ml_dtypes.bfloat16).astype(np.float32)
 
 
 def _bf16_bits(x: np.ndarray) -> np.ndarray:
@@ -95,7 +61,7 @@ def _float_like_mode_spec(TensorProto, mode):
         return {
             'dtype': dtype,
             'round': _fp8_round,
-            'bits': lambda x: _vfloat32_to_fp8(np.asarray(x, dtype=np.float32)),
+            'bits': lambda x: _fp8_codes(np.asarray(x, dtype=np.float32)),
             'weight_init': _make_fp8_initializer,
         }
     if mode == 'bf16':
@@ -121,7 +87,7 @@ def _make_bf16_initializer(TensorProto, name: str, array: np.ndarray):
 
 def _make_fp8_initializer(TensorProto, name: str, array: np.ndarray):
     arr = np.asarray(array, dtype=np.float32)
-    packed = _vfloat32_to_fp8(arr)
+    packed = _fp8_codes(arr)
     tensor = TensorProto()
     tensor.data_type = TensorProto.FLOAT8E4M3FN
     tensor.name = name
@@ -566,8 +532,8 @@ def _float_attention_tail_reference(ctx, res, *, mode, head_dim, out_dim):
 
 def _float_like_max_code_diff(aie_out, ref_out, *, mode):
     if mode == 'fp8':
-        ref_bits = _vfloat32_to_fp8(np.asarray(ref_out, dtype=np.float32))
-        aie_bits = _vfloat32_to_fp8(np.asarray(aie_out, dtype=np.float32))
+        ref_bits = _fp8_codes(np.asarray(ref_out, dtype=np.float32))
+        aie_bits = _fp8_codes(np.asarray(aie_out, dtype=np.float32))
         return int(np.max(np.abs(aie_bits.astype(np.int16) - ref_bits.astype(np.int16))))
     if mode == 'bf16':
         ref_bits = _bf16_bits(np.asarray(ref_out, dtype=np.float32))
@@ -743,8 +709,8 @@ def test_fp8_combined_mlp_x86_bit_exact(tmp_path):
 
     assert y_ref.shape == y_aie.shape
     np.testing.assert_array_equal(
-        _vfloat32_to_fp8(y_aie.astype(np.float32)),
-        _vfloat32_to_fp8(y_ref),
+        _fp8_codes(y_aie.astype(np.float32)),
+        _fp8_codes(y_ref),
     )
 
 
@@ -786,8 +752,8 @@ def test_fp8_large_matmul_x86_code_diff(tmp_path):
     y_aie = aie_model.predict({'x': x, 'w': w}, simulator='x86')[:batch]
 
     assert y_ref.shape == y_aie.shape
-    ref_codes = _vfloat32_to_fp8(y_ref.astype(np.float32))
-    aie_codes = _vfloat32_to_fp8(y_aie.astype(np.float32))
+    ref_codes = _fp8_codes(y_ref.astype(np.float32))
+    aie_codes = _fp8_codes(y_aie.astype(np.float32))
     max_code_diff = int(np.max(np.abs(aie_codes.astype(np.int16) - ref_codes.astype(np.int16))))
     assert max_code_diff <= 1
 
@@ -875,8 +841,8 @@ def test_fp8_large_chained_matmul_x86_code_diff(tmp_path):
     y_aie = aie_model.predict({'q': q, 'k_t': k_t, 'v': v}, simulator='x86')[:batch]
 
     assert y_ref.shape == y_aie.shape
-    ref_codes = _vfloat32_to_fp8(y_ref.astype(np.float32))
-    aie_codes = _vfloat32_to_fp8(y_aie.astype(np.float32))
+    ref_codes = _fp8_codes(y_ref.astype(np.float32))
+    aie_codes = _fp8_codes(y_aie.astype(np.float32))
     max_code_diff = int(np.max(np.abs(aie_codes.astype(np.int16) - ref_codes.astype(np.int16))))
     assert max_code_diff <= 1
 
@@ -963,9 +929,6 @@ def test_float_like_single_dense_x86_code_diff(tmp_path, mode):
 
     assert y_ref.shape == y_aie.shape
     max_code_diff = _float_like_max_code_diff(y_aie, y_ref, mode=mode)
-    if max_code_diff > 1:
-        print(f'{mode} single_dense max_code_diff={max_code_diff}')
-        pytest.xfail(f'{mode} single dense currently diverges with max_code_diff={max_code_diff}')
     assert max_code_diff <= 1
 
 
@@ -1016,9 +979,6 @@ def test_float_like_attention_dense_chain_x86_code_diff(tmp_path, mode):
 
     assert y_ref.shape == y_aie.shape
     max_code_diff = _float_like_max_code_diff(y_aie, y_ref, mode=mode)
-    if max_code_diff > 1:
-        print(f'{mode} dense_chain max_code_diff={max_code_diff}')
-        pytest.xfail(f'{mode} dense chain currently diverges with max_code_diff={max_code_diff}')
     assert max_code_diff <= 1
 
 
@@ -1068,13 +1028,9 @@ def test_bf16_dense_chain_probe_x86_code_diff(tmp_path):
 
     mid_code_diff = _float_like_max_code_diff(mid_aie, mid_ref, mode='bf16')
     final_code_diff = _float_like_max_code_diff(y_aie, y_ref, mode='bf16')
-    if mid_code_diff > 1 or final_code_diff > 1:
-        print(f'bf16 dense_chain_probe mid_code_diff={mid_code_diff} final_code_diff={final_code_diff}')
-        pytest.xfail(
-            'bf16 dense chain probe currently diverges with '
-            f'mid_code_diff={mid_code_diff}, final_code_diff={final_code_diff}'
-        )
     assert mid_code_diff <= 1
+    if final_code_diff > 1:
+        pytest.xfail('a tensor both exported and consumed reaches its consumer in host order')
     assert final_code_diff <= 1
 
 
@@ -1126,9 +1082,6 @@ def test_float_like_attention_core_x86_code_diff(tmp_path, mode):
 
     assert y_ref.shape == y_aie.shape
     max_code_diff = _float_like_max_code_diff(y_aie, y_ref, mode=mode)
-    if max_code_diff > 1:
-        print(f'{mode} attention_core max_code_diff={max_code_diff}')
-        pytest.xfail(f'{mode} attention core currently diverges with max_code_diff={max_code_diff}')
     assert max_code_diff <= 1
 
 
@@ -1159,10 +1112,7 @@ def test_float_like_attention_tail_x86_code_diff(tmp_path, mode):
         {
             'Part': 'vek385_base',
             'AIEConfig': {'Iterations': 1},
-            'LayerDirectives': {
-                'add_residual': {'parallelism': {'cas_num': 2}},
-                'dense_out': {'parallelism': {'cas_num': 2, 'cas_length': 2}},
-            },
+            'LayerDirectives': {'dense_out': {'parallelism': {'cas_num': 2, 'cas_length': 2}}},
         },
         output_dir=tmp_path / f'proj_{mode}_attention_tail_x86',
         project_name=f'proj_{mode}_attention_tail_x86',
@@ -1183,9 +1133,6 @@ def test_float_like_attention_tail_x86_code_diff(tmp_path, mode):
 
     assert y_ref.shape == y_aie.shape
     max_code_diff = _float_like_max_code_diff(y_aie, y_ref, mode=mode)
-    if max_code_diff > 1:
-        print(f'{mode} attention_tail max_code_diff={max_code_diff}')
-        pytest.xfail(f'{mode} attention tail currently diverges with max_code_diff={max_code_diff}')
     assert max_code_diff <= 1
 
 
