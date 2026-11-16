@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from helpers import PART, TensorProto, dq, helper, lower, make_model, numpy_helper, onnx_session, qdq, qparams
-
 from aie4ml.frontends.onnx.constants import fold_constants
 from aie4ml.frontends.onnx.heads import unbatch_heads
 from aie4ml.frontends.onnx.importer import _named
@@ -14,6 +12,7 @@ from aie4ml.frontends.onnx.shapes import build_shape_table
 from aie4ml.frontends.onnx.units import drop_unit_axes
 from aie4ml.frontends.onnx.utils import initializer_map, input_maps
 from aie4ml.ir.graph import has_input_role
+from helpers import PART, TensorProto, dq, helper, lower, make_model, numpy_helper, onnx_session, qdq, qparams
 
 pytest.importorskip('onnxruntime')
 T, D, H = 16, 32, 2

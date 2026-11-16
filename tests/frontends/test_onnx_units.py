@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from helpers import TensorProto, helper, make_model, numpy_helper, onnx_session
-
 from aie4ml.frontends.onnx.shapes import build_shape_table
 from aie4ml.frontends.onnx.units import drop_unit_axes
 from aie4ml.frontends.onnx.utils import initializer_map, input_maps
+from helpers import TensorProto, helper, make_model, numpy_helper, onnx_session
 
 pytest.importorskip('onnxruntime')
 T, D = 8, 16
