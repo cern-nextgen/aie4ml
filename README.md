@@ -51,7 +51,7 @@ pip install "aie4ml[hls4ml]"   # hls4ml frontend
 Keras 3 and QKeras v3 models need hls4ml 1.4. Until it is released, install hls4ml from upstream commit:
 
 ```bash
-pip install "hls4ml @ git+https://github.com/fastmachinelearning/hls4ml.git@a2abb4d22e7762a870cd46ccf3e07ff6a5622ed5"
+pip install "hls4ml @ git+https://github.com/fastmachinelearning/hls4ml.git@9e5f86caa503c2f49ac38841e174e7c06dba7533"
 ```
 
 ## Documentation & Tutorials

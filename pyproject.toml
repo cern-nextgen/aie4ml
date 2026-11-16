@@ -33,13 +33,15 @@ classifiers = [
 ]
 dependencies = [
   "jinja2>=3.0",
+  "ml_dtypes",
   "numpy",
   "ortools>=9.15,<10",
 ]
 
 [project.optional-dependencies]
-onnx = ["onnx", "ml_dtypes"]
-hls4ml = ["hls4ml>=1.3.0"]
+onnx = ["onnx"]
+# hls4ml 1.3.0 fails to import with quantizers 2
+hls4ml = ["hls4ml>=1.3.0", "quantizers<2"]
 testing = [
   "aie4ml[onnx,hls4ml]",
   "pytest>=7.0",
