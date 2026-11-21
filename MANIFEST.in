@@ -2,4 +2,5 @@ include LICENSE
 include README.md
 recursive-include src/aie4ml/templates *
 include src/aie4ml/aie_devices.json
+include src/aie4ml/cost/artifacts/*.json
 global-exclude *.py[cod] __pycache__ .git .gitmodules .gitlab-ci.yml .DS_Store
